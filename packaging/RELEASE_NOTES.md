@@ -60,4 +60,4 @@ d4r is Apache 2.0. The zip also contains ZLUDA (Apache 2.0 or MIT), vkd3d-proton
 
 NVIDIA's files in the zip, and the kernels built from NVIDIA's code, belong to NVIDIA and are not covered by any of these licenses. d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.
 
-**SHA-256** `d4r-0.1.0.zip`: `c26670538cdd122f9766bb30c6099c0636e4f8365f6ef82109c3671eea2f8564`
+**SHA-256** `d4r-0.1.0.zip`: `ddaa0866273c6e31f2f1282b2cc2ac370c804b04e8895cdda27c096747edf5a1`

@@ -78,7 +78,7 @@ The only other requirement is ROCm's HIP runtime 7.x, installed from your distri
 
 The full sequence is in [docs/building.md](docs/building.md). In short:
 
-1. Build ZLUDA `ee2f25a` with `patches/zluda/0002`–`0004` applied.
+1. Build ZLUDA `ee2f25a` with `patches/zluda/0002`–`0005` applied.
 2. Build the patched vkd3d-proton: `scripts/build_vkd3d_proton_d4r.sh OUT_DIR`.
 3. Build the shim and bridge: `scripts/build_d4r_nvngx_shim.sh`, `scripts/build_wine_nvcuda_bridge.sh`.
 4. Stage the runtime with your NVIDIA files: `scripts/install_d4r_runtime.sh _nvngx.dll nvngx_dlss.dll`.

@@ -4,7 +4,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 
 | Component | Tested version |
 |---|---|
-| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002`, `0003`, `0004` in that order |
+| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002`, `0003`, `0004`, `0005` in that order |
 | vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
@@ -17,7 +17,7 @@ git clone https://github.com/vosen/ZLUDA zluda && cd zluda
 git checkout ee2f25a
 git submodule update --init --recursive
 git lfs pull
-for p in 0002 0003 0004; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
+for p in 0002 0003 0004 0005; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
 # rebuild the device helpers the patches changed (ptx/lib/zluda_ptx_impl*.bc)
 ZLUDA_SOURCE_ROOT=$PWD ROCM_ROOT=/opt/rocm /path/to/d4r/scripts/build_zluda_ptx_helpers.sh
 LIBRARY_PATH=/opt/rocm/lib cargo build --release -p zluda
@@ -33,6 +33,7 @@ What the patches add:
 - **0002**: the CUDA driver API surface NGX and DLSS use (arrays, textures, surfaces, 1010102 formats, launch parameter buffers), the PTX features DLSS kernels need, and module dumps for debugging (`D4R_ZLUDA_DUMP_DIR`).
 - **0003**: an implicit 256-thread launch bound for kernels without PTX bounds (removes massive register spilling, `D4R_ZLUDA_IMPLICIT_MAX_BLOCK`) and f16 tensor-core MMA on RDNA3 WMMA (`D4R_ZLUDA_WMMA`).
 - **0004**: the native kernel override hook (`D4R_ZLUDA_NATIVE_DIR`, see [native-kernels.md](native-kernels.md)), FP8 MMA on WMMA (`D4R_ZLUDA_WMMA_FP8`), optional elision of per-instruction denormal mode switches (`D4R_ZLUDA_IGNORE_DENORMAL`), inlined image helpers, and linking extra bitcode into a PTX module (`D4R_ZLUDA_EXTRA_BC`, used by the texture-kernel build).
+- **0005**: a null texture object (CUDA handle 0) reads as zeros, as on NVIDIA GPUs, instead of faulting the GPU. DLSS samples absent optional inputs that way in some configurations (low-resolution motion vectors without HDR, as in Ghost of Tsushima).
 
 ## 2. vkd3d-proton
 
