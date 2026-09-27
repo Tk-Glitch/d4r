@@ -20,7 +20,7 @@ d4r keeps NVIDIA's DLSS library unmodified and gives it what it expects: an NGX 
 With VRAM interop and split frames (the defaults when the patched vkd3d-proton is present):
 
 1. **The game records DLSS.** Its `EvaluateFeature` call reaches the shim with the game's command list. Into that list the shim records:
-   - Vulkan commands (vkd3d-proton interop) that copy colour, depth and motion vectors into buffers exported to HIP. Linear R11G11B10, RGB10A2, and RGBA8/BGRA8 colour inputs are blitted to RGBA16F on the way when the device supports the conversion.
+   - Vulkan commands (vkd3d-proton interop) that copy colour, depth, motion vectors and optional exposure into buffers exported to HIP. Linear R11G11B10, RGB10A2, and RGBA8/BGRA8 colour inputs are blitted to RGBA16F; multichannel float exposure is blitted to R32F using its first component when the device supports the conversion.
    - A frame marker.
    - A split. vkd3d-proton submits everything the game records after the DLSS call separately, gated on a timeline semaphore reaching this frame's number.
    - At the start of that second part, a copy of the DLSS result into the game's output texture. Linear R11G11B10, RGB10A2, and RGBA8/BGRA8 outputs are converted from RGBA16F on the GPU. sRGB formats continue through host staging to preserve their existing byte interpretation.

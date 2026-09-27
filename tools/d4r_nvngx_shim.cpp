@@ -1418,12 +1418,13 @@ struct VramBuffer
     size_t bytes = 0;
 };
 
-// An RGBA16F image used to convert a noncanonical color input or output.
+// A temporary image for colour or exposure format conversion.
 struct VramImage
 {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     UINT width = 0, height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
 };
 
 struct Staging
@@ -1551,6 +1552,7 @@ struct Feature
     // formats later stop qualifying.
     bool vram = false, vramDecided = false;
     VramImage colorConversion;
+    VramImage exposureConversion;
     VramImage outputConversion;
     // Split frames: the rest of frame N's command list is submitted only once
     // splitSemaphore reaches N (signalled when N retires, or by the watchdog).
@@ -2225,11 +2227,11 @@ static void destroy_vram_image(VramImage& image)
     image = VramImage{};
 }
 
-static bool create_vram_image(VramImage& image, UINT width, UINT height)
+static bool create_vram_image(VramImage& image, UINT width, UINT height, VkFormat format)
 {
     VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    info.format = format;
     info.extent = {width, height, 1};
     info.mipLevels = 1;
     info.arrayLayers = 1;
@@ -2260,6 +2262,7 @@ static bool create_vram_image(VramImage& image, UINT width, UINT height)
     }
     image.width = width;
     image.height = height;
+    image.format = format;
     return true;
 }
 
@@ -2297,11 +2300,19 @@ struct VramCopy
     ID3D12Resource* resource = nullptr;
     VkImage image = VK_NULL_HANDLE;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    bool convert = false; // colour blit between this format and RGBA16F
+    bool convert = false; // blit to/from the plane's canonical format
     UINT width = 0, height = 0;
 };
 
-// Whether a linear color format can be blitted to/from the canonical RGBA16F.
+static bool vram_blit_supported(VkFormat source, VkFormat destination)
+{
+    VkFormatProperties sourceProperties = {}, destinationProperties = {};
+    g_vk.formatProperties(g_vk.physical, source, &sourceProperties);
+    g_vk.formatProperties(g_vk.physical, destination, &destinationProperties);
+    return (sourceProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0 &&
+           (destinationProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+}
+
 // sRGB is deliberately excluded: the host staging path treats its bytes as
 // UNORM and a Vulkan blit would apply an sRGB transfer function instead.
 static bool vram_color_blit_supported(VkFormat format, bool output)
@@ -2316,16 +2327,25 @@ static bool vram_color_blit_supported(VkFormat format, bool output)
     default:
         return false;
     }
-    VkFormatProperties resourceProperties = {}, canonicalProperties = {};
-    g_vk.formatProperties(g_vk.physical, format, &resourceProperties);
-    g_vk.formatProperties(g_vk.physical, VK_FORMAT_R16G16B16A16_SFLOAT, &canonicalProperties);
-    const VkFormatFeatureFlags resourceFeature = output ? VK_FORMAT_FEATURE_BLIT_DST_BIT : VK_FORMAT_FEATURE_BLIT_SRC_BIT;
-    const VkFormatFeatureFlags canonicalFeature = output ? VK_FORMAT_FEATURE_BLIT_SRC_BIT : VK_FORMAT_FEATURE_BLIT_DST_BIT;
-    return (resourceProperties.optimalTilingFeatures & resourceFeature) != 0 &&
-           (canonicalProperties.optimalTilingFeatures & canonicalFeature) != 0;
+    return output ? vram_blit_supported(VK_FORMAT_R16G16B16A16_SFLOAT, format)
+                  : vram_blit_supported(format, VK_FORMAT_R16G16B16A16_SFLOAT);
 }
 
-// Whether `resource` can be copied raw (or, for linear colour, blitted)
+// The host path takes only the first (R) component of an exposure texel.
+static bool vram_exposure_blit_supported(VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return vram_blit_supported(format, VK_FORMAT_R32_SFLOAT);
+    default:
+        return false;
+    }
+}
+
+// Whether `resource` can be copied raw (or, for colour/exposure, blitted)
 // to/from the canonical layout of `plane`.
 static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false)
 {
@@ -2348,7 +2368,9 @@ static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& 
         copy.convert = vram_color_blit_supported(format, output);
         return copy.convert || format == VK_FORMAT_R16G16B16A16_SFLOAT;
     }
-    return vk_texel_bytes(format) == canonical_texel_bytes(plane);
+    if (plane == Plane::Exposure)
+        copy.convert = vram_exposure_blit_supported(format);
+    return copy.convert || vk_texel_bytes(format) == canonical_texel_bytes(plane);
 }
 
 static const VkMemoryBarrier kBeforeTransfer = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -2389,9 +2411,10 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
             g_vk.copyImageToBuffer(cmd, copy.image, layout, slot.vram[index].buffer, 1, &region);
             continue;
         }
-        // Colour conversion: blit (exact for R11G11B10 -> half) into the
-        // RGBA16F image, then copy that.
-        VkImage conversion = feature.colorConversion.image;
+        // Convert colour to RGBA16F or exposure's first component to R32F,
+        // then copy from the canonical image into the shared buffer.
+        VkImage conversion = kPlanes[index] == Plane::Exposure ? feature.exposureConversion.image
+                                                               : feature.colorConversion.image;
         VkImageMemoryBarrier toDestination = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toDestination.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         toDestination.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2590,14 +2613,14 @@ static bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t byte
     return create_vram_buffer(buffer, bytes);
 }
 
-static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height)
+static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height, VkFormat format)
 {
-    if (image.image != VK_NULL_HANDLE && image.width == width && image.height == height)
+    if (image.image != VK_NULL_HANDLE && image.width == width && image.height == height && image.format == format)
         return true;
     if (image.image != VK_NULL_HANDLE)
         feature.retiredImages.push_back(image);
     image = VramImage{};
-    return create_vram_image(image, width, height);
+    return create_vram_image(image, width, height, format);
 }
 
 static void release_vram(Feature& feature)
@@ -2614,6 +2637,7 @@ static void release_vram(Feature& feature)
         destroy_vram_buffer(buffer);
     feature.retiredBuffers.clear();
     destroy_vram_image(feature.colorConversion);
+    destroy_vram_image(feature.exposureConversion);
     destroy_vram_image(feature.outputConversion);
     for (VramImage& image : feature.retiredImages)
         destroy_vram_image(image);
@@ -4406,10 +4430,16 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                 return NGX_FAIL_PLATFORM_ERROR;
         }
         if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
-                                                               vramInputs[0].width, vramInputs[0].height))
+                                                               vramInputs[0].width, vramInputs[0].height,
+                                                               VK_FORMAT_R16G16B16A16_SFLOAT))
+            return NGX_FAIL_PLATFORM_ERROR;
+        if (inputCount == 4 && vramInputs[3].convert &&
+            !ensure_conversion_image(*feature, feature->exposureConversion,
+                                     vramInputs[3].width, vramInputs[3].height, VK_FORMAT_R32_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
         if (vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
-                                                             vramOutput.width, vramOutput.height))
+                                                             vramOutput.width, vramOutput.height,
+                                                             VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
     }
     if ((!p.vram || verify) &&

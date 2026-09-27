@@ -385,6 +385,7 @@ int main(int argc, char** argv)
     }
     const bool qualityScene = std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr;
     const bool poleScene = std::getenv("D4R_HARNESS_POLE_SCENE") != nullptr;
+    const bool exposureRGBA32 = std::getenv("D4R_HARNESS_EXPOSURE_RGBA32") != nullptr;
     const char* replayDir = std::getenv("D4R_HARNESS_REPLAY_DIR");
     const bool rgba8 = std::getenv("D4R_HARNESS_RGBA8") != nullptr;
     if (rgba8 && (qualityScene || motionScene || jitterScene || replayDir != nullptr))
@@ -469,6 +470,7 @@ int main(int argc, char** argv)
     const UINT motionWidth = motionHighRes ? outWidth : resourceWidth, motionHeight = motionHighRes ? outHeight : inHeight;
     std::vector<uint16_t> motion(static_cast<size_t>(motionWidth) * motionHeight * 2, 0);
     const float exposureValue = 1.0f;
+    const std::array<float, 4> exposureRGBA = {exposureValue, 0.25f, 0.5f, 0.75f};
     std::vector<uint16_t> outputInit(static_cast<size_t>(outWidth) * outHeight * 4, 0);
     std::vector<uint8_t> color8;
     std::vector<uint8_t> outputInit8;
@@ -486,7 +488,8 @@ int main(int argc, char** argv)
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* motionTexture = create_texture(motionWidth, motionHeight, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
-    ID3D12Resource* exposureTexture = create_texture(1, 1, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* exposureTexture = create_texture(1, 1,
+        exposureRGBA32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* outputTexture = create_texture(outWidth, outHeight,
                                                    rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -494,7 +497,9 @@ int main(int argc, char** argv)
            resourceWidth * (rgba8 ? 4 : 8), srv);
     upload(depthTexture, depth.data(), resourceWidth * 4, srv);
     upload(motionTexture, motion.data(), motionWidth * 4, srv);
-    upload(exposureTexture, &exposureValue, 4, srv);
+    upload(exposureTexture, exposureRGBA32 ? static_cast<const void*>(exposureRGBA.data())
+                                          : static_cast<const void*>(&exposureValue),
+           exposureRGBA32 ? 16 : 4, srv);
     upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data()) : static_cast<const void*>(outputInit.data()),
            outWidth * (rgba8 ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     std::printf("synthetic inputs uploaded\n");
