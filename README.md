@@ -17,11 +17,7 @@ Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, the same
 | Performance (1280×720) | **87.8** | 84.0 | 69.9 | 94.0 |
 | Ultra Performance (853×480) | 88.9 | **94.5** | 90.3 | 107.3 |
 
-DLSS Ultra Performance demo:
-
-[![DLSS Ultra Performance gameplay demo](docs/media/dlss-demo.jpg)](https://cdn.ayois.gay/dlss)
-
-[Watch the 48-second demo video](https://cdn.ayois.gay/dlss).
+[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
 
 For reference, native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49.1 fps on the same walk.
 
