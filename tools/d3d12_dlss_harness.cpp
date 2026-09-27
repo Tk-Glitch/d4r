@@ -386,6 +386,12 @@ int main(int argc, char** argv)
     const bool qualityScene = std::getenv("D4R_HARNESS_QUALITY_SCENE") != nullptr;
     const bool poleScene = std::getenv("D4R_HARNESS_POLE_SCENE") != nullptr;
     const char* replayDir = std::getenv("D4R_HARNESS_REPLAY_DIR");
+    const bool rgba8 = std::getenv("D4R_HARNESS_RGBA8") != nullptr;
+    if (rgba8 && (qualityScene || motionScene || jitterScene || replayDir != nullptr))
+    {
+        std::fprintf(stderr, "RGBA8 format probe requires the static synthetic scene\n");
+        return 2;
+    }
     const uint32_t replayStart = std::getenv("D4R_HARNESS_REPLAY_START") != nullptr
         ? static_cast<uint32_t>(std::atoi(std::getenv("D4R_HARNESS_REPLAY_START"))) : 1;
     const bool temporal = std::getenv("D4R_HARNESS_TEMPORAL") != nullptr || motionScene || jitterScene || qualityScene ||
@@ -464,19 +470,33 @@ int main(int argc, char** argv)
     std::vector<uint16_t> motion(static_cast<size_t>(motionWidth) * motionHeight * 2, 0);
     const float exposureValue = 1.0f;
     std::vector<uint16_t> outputInit(static_cast<size_t>(outWidth) * outHeight * 4, 0);
+    std::vector<uint8_t> color8;
+    std::vector<uint8_t> outputInit8;
+    if (rgba8)
+    {
+        color8.resize(color.size());
+        for (size_t index = 0; index < color.size(); ++index)
+            color8[index] = static_cast<uint8_t>(std::lround(
+                std::clamp(static_cast<float>(std::bit_cast<_Float16>(color[index])), 0.0f, 1.0f) * 255.0f));
+        outputInit8.resize(static_cast<size_t>(outWidth) * outHeight * 4);
+    }
 
     const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
+        rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* motionTexture = create_texture(motionWidth, motionHeight, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* exposureTexture = create_texture(1, 1, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
-    ID3D12Resource* outputTexture = create_texture(outWidth, outHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    ID3D12Resource* outputTexture = create_texture(outWidth, outHeight,
+                                                   rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    upload(colorTexture, color.data(), resourceWidth * 8, srv);
+    upload(colorTexture, rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
+           resourceWidth * (rgba8 ? 4 : 8), srv);
     upload(depthTexture, depth.data(), resourceWidth * 4, srv);
     upload(motionTexture, motion.data(), motionWidth * 4, srv);
     upload(exposureTexture, &exposureValue, 4, srv);
-    upload(outputTexture, outputInit.data(), outWidth * 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    upload(outputTexture, rgba8 ? static_cast<const void*>(outputInit8.data()) : static_cast<const void*>(outputInit.data()),
+           outWidth * (rgba8 ? 4 : 8), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     std::printf("synthetic inputs uploaded\n");
     trace_stage("synthetic inputs uploaded");
 
@@ -501,7 +521,9 @@ int main(int argc, char** argv)
 
     wchar_t dataPath[MAX_PATH];
     GetTempPathW(MAX_PATH, dataPath);
-    NgxResult result = init(241534723ULL, dataPath, g_device, 0x15, nullptr);
+    const char* appIdSetting = std::getenv("D4R_HARNESS_APP_ID");
+    const unsigned long long appId = appIdSetting != nullptr ? std::strtoull(appIdSetting, nullptr, 10) : 241534723ULL;
+    NgxResult result = init(appId, dataPath, g_device, 0x15, nullptr);
     trace_stage(result == NGX_SUCCESS ? "NGX init succeeded" : "NGX init failed");
     std::printf("NVSDK_NGX_D3D12_Init_Ext -> 0x%08x\n", result);
     if (result != NGX_SUCCESS)
@@ -786,7 +808,7 @@ int main(int argc, char** argv)
         if (saveFrames)
         {
             const std::vector<uint8_t> frameOutput =
-                read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * 8);
+                read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * (rgba8 ? 4 : 8));
             const std::string framePath = std::string(argv[2]) + ".frame" + std::to_string(frame);
             if (FILE* frameFile = std::fopen(framePath.c_str(), "wb"))
             {
@@ -796,7 +818,8 @@ int main(int argc, char** argv)
         }
     }
 
-    const std::vector<uint8_t> output = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outWidth * 8);
+    const std::vector<uint8_t> output = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                  outWidth * (rgba8 ? 4 : 8));
     FILE* file = std::fopen(argv[2], "wb");
     if (file != nullptr)
     {
@@ -804,9 +827,9 @@ int main(int argc, char** argv)
         std::fclose(file);
     }
     size_t nonzero = 0;
-    for (size_t index = 0; index < output.size(); index += 2)
-        nonzero += (output[index] | output[index + 1]) != 0;
-    std::printf("output read back: %zu of %zu halves nonzero, written to %s\n", nonzero, output.size() / 2, argv[2]);
+    for (uint8_t value : output)
+        nonzero += value != 0;
+    std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
 
     release(feature);
     shutdown();

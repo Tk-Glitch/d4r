@@ -1418,8 +1418,7 @@ struct VramBuffer
     size_t bytes = 0;
 };
 
-// An RGBA16F image the color input is converted into when its format is not
-// the canonical one (R11G11B10_FLOAT in Townfall).
+// An RGBA16F image used to convert a noncanonical color input or output.
 struct VramImage
 {
     VkImage image = VK_NULL_HANDLE;
@@ -1552,6 +1551,7 @@ struct Feature
     // formats later stop qualifying.
     bool vram = false, vramDecided = false;
     VramImage colorConversion;
+    VramImage outputConversion;
     // Split frames: the rest of frame N's command list is submitted only once
     // splitSemaphore reaches N (signalled when N retires, or by the watchdog).
     bool split = false;
@@ -2025,6 +2025,8 @@ struct VulkanInterop
     ID3D12DXVKInteropDeviceD4R* split = nullptr; // only with the d4r vkd3d-proton patch
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory = {};
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    PFN_vkGetPhysicalDeviceFormatProperties formatProperties = nullptr;
     PFN_vkCreateBuffer createBuffer = nullptr;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkGetBufferMemoryRequirements bufferRequirements = nullptr;
@@ -2096,7 +2098,10 @@ static void init_vram_interop()
     if (deviceProc == nullptr || memoryProperties == nullptr)
         return;
     memoryProperties(physical, &g_vk.memory);
-    bool ok = true;
+    g_vk.physical = physical;
+    g_vk.formatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+        instanceProc(instance, "vkGetPhysicalDeviceFormatProperties"));
+    bool ok = g_vk.formatProperties != nullptr;
     auto load = [&](auto& function, const char* name) {
         function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(deviceProc(g_vk.device, name));
         ok &= function != nullptr;
@@ -2292,13 +2297,37 @@ struct VramCopy
     ID3D12Resource* resource = nullptr;
     VkImage image = VK_NULL_HANDLE;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    bool convert = false; // colour blit into RGBA16F first
+    bool convert = false; // colour blit between this format and RGBA16F
     UINT width = 0, height = 0;
 };
 
-// Whether `resource` can be copied raw (or, for colour, blitted) into the
-// canonical layout of `plane`; plane Color with rgba16 also describes the output.
-static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy)
+// Whether a linear color format can be blitted to/from the canonical RGBA16F.
+// sRGB is deliberately excluded: the host staging path treats its bytes as
+// UNORM and a Vulkan blit would apply an sRGB transfer function instead.
+static bool vram_color_blit_supported(VkFormat format, bool output)
+{
+    switch (format)
+    {
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        break;
+    default:
+        return false;
+    }
+    VkFormatProperties resourceProperties = {}, canonicalProperties = {};
+    g_vk.formatProperties(g_vk.physical, format, &resourceProperties);
+    g_vk.formatProperties(g_vk.physical, VK_FORMAT_R16G16B16A16_SFLOAT, &canonicalProperties);
+    const VkFormatFeatureFlags resourceFeature = output ? VK_FORMAT_FEATURE_BLIT_DST_BIT : VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+    const VkFormatFeatureFlags canonicalFeature = output ? VK_FORMAT_FEATURE_BLIT_SRC_BIT : VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    return (resourceProperties.optimalTilingFeatures & resourceFeature) != 0 &&
+           (canonicalProperties.optimalTilingFeatures & canonicalFeature) != 0;
+}
+
+// Whether `resource` can be copied raw (or, for linear colour, blitted)
+// to/from the canonical layout of `plane`.
+static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false)
 {
     UINT64 handle = 0, offset = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -2314,8 +2343,12 @@ static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& 
     copy.height = desc.Height;
     copy.aspect = (format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT)
                       ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.convert = plane == Plane::Color && format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    return copy.convert || vk_texel_bytes(format) == canonical_texel_bytes(plane);
+    if (plane == Plane::Color)
+    {
+        copy.convert = vram_color_blit_supported(format, output);
+        return copy.convert || format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    }
+    return vk_texel_bytes(format) == canonical_texel_bytes(plane);
 }
 
 static const VkMemoryBarrier kBeforeTransfer = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -2397,7 +2430,8 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
 
 // Records the copy of a finished result into the output texture, which is in
 // COPY_DEST state already.
-static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer& buffer, const VramCopy& copy)
+static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer& buffer, const VramCopy& copy,
+                               const VramImage& conversion)
 {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
@@ -2407,7 +2441,37 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
     const VkBufferImageCopy region = full_region(copy);
     g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &kBeforeTransfer, 0,
                  nullptr, 0, nullptr);
-    g_vk.copyBufferToImage(cmd, buffer.buffer, copy.image, layout, 1, &region);
+    if (!copy.convert)
+        g_vk.copyBufferToImage(cmd, buffer.buffer, copy.image, layout, 1, &region);
+    else
+    {
+        VkImageMemoryBarrier toDestination = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDestination.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toDestination.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDestination.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDestination.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDestination.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDestination.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDestination.image = conversion.image;
+        toDestination.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                     &toDestination);
+        g_vk.copyBufferToImage(cmd, buffer.buffer, conversion.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkImageMemoryBarrier toSource = toDestination;
+        toSource.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toSource.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                     &toSource);
+        VkImageBlit blit = {};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {static_cast<int32_t>(copy.width), static_cast<int32_t>(copy.height), 1};
+        blit.dstSubresource = blit.srcSubresource;
+        blit.dstOffsets[1] = blit.srcOffsets[1];
+        g_vk.blit(cmd, conversion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy.image, layout, 1, &blit,
+                  VK_FILTER_NEAREST);
+    }
     g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &kAfterTransfer, 0,
                  nullptr, 0, nullptr);
     return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
@@ -2526,9 +2590,8 @@ static bool ensure_vram_buffer(Feature& feature, VramBuffer& buffer, size_t byte
     return create_vram_buffer(buffer, bytes);
 }
 
-static bool ensure_color_conversion(Feature& feature, UINT width, UINT height)
+static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT width, UINT height)
 {
-    VramImage& image = feature.colorConversion;
     if (image.image != VK_NULL_HANDLE && image.width == width && image.height == height)
         return true;
     if (image.image != VK_NULL_HANDLE)
@@ -2551,6 +2614,7 @@ static void release_vram(Feature& feature)
         destroy_vram_buffer(buffer);
     feature.retiredBuffers.clear();
     destroy_vram_image(feature.colorConversion);
+    destroy_vram_image(feature.outputConversion);
     for (VramImage& image : feature.retiredImages)
         destroy_vram_image(image);
     feature.retiredImages.clear();
@@ -4291,7 +4355,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     VramCopy vramInputs[4], vramOutput;
     if ((!feature->vramDecided || feature->vram) && vram_interop_available())
     {
-        p.vram = describe_vram_copy(output, Plane::Color, vramOutput) && !vramOutput.convert;
+        p.vram = describe_vram_copy(output, Plane::Color, vramOutput, true);
         for (int index = 0; index < inputCount && p.vram; ++index)
             p.vram = describe_vram_copy(inputs[index], planes[index], vramInputs[index]);
     }
@@ -4341,7 +4405,11 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
             if (!ensure_vram_buffer(*feature, slot.vram[index], geometry.size()))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
-        if (vramInputs[0].convert && !ensure_color_conversion(*feature, vramInputs[0].width, vramInputs[0].height))
+        if (vramInputs[0].convert && !ensure_conversion_image(*feature, feature->colorConversion,
+                                                               vramInputs[0].width, vramInputs[0].height))
+            return NGX_FAIL_PLATFORM_ERROR;
+        if (vramOutput.convert && !ensure_conversion_image(*feature, feature->outputConversion,
+                                                             vramOutput.width, vramOutput.height))
             return NGX_FAIL_PLATFORM_ERROR;
     }
     if ((!p.vram || verify) &&
@@ -4432,7 +4500,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         // Runs in the second half of the list, once frame's result is in place.
         const int target = static_cast<int>(frame % kOutputSlots);
         transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!record_vram_output(list, feature->outputs[target].vram, vramOutput))
+        if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
             logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
         transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
         if (timing.enabled)
@@ -4441,7 +4509,7 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     else if (latest >= 0 && p.vram)
     {
         transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!record_vram_output(list, feature->outputs[latest].vram, vramOutput))
+        if (!record_vram_output(list, feature->outputs[latest].vram, vramOutput, feature->outputConversion))
             logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
         transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
     }

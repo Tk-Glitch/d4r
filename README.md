@@ -1,8 +1,8 @@
-# d4r
+# d4r (dlss 4 radeon)
 
 d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest DLSS kernels replaced by hand-written RDNA3 code.
 
-It is an experiment. It has been tested on one GPU and one game, it depends on unreleased patches to ZLUDA and vkd3d-proton, and it needs NVIDIA files that are not part of this repository.
+It is an experiment. It has been tested on one GPU in two games, it depends on unreleased patches to ZLUDA and vkd3d-proton, and it needs NVIDIA files that are not part of this repository.
 
 > **Not affiliated with NVIDIA or AMD.**
 

@@ -6,8 +6,8 @@ DirectX 12 games under Proton. OptiScaler (included) catches the game's DLSS cal
 d4r. d4r then runs NVIDIA's DLSS on the Radeon through ZLUDA, with the heaviest parts replaced by
 kernels written for RDNA3.
 
-This is an early release. It has been tested on one GPU (Radeon RX 7700 XT) and one game
-(SILENT HILL Townfall). Expect problems in other games.
+This is an early release. It has been tested on one GPU (Radeon RX 7700 XT) in
+SILENT HILL Townfall and Ghost of Tsushima DIRECTOR'S CUT. Expect problems in other games.
 
 
 What you need

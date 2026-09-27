@@ -2,7 +2,7 @@
 
 NVIDIA's own DLSS Super Resolution on AMD Radeon RX 7000 (RDNA3) GPUs, in DirectX 12 games under Proton. This is the first release packaged as a drop-in zip, to install extract it next to the game's executable and set one line of launch options.
 
-It is an early release, tested on one GPU (RX 7700 XT) and one game (SILENT HILL Townfall).
+It is an early release, tested on one GPU (RX 7700 XT) in SILENT HILL Townfall and Ghost of Tsushima DIRECTOR'S CUT.
 
 ## Install
 
@@ -25,6 +25,7 @@ It is an early release, tested on one GPU (RX 7700 XT) and one game (SILENT HILL
 
 - **d4r:** the NGX shim, the Wine CUDA bridge, and hand-written RDNA3 kernels for the DLSS 4 (K) and DLSS 4.5 (M) network layers.
   - Each kernel is used only when the DLSS library's code for it matches the code it was written for. Swapping in another DLSS version therefore still works, only slower.
+  - Linear 8-bit colour inputs and outputs can stay in VRAM when Vulkan supports the required blits, fixing the slow staging path seen in Ghost of Tsushima.
   - `d4r/d4r.ini` holds the settings for that game. The default model is DLSS 4 (K); E (DLSS 3 CNN) and M (DLSS 4.5) are one line away.
 - **NVIDIA:** DLSS 310.7.0 (`nvngx_dlss.dll`), the NGX runtime from driver 596.36 (`_nvngx.dll`), and five DLSS kernels built from NVIDIA's code with parts replaced by d4r's.
 - **ZLUDA** with d4r's patches: CUDA on ROCm.
@@ -46,12 +47,12 @@ Radeon RX 7700 XT, SILENT HILL Townfall at 2560×1440, average fps over the same
 
 Native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49 fps, so DLSS 4 at Quality is 40% faster than native.
 
-DLSS 4 in every mode, and E and M at Quality, were measured with this release. The other E and M figures come from the development setup, which runs the same kernels.
+The Townfall figures were measured before the 8-bit VRAM conversion update, using the same native kernels. Ghost of Tsushima was checked in a live run with the updated shim; its VRAM path stayed on and gameplay performance improved, but no matched benchmark was recorded.
 
 ## Known limitations
 
 - Only DLSS Super Resolution in DirectX 12 games. No Frame Generation or Ray Reconstruction.
-- Tested with one game. Do not use it in games with anti-cheat.
+- Tested with two games. Do not use it in games with anti-cheat.
 - DLSS 4.5 (M) is much slower than FSR 4 on RDNA3.
 
 ## Licenses
@@ -60,4 +61,4 @@ d4r is Apache 2.0. The zip also contains ZLUDA (Apache 2.0 or MIT), vkd3d-proton
 
 NVIDIA's files in the zip, and the kernels built from NVIDIA's code, belong to NVIDIA and are not covered by any of these licenses. d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.
 
-**SHA-256** `d4r-0.1.0.zip`: `ddaa0866273c6e31f2f1282b2cc2ac370c804b04e8895cdda27c096747edf5a1`
+**SHA-256** `d4r-0.1.0.zip`: `487f8c98c0c5617449dddd5f573bfd4b7333c8c2f5a87198d485256673cabdba`

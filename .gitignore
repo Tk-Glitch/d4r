@@ -22,6 +22,7 @@ __pycache__/
 .venv/
 /Archive.zip
 /vkd3d-proton.cache
+.vscode/
 
 # Machine-specific notes, CI runner setup, local experiments, benchmark automation (kept locally, never published)
 /private/
