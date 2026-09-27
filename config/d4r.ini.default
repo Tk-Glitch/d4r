@@ -1,0 +1,126 @@
+; d4r configuration: official NVIDIA DLSS on AMD (ZLUDA + Wine CUDA bridge + NGX shim)
+;
+; Read by scripts/run_game_d4r_optiscaler_proton.sh at every game launch. The first launch copies
+; this file to ~/.config/d4r/d4r.ini (or D4R_CONFIG); edit that copy. Changes apply at the next launch.
+;
+; Every value can be left as "auto" (or empty) to keep the built-in default. An environment variable
+; set before launching (e.g. D4R_DLSS_PRESET=11) always wins over this file.
+; Paths may use ~ for your home directory.
+
+[Launch]
+; Used by scripts/d4r_play.sh (one-command launch). Examples:
+;   ProtonDir = ~/.local/share/Steam/compatibilitytools.d/GE-Proton11-3
+;   CompatDataDir = ~/.local/share/Steam/steamapps/compatdata/<appid>
+;   GameExe = ~/Games/MyGame/Binaries/Win64/MyGame-Win64-Shipping.exe
+ProtonDir =
+CompatDataDir =
+GameExe =
+
+[DLSS]
+; Which DLSS network ("preset") to run. fps measured on an RX 7700 XT, Townfall 2560x1440, same street
+; walk, for Quality / Balanced / Performance / Ultra Performance (FSR 4: 76 / 85 / 94 / 107):
+;   E (or CNN)     = DLSS 3 CNN, the fastest at Quality..Performance  72 / 81 / 88 / 89
+;   K (or DLSS4)   = DLSS 4 transformer, sharper; best at Ultra Perf  69 / 77 / 84 / 95
+;   M (or DLSS4.5) = DLSS 4.5 transformer, best image, slowest        52 / 60 / 70 / 90
+;   F = the other CNN (same speed as E); A, B, C, D, G, J run the K network in this DLSS version;
+;   L (DLSS 4.5 Ultra Performance model) is not accelerated here and runs very slowly.
+;   auto = whatever the game/OptiScaler asks for
+Model = K
+[Latency]
+; How many frames old the upscaled image the game presents may be.
+;   0 = same frame (no added latency, no trailing artefacts; needs VkD3DDir below)
+;   1 = at most 1 frame old
+;   2 = 2 frames old (roughly +20% fps with DLSS 4.5, adds ~2 frames of input latency,
+;       fast motion can trail)
+;   3 = 2-3 frames old (about the same fps as 2 in practice)
+FrameAge = 0
+
+[Kernels]
+; Native RDNA3 kernels for the DLSS 4 and 4.5 network layers (replace ZLUDA's translated code).
+;   fast  = native kernels with relaxed numerics (visually identical to exact, ~15% faster)
+;   exact = native kernels that reproduce NVIDIA's FP8/f16 rounding bit for bit
+;   off   = ZLUDA-translated kernels only
+; fast/exact need the code objects built by the native-kernel tools ([Paths] NativeKernelDir*).
+NativeKernels = off
+; FP8 tensor-core emulation on RDNA3 WMMA (much faster than the scalar path).
+Fp8Wmma = true
+; Drop per-instruction flush-to-zero mode switches in ZLUDA-compiled kernels
+; (only values below ~1e-38 differ; a little faster).
+IgnoreDenormals = true
+; Thread-block bound assumed for kernels without launch bounds (256 avoids register spills).
+ImplicitMaxBlock = 256
+
+[Interop]
+; Keep DLSS inputs and output in VRAM (vkd3d-proton Vulkan interop) instead of copying through
+; system memory. Falls back automatically when the game's resources do not qualify.
+VramInterop = true
+; Wait for the input copies before DLSS runs (prevents beaded thin lines in motion). Keep on.
+InputSync = true
+; Faster hand-offs between the game and DLSS (same frame, same result). Need FrameAge = 0 and VRAM
+; interop, and a runtime built from this checkout (scripts/install_d4r_runtime.sh).
+;   GpuWait: DLSS is queued ahead and starts on the GPU the moment the game's inputs are ready
+;   LinearInputs: DLSS reads the game's inputs in place (no input copies; needs GpuWait)
+;   DirectOutput: the result is written straight into the game-side buffer (preset K, and only while
+;     NGX runs the native output kernel; drops NVIDIA's "DLSS SDK" watermark)
+;   ElideNgxSync: removes NGX's internal CPU waits between its GPU stages
+;   EvalSync = false: no CPU wait between DLSS and the output copy
+;   MarkerPollUs: how often (microseconds) the CPU checks for the game's inputs without GpuWait
+GpuWait = true
+LinearInputs = true
+DirectOutput = true
+ElideNgxSync = true
+EvalSync = false
+MarkerPollUs = 20
+
+[Paths]
+; auto = defaults of scripts/d4r_proton_env.sh
+RuntimeDir = auto
+; ZLUDA build (directory with libcuda.so / libnvcuda.so)
+ZludaDir = auto
+RocmDir = auto
+; d4r-patched vkd3d-proton (d3d12.dll + d3d12core.dll); required for FrameAge = 0
+VkD3DDir = auto
+; JIT cache directory (XDG_CACHE_HOME): auto = the default ~/.cache; per-zluda = one per ZLUDA build,
+; ~/.cache/d4r-perf-game-jit-<ZludaDir name> (a new ZLUDA build compiles every kernel once on first use)
+JitCacheDir = auto
+; Native kernel code objects, one directory per NativeKernels mode
+NativeKernelDirFast = auto
+NativeKernelDirExact = auto
+
+[Game]
+; Unreal Engine games: extra console variables applied for this launch only (the game's Engine.ini is
+; backed up and restored on exit). Example for sharper thin lines in SILENT HILL Townfall:
+;   EngineIni = ~/.local/share/Steam/steamapps/compatdata/<appid>/pfx/drive_c/users/steamuser/AppData/Local/Townfall/Saved/Config/Windows/Engine.ini
+;   Cvars = r.Tonemapper.Sharpen=0;r.SceneColorFringeQuality=0
+EngineIni =
+Cvars =
+
+[OptiScaler]
+; OptiScaler's own FPS overlay (top left)
+FpsOverlay = true
+; 0 = simple ... 3 = detailed with frame-time graph
+FpsOverlayType = 3
+LogLevel = 2
+; Override the render resolution OptiScaler requests per quality mode, e.g. 2.0 turns the game's
+; "Quality" into Performance-level input (1280x720 for 1440p). auto = the game's choice.
+QualityRatioQuality = auto
+QualityRatioBalanced = auto
+QualityRatioPerformance = auto
+QualityRatioUltraPerformance = auto
+; Any other OptiScaler.ini settings for this launch, "Section.Key=value;Section.Key=value"
+Extra =
+
+[Overlay]
+; MangoHud FPS counter (top right)
+MangoHud = false
+MangoHudConfig = fps,frametime,frame_timing=0,gpu_stats=0,cpu_stats=0,position=top-right,font_size=36
+
+[Debug]
+; Per-frame timing lines in the shim log (d4r_nvngx.log)
+Profile = false
+; Log directory (auto = ~/.cache/d4r-dlss-captures/game-<exe>-<time>)
+LogDir = auto
+
+[Env]
+; Anything else, passed through as environment variables (one per line):
+;   D4R_SHIM_SPLIT_TIMEOUT_MS = 200

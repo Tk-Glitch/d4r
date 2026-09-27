@@ -1,0 +1,34 @@
+# Local proprietary/runtime inputs and outputs
+*.dll
+*.exe
+*.asi
+*.pth
+*.safetensors
+*.onnx
+*.cubin
+*.fatbin
+*.nvngx
+
+# Local captures, dumps, traces, and build products
+/captures/
+/dumps/
+/traces/
+/build/
+/dist/
+*.trace
+*.dump
+*.log
+__pycache__/
+.venv/
+/Archive.zip
+/vkd3d-proton.cache
+
+# Machine-specific notes, CI runner setup, local experiments, benchmark automation (kept locally, never published)
+/private/
+# Claude Code local settings
+/.claude/
+# Native kernel build products and inputs extracted from NVIDIA's DLL at build time
+/kernels/out/
+*.hsaco
+*.ptx
+/kernels/extracted/

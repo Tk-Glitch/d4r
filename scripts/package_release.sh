@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Builds the drag-in release: a zip whose contents are extracted into the folder that holds a game's
+# main .exe, like an OptiScaler release. packaging/D4R_README.txt describes the result.
+#
+# usage: scripts/package_release.sh [OUT_DIR]          (default: dist/)
+#
+# Inputs (environment):
+#   D4R_OPTISCALER   OptiScaler release archive (.7z or .zip) or extracted folder (required; 0.9.4 tested)
+#   D4R_DLSS_DLLS    colon-separated nvngx_dlss.dll files whose kernel code the native kernels accept
+#                    (required; only hashes of their PTX go into the release)
+#   D4R_ZLUDA_DIR    ZLUDA build with patches/zluda applied (libnvcuda.so)   default ~/.cache/d4r-zluda-current
+#   D4R_VKD3D_DIR    d4r-patched vkd3d-proton (d3d12.dll, d3d12core.dll)    default ~/.cache/d4r-vkd3d-d4r
+#   D4R_ROCM_DIR     ROCm with clang, for the kernels                       default /opt/rocm
+#   D4R_GPU_ARCHS    GPU targets to build kernels for                       default gfx1101
+#   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: the system's SPDX copy
+#   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
+#   D4R_ZLUDA_SRC    ZLUDA source checkout, for its license files            default: D4R_ZLUDA_DIR's ../d4r-zluda-upstream
+#   SOURCE_DATE_EPOCH  timestamp given to every packaged file                default: the last commit's
+# The zip also contains NVIDIA's files and the texture kernels built from NVIDIA's PTX; redistributing
+# those is up to whoever publishes it (they are not covered by d4r's license):
+#   D4R_BUNDLE_DLSS  nvngx_dlss.dll to include      D4R_BUNDLE_NGX  _nvngx.dll to include
+#   D4R_BUNDLE_TEX   directory with the texture-kernel code objects (kernels/build.sh tex), for gfx1101
+# D4R_BUNDLE_NVIDIA=0 leaves them out (d4r-VERSION-nonvidia.zip; users then add the two DLLs themselves).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="$(realpath -m "${1:-$ROOT/dist}")"
+VERSION="$(cat "$ROOT/packaging/VERSION")"
+VARIANT=full
+[[ "${D4R_BUNDLE_NVIDIA:-1}" == 0 ]] && VARIANT=clean
+NAME="d4r-$VERSION"
+[[ "$VARIANT" == clean ]] && NAME="$NAME-nonvidia"
+STAGE="$OUT/$NAME"
+ZLUDA="${D4R_ZLUDA_DIR:-$HOME/.cache/d4r-zluda-current}"
+VKD3D="${D4R_VKD3D_DIR:-$HOME/.cache/d4r-vkd3d-d4r}"
+ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
+ARCHS="${D4R_GPU_ARCHS:-gfx1101}"
+: "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
+: "${D4R_DLSS_DLLS:?set D4R_DLSS_DLLS to the nvngx_dlss.dll files the kernel manifest accepts}"
+for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll"; do
+  [[ -f "$f" ]] || { echo "missing $f" >&2; exit 2; }
+done
+
+# D4R_SKIP_BUILD=1 packages the shim and bridge already in build/ (e.g. the binaries that were tested)
+if [[ "${D4R_SKIP_BUILD:-0}" != 1 ]]; then
+  "$ROOT/scripts/build_d4r_nvngx_shim.sh" >/dev/null
+  "$ROOT/scripts/build_wine_nvcuda_bridge.sh" >/dev/null
+fi
+
+rm -rf "$STAGE"
+mkdir -p "$STAGE/d4r/zluda" "$STAGE/d4r/ngx" "$STAGE/d4r/kernels" "$STAGE/d4r/licenses" "$STAGE/d4r/source"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# OptiScaler, as dxgi.dll with its INI preconfigured for d4r
+if [[ -d "$D4R_OPTISCALER" ]]; then
+  OPTI="$D4R_OPTISCALER"
+else
+  OPTI="$TMP/optiscaler"
+  mkdir -p "$OPTI"
+  case "$D4R_OPTISCALER" in
+    *.7z) 7z x -y -o"$OPTI" "$D4R_OPTISCALER" >/dev/null ;;
+    *.zip) unzip -q -o "$D4R_OPTISCALER" -d "$OPTI" ;;
+    *) echo "D4R_OPTISCALER must be a .7z, a .zip or a folder" >&2; exit 2 ;;
+  esac
+fi
+cp "$OPTI/OptiScaler.dll" "$STAGE/dxgi.dll"
+python3 - "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini" <<'PY'
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8", newline="").read().split("\n")  # keeps the file's line endings
+for setting in open(sys.argv[2], encoding="utf-8"):
+    setting = setting.strip()
+    if not setting or setting.startswith("#"):
+        continue
+    path, value = setting.split("=", 1)
+    section, key = path.split(".", 1)
+    start = next((i for i, l in enumerate(lines) if l.strip() == f"[{section}]"), None)
+    if start is None:
+        sys.exit(f"OptiScaler.ini has no [{section}]")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+    for i in range(start + 1, end):
+        if re.match(rf"{re.escape(key)}\s*=", lines[i]):
+            lines[i] = f"{key}={value}" + ("\r" if lines[i].endswith("\r") else "")
+            break
+    else:
+        sys.exit(f"OptiScaler.ini has no {key} in [{section}]")
+open(sys.argv[3], "w", encoding="utf-8", newline="").write("\n".join(lines))
+PY
+
+# d4r-patched vkd3d-proton: same-frame DLSS results
+cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"
+
+# d4r itself
+cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r/nvngx.dll"
+cp "$ROOT/build/wine-nvcuda/x86_64-unix/nvcuda.dll.so" "$STAGE/d4r/nvcuda.dll"
+cp "$ZLUDA/libnvcuda.so" "$STAGE/d4r/zluda/libcuda.so"
+cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
+cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
+if [[ "$VARIANT" == full ]]; then
+  : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_NGX:?set D4R_BUNDLE_NGX}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
+  cp "$D4R_BUNDLE_DLSS" "$STAGE/d4r/nvngx_dlss.dll"
+  cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
+else
+  printf 'Put NVIDIA'"'"'s NGX runtime, _nvngx.dll, in this folder (see D4R_README.txt).\r\n' > "$STAGE/d4r/ngx/README.txt"
+fi
+IFS=: read -r -a DLLS <<< "$D4R_DLSS_DLLS"
+for arch in $ARCHS; do
+  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$arch" >/dev/null
+  D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$arch" >/dev/null
+  rm -f "$STAGE/d4r/kernels/$arch"/*.resolution.txt  # empty LTO notes from clang's -save-temps
+  if [[ "$VARIANT" == full && "$arch" == gfx1101 ]]; then
+    for f in "$D4R_BUNDLE_TEX"/*.hsaco; do  # texture kernels only; the layers above are built from source
+      [[ -e "$STAGE/d4r/kernels/$arch/$(basename "$f")" ]] || cp "$f" "$STAGE/d4r/kernels/$arch/"
+    done
+  fi
+  python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$arch" "${DLLS[@]}"
+done
+
+# licenses and sources
+ZLUDA_SRC="${D4R_ZLUDA_SRC:-$(dirname "$ZLUDA")/d4r-zluda-upstream}"
+VKD3D_SRC="${D4R_VKD3D_SRC:-$HOME/.cache/d4r-vkd3d-proton}"
+L="$STAGE/d4r/licenses"
+cp "$ROOT/LICENSE" "$L/d4r-LICENSE.txt"
+cp "$ROOT/NOTICE" "$L/d4r-NOTICE.txt"
+cp "$ZLUDA_SRC/LICENSE-APACHE" "$L/ZLUDA-LICENSE-APACHE.txt"
+cp "$ZLUDA_SRC/LICENSE-MIT" "$L/ZLUDA-LICENSE-MIT.txt"
+cp "$ZLUDA_SRC/ext/llvm-project/llvm/LICENSE.TXT" "$L/LLVM-LICENSE.txt"
+cp "$VKD3D_SRC/LICENSE" "$L/vkd3d-proton-LICENSE.txt"
+cp "$VKD3D_SRC/COPYING" "$L/vkd3d-proton-COPYING.txt"
+cp "${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-only.txt}" "$L/OptiScaler-LICENSE-GPL-3.0.txt"
+mkdir -p "$STAGE/d4r/source/patches"
+cp -r "$ROOT/patches/zluda" "$ROOT/patches/vkd3d-proton" "$STAGE/d4r/source/patches/"
+ZLUDA_COMMIT="$(git -C "$ZLUDA_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+VKD3D_COMMIT="$(git -C "$VKD3D_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+# "@clean " / "@full " lines belong to one variant only
+variant() { sed -n -e "s/^@$VARIANT //" -e '/^@[a-z]* /d' -e p; }
+file_version() { [[ -f "$1" ]] && strings -el "$1" | grep -A1 '^FileVersion$' | sed -n 2p | tr ',' '.' | tr -d ' '; }
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@ZLUDA_COMMIT@/$ZLUDA_COMMIT/g" -e "s/@VKD3D_COMMIT@/$VKD3D_COMMIT/g" \
+  -e "s/@DLSS_VERSION@/$(file_version "$STAGE/d4r/nvngx_dlss.dll")/g" -e "s/@NGX_VERSION@/$(file_version "$STAGE/d4r/ngx/_nvngx.dll")/g" \
+  "$ROOT/packaging/SOURCES.txt" | variant > "$STAGE/d4r/source/SOURCES.txt"
+sed -e "s/@VERSION@/$VERSION/g" "$ROOT/packaging/D4R_README.txt" | variant | sed 's/$/\r/' > "$STAGE/D4R_README.txt"
+
+# One timestamp for every file (SOURCE_DATE_EPOCH, default the last commit): ZLUDA's kernel cache is keyed on
+# its library's size and mtime, so every extraction of the zip shares one cache.
+EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct)}"
+find "$STAGE" -exec touch -h -d "@$EPOCH" {} +
+# The zip holds the folder's contents, so it can be extracted straight into the game folder.
+rm -f "$OUT/$NAME.zip"
+(cd "$STAGE" && find . -type f | LC_ALL=C sort | sed 's|^\./||' | zip -q -X -9 "$OUT/$NAME.zip" -@)
+(cd "$OUT" && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
+printf 'Built %s (%s)\n' "$OUT/$NAME.zip" "$(du -h "$OUT/$NAME.zip" | cut -f1)"
