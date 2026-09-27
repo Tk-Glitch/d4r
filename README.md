@@ -8,6 +8,8 @@ It is an experiment. It has been tested on one GPU in two games, it depends on u
 
 ## Results
 
+[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
+
 Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, the same 62-second street walk for every run, frame rates from MangoHud frametime logs. Every DLSS result is presented in the frame it belongs to (no added latency).
 
 | Mode | DLSS 3 CNN (preset E) | DLSS 4 (preset K) | DLSS 4.5 (preset M) | FSR 4 |
@@ -16,8 +18,6 @@ Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, the same
 | Balanced (1488×837) | **80.5** | 76.6 | 59.6 | 84.5 |
 | Performance (1280×720) | **87.8** | 84.0 | 69.9 | 94.0 |
 | Ultra Performance (853×480) | 88.9 | **94.5** | 90.3 | 107.3 |
-
-[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
 
 For reference, native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49.1 fps on the same walk.
 
