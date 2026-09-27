@@ -4,6 +4,8 @@ d4r runs NVIDIA's official DLSS Super Resolution library (`nvngx_dlss.dll`) in W
 
 It is an experiment. It has been tested on one GPU in two games, it depends on unreleased patches to ZLUDA and vkd3d-proton, and it needs NVIDIA files that are not part of this repository.
 
+See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
+
 > **Not affiliated with NVIDIA or AMD.**
 
 ## Results
