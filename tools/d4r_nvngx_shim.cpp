@@ -495,8 +495,12 @@ static void load_portable_config()
 
     const std::string zluda = ini_value(ini, "paths", "ZludaDir");
     portable_set_unix("D4R_ZLUDA_LIBCUDA", (zluda.empty() ? g_portable.unixDir + "/zluda" : zluda) + "/libcuda.so");
-    if (const std::string rocm = ini_value(ini, "paths", "RocmDir"); !rocm.empty())
+    // The release's bundled ROCm runtime unless d4r.ini names another
+    const std::string rocm = ini_value(ini, "paths", "RocmDir");
+    if (!rocm.empty())
         portable_set_unix("D4R_ROCM_DIR", rocm);
+    else if (!g_portable.unixDir.empty() && GetFileAttributesW((dir + L"\\rocm\\lib").c_str()) != INVALID_FILE_ATTRIBUTES)
+        portable_set_unix("D4R_ROCM_DIR", g_portable.unixDir + "/rocm");
     const std::string cache = ini_value(ini, "paths", "CacheDir");
     portable_set_unix("D4R_ZLUDA_CACHE_HOME", cache.empty() ? "~/.cache/d4r" : cache);
 

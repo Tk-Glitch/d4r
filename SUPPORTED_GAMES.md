@@ -6,7 +6,7 @@ The following DirectX 12 games run DLSS Super Resolution through d4r on the test
 |---|---|---|---|
 | SILENT HILL Townfall | Works | Works | Works |
 | Ghost of Tsushima DIRECTOR'S CUT | Works | Works | Works |
-| Ready or Not | Works | Works; visible graphical artifacts | Works; minor artifacts |
+| Ready or Not | Works | Works; visible graphical artifacts with hdr enabled | Works |
 |  |  |  |  |
 |  |  |  |  |
 |  |  |  |  |

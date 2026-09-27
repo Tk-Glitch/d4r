@@ -18,6 +18,16 @@ Third-party software, unmodified or patched by d4r:
                          commit @VKD3D_COMMIT@ with d4r/source/patches/vkd3d-proton/0001 applied,
                          built with its build-win64.txt cross file (meson --buildtype release).
                          Licenses: d4r/licenses/vkd3d-proton-*.txt
+  d4r/rocm/lib/          ROCm 7.2.4 runtime, unmodified, from AMD's Ubuntu 22.04 packages
+                         (https://repo.radeon.com/rocm/apt/7.2.4): HIP (hip-runtime-amd, MIT),
+                         comgr (NCSA; contains LLVM, Apache License 2.0 with LLVM exceptions),
+                         ROCr (hsa-rocr, NCSA) and rocprofiler-register (MIT).
+                         Sources: https://github.com/ROCm/rocm-systems and https://github.com/ROCm/llvm-project,
+                         tag rocm-7.2.4. Licenses: d4r/licenses/ROCm-*
+                         libelf.so.1 (elfutils 0.186, GNU LGPL 3.0 or GPL 2.0) and libnuma.so.1 (numactl 2.0.14,
+                         GNU LGPL 2.1), unmodified, from Ubuntu 22.04's libelf1 and libnuma1 packages; their
+                         sources are Ubuntu's elfutils 0.186-1ubuntu0.1 and numactl 2.0.14-3ubuntu2 source packages.
+                         Licenses: d4r/licenses/ROCm-lib*-copyright.txt
   dxgi.dll               OptiScaler 0.9.4 (GNU GPL 3.0), unmodified OptiScaler.dll renamed to dxgi.dll.
                          Source: https://github.com/optiscaler/OptiScaler/tree/v0.9.4
                          License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt

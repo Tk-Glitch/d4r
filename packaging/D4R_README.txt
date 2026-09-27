@@ -14,9 +14,8 @@ What you need
 -------------
 - An AMD Radeon RX 7000 series GPU (RDNA3). The fast kernels are built for gfx1101
   (RX 7700 XT, RX 7800 XT). Other RDNA3 cards run DLSS without them, which is much slower.
-- Linux with ROCm's HIP runtime, version 7 (the file libamdhip64.so.7). ROCm 7.2 was tested.
-  Arch Linux: the hip-runtime-amd package. Ubuntu, Fedora and others: the ROCm HIP runtime package
-  of your distribution or of AMD's ROCm repository.
+- Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
+  ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.
 @clean - Two NVIDIA files, which this zip does not include:
 @clean   - nvngx_dlss.dll, the DLSS library, version 310.7 or 310.9 (tested: 310.7.0 and 310.9.1).

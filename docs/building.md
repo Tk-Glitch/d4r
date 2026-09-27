@@ -84,6 +84,7 @@ In the game, pick DLSS as the upscaler (OptiScaler intercepts it). Every setting
 ## 7. Package a release
 
 ```sh
+scripts/fetch_rocm_runtime.sh         # -> ~/.cache/d4r-rocm-runtime (AMD's ROCm 7.2.4 runtime, checksummed)
 D4R_OPTISCALER=/path/to/OptiScaler_0.9.4.7z \
 D4R_DLSS_DLLS=/path/to/310.7/nvngx_dlss.dll:/path/to/310.9/nvngx_dlss.dll \
 D4R_BUNDLE_DLSS=/path/to/nvngx_dlss.dll D4R_BUNDLE_NGX=/path/to/_nvngx.dll D4R_BUNDLE_TEX=kernels/out/native \
@@ -96,7 +97,7 @@ The script:
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
 - stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`;
 - adds NVIDIA's two DLLs and the texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`);
-- zips the result together with the ZLUDA and vkd3d-proton builds, `packaging/d4r.ini`, the licenses and the patches.
+- zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
 
 The NVIDIA files are not covered by d4r's license; redistributing them is up to whoever publishes the zip. `D4R_BUNDLE_NVIDIA=0` builds `d4r-<version>-nonvidia.zip` without them and without the texture kernels. [architecture.md](architecture.md#portable-installs-the-release-zip) describes how the installed files work together.
 

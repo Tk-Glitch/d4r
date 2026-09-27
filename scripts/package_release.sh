@@ -11,6 +11,8 @@
 #   D4R_ZLUDA_DIR    ZLUDA build with patches/zluda applied (libnvcuda.so)   default ~/.cache/d4r-zluda-current
 #   D4R_VKD3D_DIR    d4r-patched vkd3d-proton (d3d12.dll, d3d12core.dll)    default ~/.cache/d4r-vkd3d-d4r
 #   D4R_ROCM_DIR     ROCm with clang, for the kernels                       default /opt/rocm
+#   D4R_ROCM_RUNTIME ROCm runtime bundled as d4r/rocm (scripts/fetch_rocm_runtime.sh)
+#                                                                           default ~/.cache/d4r-rocm-runtime
 #   D4R_GPU_ARCHS    GPU targets to build kernels for                       default gfx1101
 #   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: the system's SPDX copy
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
@@ -34,11 +36,12 @@ STAGE="$OUT/$NAME"
 ZLUDA="${D4R_ZLUDA_DIR:-$HOME/.cache/d4r-zluda-current}"
 VKD3D="${D4R_VKD3D_DIR:-$HOME/.cache/d4r-vkd3d-d4r}"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
+ROCM_RUNTIME="${D4R_ROCM_RUNTIME:-$HOME/.cache/d4r-rocm-runtime}"
 ARCHS="${D4R_GPU_ARCHS:-gfx1101}"
 : "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
 : "${D4R_DLSS_DLLS:?set D4R_DLSS_DLLS to the nvngx_dlss.dll files the kernel manifest accepts}"
-for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll"; do
-  [[ -f "$f" ]] || { echo "missing $f" >&2; exit 2; }
+for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$ROCM_RUNTIME/lib/libamdhip64.so.7"; do
+  [[ -f "$f" ]] || { echo "missing $f (the ROCm runtime comes from scripts/fetch_rocm_runtime.sh)" >&2; exit 2; }
 done
 
 # D4R_SKIP_BUILD=1 packages the shim and bridge already in build/ (e.g. the binaries that were tested)
@@ -48,7 +51,7 @@ if [[ "${D4R_SKIP_BUILD:-0}" != 1 ]]; then
 fi
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/d4r/zluda" "$STAGE/d4r/ngx" "$STAGE/d4r/kernels" "$STAGE/d4r/licenses" "$STAGE/d4r/source"
+mkdir -p "$STAGE/d4r/zluda" "$STAGE/d4r/rocm" "$STAGE/d4r/ngx" "$STAGE/d4r/kernels" "$STAGE/d4r/licenses" "$STAGE/d4r/source"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -94,6 +97,7 @@ cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"
 cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r/nvngx.dll"
 cp "$ROOT/build/wine-nvcuda/x86_64-unix/nvcuda.dll.so" "$STAGE/d4r/nvcuda.dll"
 cp "$ZLUDA/libnvcuda.so" "$STAGE/d4r/zluda/libcuda.so"
+cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
 if [[ "$VARIANT" == full ]]; then
@@ -128,6 +132,7 @@ cp "$ZLUDA_SRC/ext/llvm-project/llvm/LICENSE.TXT" "$L/LLVM-LICENSE.txt"
 cp "$VKD3D_SRC/LICENSE" "$L/vkd3d-proton-LICENSE.txt"
 cp "$VKD3D_SRC/COPYING" "$L/vkd3d-proton-COPYING.txt"
 cp "${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-only.txt}" "$L/OptiScaler-LICENSE-GPL-3.0.txt"
+for f in "$ROCM_RUNTIME"/licenses/*; do cp "$f" "$L/ROCm-$(basename "$f")"; done
 mkdir -p "$STAGE/d4r/source/patches"
 cp -r "$ROOT/patches/zluda" "$ROOT/patches/vkd3d-proton" "$STAGE/d4r/source/patches/"
 ZLUDA_COMMIT="$(git -C "$ZLUDA_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"

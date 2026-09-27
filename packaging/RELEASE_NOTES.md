@@ -18,7 +18,7 @@ It is an early release, tested on one GPU (RX 7700 XT) in SILENT HILL Townfall a
 ## Requirements
 
 - AMD Radeon RX 7000 series. The fast kernels are built for gfx1101 (RX 7700 XT, RX 7800 XT). Other RDNA3 cards run DLSS without them, which is much slower.
-- The ROCm HIP runtime 7.x (`libamdhip64.so.7`), from your distribution. ROCm 7.2 was tested.
+- The amdgpu kernel driver (`/dev/kfd`). The ROCm 7.2.4 runtime is included in `d4r/rocm`; nothing needs to be installed.
 - GE-Proton 11 (tested: GE-Proton11-3).
 
 ## What is in the zip
@@ -29,6 +29,7 @@ It is an early release, tested on one GPU (RX 7700 XT) in SILENT HILL Townfall a
   - `d4r/d4r.ini` holds the settings for that game. The default model is DLSS 4 (K); E (DLSS 3 CNN) and M (DLSS 4.5) are one line away.
 - **NVIDIA:** DLSS 310.7.0 (`nvngx_dlss.dll`), the NGX runtime from driver 596.36 (`_nvngx.dll`), and five DLSS kernels built from NVIDIA's code with parts replaced by d4r's.
 - **ZLUDA** with d4r's patches: CUDA on ROCm.
+- **ROCm 7.2.4 runtime** (HIP, HSA, comgr), unmodified, from AMD's Ubuntu 22.04 packages.
 - **vkd3d-proton** with d4r's patch, so every frame shows its own DLSS result (no added latency).
 - **OptiScaler 0.9.4**, unmodified, set up to hand the game's DLSS calls to d4r.
 

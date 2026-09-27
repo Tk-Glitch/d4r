@@ -75,7 +75,7 @@ The release zip (`scripts/package_release.sh`) is unpacked into the folder that 
 **Settings.** When an `d4r.ini` sits next to the shim, the shim turns it into the same environment variables the developer launcher sets, with the release's defaults. A variable that is already set, for example in the launch options, wins. Settings for the Linux side (ZLUDA's and the bridge's) are handed to the bridge through `d4rSetEnv` right after it is loaded, before its first CUDA call.
 
 **Loading ROCm.** Steam runs GE-Proton 11 inside its container runtime (SteamLinuxRuntime_4), whose library search path has no ROCm. The bridge therefore:
-- loads HIP, HSA and comgr by path, from `RocmDir` (default `/opt/rocm`);
+- loads HIP, HSA and comgr by path, from `RocmDir` (default: the release's bundled `d4r/rocm`, else `/opt/rocm`);
 - looks up any dependency they lack in the host's library directories, which the container mounts under `/run/host`;
 - sets `XDG_CACHE_HOME` only while ZLUDA initialises, so ZLUDA's kernel cache goes to `~/.cache/d4r` without affecting the rest of the game.
 

@@ -4,10 +4,11 @@
 # usage: sh d4r/d4r-check.sh [GAME_FOLDER] [ROCM_DIR]
 GAME="${1:-.}"
 D4R="$GAME/d4r"
-# ROCm: the argument, else d4r.ini's RocmDir, else D4R_ROCM_DIR, else /opt/rocm
+# ROCm: the argument, else d4r.ini's RocmDir, else the bundled d4r/rocm, else D4R_ROCM_DIR, else /opt/rocm
 ini_rocm=$(sed -n 's/^[[:space:]]*RocmDir[[:space:]]*=[[:space:]]*\([^;#]*\).*/\1/p' "$D4R/d4r.ini" 2>/dev/null | tail -1 | sed 's/[[:space:]]*$//')
 [ "$ini_rocm" = auto ] && ini_rocm=
 case "$ini_rocm" in "~/"*) ini_rocm="$HOME/${ini_rocm#\~/}" ;; esac
+[ -z "$ini_rocm" ] && [ -d "$D4R/rocm/lib" ] && ini_rocm="$D4R/rocm"
 ROCM="${2:-${ini_rocm:-${D4R_ROCM_DIR:-/opt/rocm}}}"
 problems=0
 ok() { printf '  ok       %s\n' "$1"; }
@@ -35,7 +36,7 @@ found=
 for dir in "$ROCM/lib" /opt/rocm/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu; do
   [ -e "$dir/libamdhip64.so.7" ] && { found="$dir"; break; }
 done
-[ -n "$found" ] && ok "ROCm HIP runtime ($found/libamdhip64.so.7)" || bad "ROCm HIP runtime 7.x (libamdhip64.so.7); install your distribution's HIP runtime package"
+[ -n "$found" ] && ok "ROCm HIP runtime ($found/libamdhip64.so.7)" || bad "ROCm HIP runtime 7.x (libamdhip64.so.7); re-extract the d4r zip, which includes it in d4r/rocm"
 [ -e /dev/kfd ] && ok "/dev/kfd (ROCm compute device)" || bad "/dev/kfd: the amdgpu compute interface is not available"
 target=""
 for props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
