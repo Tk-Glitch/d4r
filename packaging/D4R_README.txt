@@ -6,14 +6,16 @@ DirectX 12 games under Proton. OptiScaler (included) catches the game's DLSS cal
 d4r. d4r then runs NVIDIA's DLSS on the Radeon through ZLUDA, with the heaviest parts replaced by
 kernels written for RDNA3.
 
-This is an early release. It has been tested on one GPU (Radeon RX 7700 XT) in
-SILENT HILL Townfall and Ghost of Tsushima DIRECTOR'S CUT. Expect problems in other games.
+This is an early release, tested on one GPU (Radeon RX 7700 XT) in about a dozen DirectX 12 games.
+SUPPORTED_GAMES.md in the source repository lists them, with per-game setup notes. Expect problems
+in other games.
 
 
 What you need
 -------------
-- An AMD Radeon RX 7000 series GPU (RDNA3). The fast kernels are built for gfx1101
-  (RX 7700 XT, RX 7800 XT). Other RDNA3 cards run DLSS without them, which is much slower.
+- An AMD Radeon RX 7000 series GPU (RDNA3). The fast kernels are built for gfx1101 (RX 7700 XT,
+  RX 7800 XT, RX 7700). Other RDNA3 cards run DLSS without them: DLSS 3 (E) at full speed,
+  DLSS 4.5 (M) at about half speed, and DLSS 4 (K) without its transformer (worse image).
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.

@@ -1,39 +1,41 @@
-# d4r 0.1.0
+# d4r 0.1.1
 
-NVIDIA's own DLSS Super Resolution on AMD Radeon RX 7000 (RDNA3) GPUs, in DirectX 12 games under Proton. This is the first release packaged as a drop-in zip, to install extract it next to the game's executable and set one line of launch options.
+NVIDIA's own DLSS Super Resolution on AMD Radeon RX 7000 (RDNA3) GPUs, in DirectX 12 games under Proton. This release fixes a VRAM leak and two input-format problems, bundles the ROCm runtime, and adds a dozen tested games.
 
-It is an early release, tested on one GPU (RX 7700 XT) in SILENT HILL Townfall and Ghost of Tsushima DIRECTOR'S CUT.
+## What's new
+
+- **No more VRAM growth when changing the DLSS quality setting.** Each switch between Quality, Balanced, Performance and so on used to keep about 130 MB of VRAM until the game closed, because of a reference-counting bug in ROCm 7.2's external-memory mapping. d4r now reuses its shared buffers, and VRAM stays flat over repeated switches. It also no longer leaks a file handle per buffer.
+- **Games that pass 4-channel motion vectors now work.** Motion vectors in `R16G16B16A16` formats (including `TYPELESS`, as Dying Light: The Beast uses) used to be rejected, which left the screen black. They are now converted on the GPU and stay on the fast VRAM path.
+- **Multi-channel exposure textures stay on the VRAM path.** Games that pass exposure as an RGBA float texture no longer fall back to the slower copy through system memory, which showed up as reflections lagging behind (Ready or Not).
+- **ROCm no longer needs to be installed.** The zip includes the ROCm 7.2.4 runtime (HIP, HSA, comgr) in `d4r/rocm`, from AMD's Ubuntu 22.04 packages; it runs under Steam's container runtime on any distribution. `RocmDir` in `d4r/d4r.ini` still selects another installation.
+
+## Tested games
+
+Radeon RX 7700 XT, GE-Proton 11-3. All three DLSS models (E, K, M) run in each game:
+
+SILENT HILL Townfall, Ghost of Tsushima DIRECTOR'S CUT, Ready or Not, Clair Obscur: Expedition 33, Marvel's Spider-Man: Miles Morales, The Last of Us Part I, Control Ultimate Edition, Cyberpunk 2077, Alan Wake 2, SILENT HILL 2 (2024), Subnautica 2, Horizon Zero Dawn Remastered, Ratchet & Clank: Rift Apart, Dying Light: The Beast.
+
+Several need a small setup step: renaming a file, a launch option, or an `OptiScaler.ini` setting. [SUPPORTED_GAMES.md](https://github.com/countervolts/d4r/blob/main/SUPPORTED_GAMES.md) lists these, along with known image-quality issues per model.
 
 ## Install
 
-1. Extract `d4r-0.1.0.zip` into the folder that holds the game's main `.exe`. For Unreal Engine games that is `<Project>/Binaries/Win64`.
+1. Extract `d4r-0.1.1.zip` into the folder that holds the game's main `.exe`. For Unreal Engine games that is `<Project>/Binaries/Win64`. Keep the zip's layout: `dxgi.dll`, `OptiScaler.ini`, `d3d12.dll` and `d3d12core.dll` go next to the `.exe`, beside the `d4r` folder.
 2. In Steam, force GE-Proton 11 for the game, and set these launch options:
    ```
    PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%
    ```
 3. Select DLSS in the game. The first start compiles DLSS's GPU kernels, which takes about a minute and a half; later starts use the cache in `~/.cache/d4r`.
 
-`D4R_README.txt` in the zip has the details, and `sh d4r/d4r-check.sh` checks an install.
+**Upgrading from 0.1.0:** extract over the old files, then restore your `d4r/d4r.ini` if you changed it. `D4R_README.txt` in the zip has the details, and `sh d4r/d4r-check.sh` checks an install.
 
 ## Requirements
 
-- AMD Radeon RX 7000 series. The fast kernels are built for gfx1101 (RX 7700 XT, RX 7800 XT). Other RDNA3 cards run DLSS without them, which is much slower.
-- The amdgpu kernel driver (`/dev/kfd`). The ROCm 7.2.4 runtime is included in `d4r/rocm`; nothing needs to be installed.
+- An AMD Radeon RX 7000 series GPU. The fast kernels are built for gfx1101 (RX 7700 XT, RX 7800 XT, RX 7700). Other RDNA3 cards run DLSS without them:
+  - DLSS 3 (E) at full speed;
+  - DLSS 4.5 (M) at about half speed;
+  - DLSS 4 (K) without its transformer, with a worse image.
+- The amdgpu kernel driver (`/dev/kfd`).
 - GE-Proton 11 (tested: GE-Proton11-3).
-
-## What is in the zip
-
-- **d4r:** the NGX shim, the Wine CUDA bridge, and hand-written RDNA3 kernels for the DLSS 4 (K) and DLSS 4.5 (M) network layers.
-  - Each kernel is used only when the DLSS library's code for it matches the code it was written for. Swapping in another DLSS version therefore still works, only slower.
-  - Linear 8-bit colour inputs and outputs can stay in VRAM when Vulkan supports the required blits, fixing the slow staging path seen in Ghost of Tsushima.
-  - `d4r/d4r.ini` holds the settings for that game. The default model is DLSS 4 (K); E (DLSS 3 CNN) and M (DLSS 4.5) are one line away.
-- **NVIDIA:** DLSS 310.7.0 (`nvngx_dlss.dll`), the NGX runtime from driver 596.36 (`_nvngx.dll`), and five DLSS kernels built from NVIDIA's code with parts replaced by d4r's.
-- **ZLUDA** with d4r's patches: CUDA on ROCm.
-- **ROCm 7.2.4 runtime** (HIP, HSA, comgr), unmodified, from AMD's Ubuntu 22.04 packages.
-- **vkd3d-proton** with d4r's patch, so every frame shows its own DLSS result (no added latency).
-- **OptiScaler 0.9.4**, unmodified, set up to hand the game's DLSS calls to d4r.
-
-Nothing in the Proton prefix or the system is changed. Uninstalling means deleting the extracted files.
 
 ## Performance
 
@@ -46,20 +48,26 @@ Radeon RX 7700 XT, SILENT HILL Townfall at 2560×1440, average fps over the same
 | Performance | 88 | 82 | 69 | 94 |
 | Ultra Performance | 89 | 93 | 90 | 107 |
 
-Native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49 fps, so DLSS 4 at Quality is 40% faster than native.
-
-The Townfall figures were measured before the 8-bit VRAM conversion update, using the same native kernels. Ghost of Tsushima was checked in a live run with the updated shim; its VRAM path stayed on and gameplay performance improved, but no matched benchmark was recorded.
+Native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49 fps. This release does not change the per-frame cost of DLSS.
 
 ## Known limitations
 
-- Only DLSS Super Resolution in DirectX 12 games. No Frame Generation or Ray Reconstruction.
-- Tested with two games. Do not use it in games with anti-cheat.
+- Only DLSS Super Resolution in DirectX 12 games. There is no Frame Generation or Ray Reconstruction: keep Ray Reconstruction off in games that offer it.
+- Use the game's DLSS setting where it exists. Feeding DLSS from FSR or XeSS inputs through OptiScaler can ghost, or show a black screen in some games.
+- Saving from the OptiScaler overlay ("Save INI") resets d4r's `OptiScaler.ini` values to `auto`, including frame generation. Restore them afterwards.
+- Do not use it in games with anti-cheat.
 - DLSS 4.5 (M) is much slower than FSR 4 on RDNA3.
 
 ## Licenses
 
-d4r is Apache 2.0. The zip also contains ZLUDA (Apache 2.0 or MIT), vkd3d-proton (LGPL 2.1, patched; the patch is in `d4r/source`) and OptiScaler 0.9.4 (GPL 3.0, unmodified; source at https://github.com/optiscaler/OptiScaler/tree/v0.9.4). `d4r/source/SOURCES.txt` lists where every file comes from.
+d4r is Apache 2.0. The zip also contains:
+- ZLUDA (Apache 2.0 or MIT);
+- vkd3d-proton (LGPL 2.1, patched; the patch is in `d4r/source`);
+- the ROCm 7.2.4 runtime, unmodified: HIP and rocprofiler-register (MIT), ROCr (NCSA), comgr (Apache 2.0), and Ubuntu's libelf and libnuma (LGPL). The license texts are in `d4r/licenses`;
+- OptiScaler 0.9.4 (GPL 3.0, unmodified; source at https://github.com/optiscaler/OptiScaler/tree/v0.9.4).
+
+`d4r/source/SOURCES.txt` lists where every file comes from.
 
 NVIDIA's files in the zip, and the kernels built from NVIDIA's code, belong to NVIDIA and are not covered by any of these licenses. d4r is not affiliated with NVIDIA, AMD or the OptiScaler project.
 
-**SHA-256** `d4r-0.1.0.zip`: `487f8c98c0c5617449dddd5f573bfd4b7333c8c2f5a87198d485256673cabdba`
+**SHA-256** `d4r-0.1.1.zip`: `@SHA256@`
