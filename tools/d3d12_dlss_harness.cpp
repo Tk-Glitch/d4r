@@ -52,6 +52,35 @@ static ID3D12Fence* g_fence;
 static HANDLE g_event;
 static UINT64 g_fenceValue;
 
+static unsigned long long process_vram_kib()
+{
+    std::vector<unsigned long long> clients;
+    unsigned long long total = 0;
+    for (int fd = 0; fd < 4096; ++fd)
+    {
+        char path[64];
+        std::snprintf(path, sizeof(path), "Z:\\proc\\self\\fdinfo\\%d", fd);
+        FILE* file = std::fopen(path, "r");
+        if (file == nullptr)
+            continue;
+        unsigned long long client = 0, vram = 0;
+        bool drm = false;
+        char line[256];
+        while (std::fgets(line, sizeof(line), file) != nullptr)
+            if (std::sscanf(line, "drm-client-id: %llu", &client) == 1)
+                drm = true;
+            else
+                std::sscanf(line, "drm-memory-vram: %llu", &vram);
+        std::fclose(file);
+        if (drm && std::find(clients.begin(), clients.end(), client) == clients.end())
+        {
+            clients.push_back(client);
+            total += vram;
+        }
+    }
+    return total;
+}
+
 static bool check(HRESULT hr, const char* what)
 {
     if (FAILED(hr))
@@ -487,7 +516,27 @@ int main(int argc, char** argv)
     ID3D12Resource* colorTexture = create_texture(resourceWidth, inHeight,
         rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* depthTexture = create_texture(resourceWidth, inHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
-    ID3D12Resource* motionTexture = create_texture(motionWidth, motionHeight, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    // D4R_HARNESS_MV_RGBA16=1: motion vectors in an R16G16B16A16_TYPELESS texture (as some games pass them), the
+    // unused components filled with junk that must not reach DLSS.
+    const bool mvRgba16 = std::getenv("D4R_HARNESS_MV_RGBA16") != nullptr && std::atoi(std::getenv("D4R_HARNESS_MV_RGBA16")) != 0;
+    ID3D12Resource* motionTexture = create_texture(motionWidth, motionHeight,
+        mvRgba16 ? DXGI_FORMAT_R16G16B16A16_TYPELESS : DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    std::vector<uint16_t> motionWide;
+    auto motion_rows = [&](const uint16_t* rg) -> const void* {
+        if (!mvRgba16)
+            return rg;
+        const size_t pixels = static_cast<size_t>(motionWidth) * motionHeight;
+        motionWide.resize(pixels * 4);
+        for (size_t pixel = 0; pixel < pixels; ++pixel)
+        {
+            motionWide[pixel * 4 + 0] = rg[pixel * 2 + 0];
+            motionWide[pixel * 4 + 1] = rg[pixel * 2 + 1];
+            motionWide[pixel * 4 + 2] = 0x5640; // 100.0
+            motionWide[pixel * 4 + 3] = 0xd640; // -100.0
+        }
+        return motionWide.data();
+    };
+    const UINT motionRowBytes = motionWidth * (mvRgba16 ? 8 : 4);
     ID3D12Resource* exposureTexture = create_texture(1, 1,
         exposureRGBA32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* outputTexture = create_texture(outWidth, outHeight,
@@ -496,7 +545,7 @@ int main(int argc, char** argv)
     upload(colorTexture, rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
            resourceWidth * (rgba8 ? 4 : 8), srv);
     upload(depthTexture, depth.data(), resourceWidth * 4, srv);
-    upload(motionTexture, motion.data(), motionWidth * 4, srv);
+    upload(motionTexture, motion_rows(motion.data()), motionRowBytes, srv);
     upload(exposureTexture, exposureRGBA32 ? static_cast<const void*>(exposureRGBA.data())
                                           : static_cast<const void*>(&exposureValue),
            exposureRGBA32 ? 16 : 4, srv);
@@ -662,7 +711,7 @@ int main(int argc, char** argv)
                     motion[pixel * 2 + 0] = mvX;
                     motion[pixel * 2 + 1] = mvY;
                 }
-                update_texture(motionTexture, motion.data(), motionWidth * 4, srv);
+                update_texture(motionTexture, motion_rows(motion.data()), motionRowBytes, srv);
             }
             d4r_ngx_set_float(parameters, "Jitter.Offset.X", signX * jx);
             d4r_ngx_set_float(parameters, "Jitter.Offset.Y", signY * jy);
@@ -700,7 +749,7 @@ int main(int argc, char** argv)
                 }
             update_texture(colorTexture, color.data(), resourceWidth * 8, srv);
             update_texture(depthTexture, depth.data(), resourceWidth * 4, srv);
-            update_texture(motionTexture, motion.data(), motionWidth * 4, srv);
+            update_texture(motionTexture, motion_rows(motion.data()), motionRowBytes, srv);
         }
         if (replayDir != nullptr)
         {
@@ -711,7 +760,7 @@ int main(int argc, char** argv)
                 return 1;
             update_texture(colorTexture, replay.color.data(), resourceWidth * 8, srv);
             update_texture(depthTexture, replay.depth.data(), resourceWidth * 4, srv);
-            update_texture(motionTexture, replay.motion.data(), motionWidth * 4, srv);
+            update_texture(motionTexture, motion_rows(reinterpret_cast<const uint16_t*>(replay.motion.data())), motionRowBytes, srv);
             d4r_ngx_set_float(parameters, "Jitter.Offset.X", replay.jitterX);
             d4r_ngx_set_float(parameters, "Jitter.Offset.Y", replay.jitterY);
             d4r_ngx_set_float(parameters, "MV.Scale.X", replay.mvScaleX);
@@ -835,6 +884,50 @@ int main(int argc, char** argv)
     for (uint8_t value : output)
         nonzero += value != 0;
     std::printf("output read back: %zu of %zu bytes nonzero, written to %s\n", nonzero, output.size(), argv[2]);
+
+    // D4R_HARNESS_RECREATE=N: N more release/create cycles at alternating render sizes (as when a game's DLSS
+    // quality setting changes), a few evaluations each, logging this process's VRAM to find leaks per cycle.
+    const int recreateCycles = std::getenv("D4R_HARNESS_RECREATE") != nullptr ? std::atoi(std::getenv("D4R_HARNESS_RECREATE")) : 0;
+    for (int cycle = 1; cycle <= recreateCycles; ++cycle)
+    {
+        release(feature);
+        feature = nullptr;
+        const UINT width = cycle % 2 != 0 ? inWidth * 10 / 13 : inWidth;
+        const UINT height = cycle % 2 != 0 ? inHeight * 10 / 13 : inHeight;
+        d4r_ngx_set_uint(parameters, "Width", width);
+        d4r_ngx_set_uint(parameters, "Height", height);
+        d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", width);
+        d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", height);
+        result = createFeature(g_list, 1, parameters, &feature);
+        if (result != NGX_SUCCESS)
+        {
+            std::printf("RECREATE cycle %d: CreateFeature -> 0x%08x\n", cycle, result);
+            return 1;
+        }
+        for (int frame = 0; frame < 4; ++frame)
+        {
+            d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
+            evaluate(g_list, feature, parameters, nullptr);
+            submit_and_wait();
+            Sleep(frameWaitMs);
+        }
+        const std::vector<uint8_t> cycleOutput = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                           outWidth * (rgba8 ? 4 : 8));
+        if (FILE* cycleFile = std::fopen((std::string(argv[2]) + ".cycle" + std::to_string(cycle)).c_str(), "wb"))
+        {
+            std::fwrite(cycleOutput.data(), 1, cycleOutput.size(), cycleFile);
+            std::fclose(cycleFile);
+        }
+        // Also to the quality report file, which survives when Proton drops stdout.
+        const char* reportPath = std::getenv("D4R_HARNESS_QUALITY_SCENE");
+        FILE* report = reportPath != nullptr ? std::fopen(reportPath, "a") : nullptr;
+        for (FILE* out : {stdout, report})
+            if (out != nullptr)
+                std::fprintf(out, "RECREATE cycle %d (%ux%u): process VRAM %llu KiB\n", cycle, width, height,
+                             process_vram_kib());
+        if (report != nullptr)
+            std::fclose(report);
+    }
 
     release(feature);
     shutdown();

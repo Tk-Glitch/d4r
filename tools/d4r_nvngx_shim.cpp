@@ -836,7 +836,8 @@ static bool supported_input(Plane plane, DXGI_FORMAT format)
     case Plane::Motion:
         return format == DXGI_FORMAT_R16G16_FLOAT || format == DXGI_FORMAT_R16G16_TYPELESS ||
                format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32_TYPELESS ||
-               format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+               format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+               format == DXGI_FORMAT_R32G32B32A32_FLOAT;
     case Plane::Exposure:
         return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS ||
                format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R16_TYPELESS ||
@@ -959,6 +960,7 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
                 std::memcpy(half + x * 2, source + x * 4, 4);
                 break;
             case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS:
                 std::memcpy(half + x * 2, source + x * 8, 4);
                 break;
             case DXGI_FORMAT_R32G32B32A32_FLOAT:
@@ -1556,6 +1558,7 @@ struct Feature
     // formats later stop qualifying.
     bool vram = false, vramDecided = false;
     VramImage colorConversion;
+    VramImage motionConversion;
     VramImage exposureConversion;
     VramImage outputConversion;
     // Split frames: the rest of frame N's command list is submitted only once
@@ -2159,9 +2162,33 @@ static int device_local_type(uint32_t typeBits)
     return -1;
 }
 
+// Buffers of released features, reused by later ones. ROCm up to at least 7.2.4 never frees memory mapped with
+// hipExternalMemoryGetMappedBuffer (the mapping's buffer view is retained twice but released once by hipFree), so
+// destroying a buffer would leak its memory: each DLSS quality change (a new feature) would add ~100 MB of VRAM.
+static std::mutex g_vramPoolMutex;
+static std::vector<VramBuffer> g_vramPool;
+constexpr size_t kVramPoolLimit = 64;
+
+// The smallest pooled buffer that holds `bytes`.
+static bool take_pooled_vram_buffer(VramBuffer& target, size_t bytes)
+{
+    std::lock_guard<std::mutex> lock(g_vramPoolMutex);
+    auto best = g_vramPool.end();
+    for (auto it = g_vramPool.begin(); it != g_vramPool.end(); ++it)
+        if (it->bytes >= bytes && (best == g_vramPool.end() || it->bytes < best->bytes))
+            best = it;
+    if (best == g_vramPool.end())
+        return false;
+    target = *best;
+    g_vramPool.erase(best);
+    return true;
+}
+
 // Game thread. The CUDA import runs on the worker, which owns the context.
 static bool create_vram_buffer(VramBuffer& target, size_t bytes)
 {
+    if (take_pooled_vram_buffer(target, bytes))
+        return true;
     VramBuffer buffer;
     VkExternalMemoryBufferCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
@@ -2212,14 +2239,45 @@ static void destroy_vram_buffer(VramBuffer& buffer)
 {
     if (buffer.external != nullptr)
         g.worker.call([&buffer] {
-            g.cu.memFree(buffer.device);
-            return g_vk.release(buffer.external);
+            const int freed = g.cu.memFree(buffer.device);
+            const int released = g_vk.release(buffer.external);
+            if (freed != 0 || released != 0)
+                logf("VRAM interop: freeing %zu-byte buffer: cuMemFree %d, release %d", buffer.bytes, freed, released);
+            return released;
         });
     if (buffer.memory != VK_NULL_HANDLE)
         g_vk.free(g_vk.device, buffer.memory, nullptr);
     if (buffer.buffer != VK_NULL_HANDLE)
         g_vk.destroyBuffer(g_vk.device, buffer.buffer, nullptr);
     buffer = VramBuffer{};
+}
+
+// Only once no command list or CUDA work uses the buffer: keeps it for a later feature (see g_vramPool).
+static void recycle_vram_buffer(VramBuffer& buffer)
+{
+    if (buffer.buffer == VK_NULL_HANDLE)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_vramPoolMutex);
+        if (g_vramPool.size() < kVramPoolLimit)
+        {
+            g_vramPool.push_back(buffer);
+            buffer = VramBuffer{};
+            return;
+        }
+    }
+    destroy_vram_buffer(buffer);
+}
+
+static void free_vram_pool()
+{
+    std::vector<VramBuffer> pool;
+    {
+        std::lock_guard<std::mutex> lock(g_vramPoolMutex);
+        pool.swap(g_vramPool);
+    }
+    for (VramBuffer& buffer : pool)
+        destroy_vram_buffer(buffer);
 }
 
 static void destroy_vram_image(VramImage& image)
@@ -2349,7 +2407,21 @@ static bool vram_exposure_blit_supported(VkFormat format)
     }
 }
 
-// Whether `resource` can be copied raw (or, for colour/exposure, blitted)
+// Motion vectors in a wider float format keep their first two components (as the host path does).
+static bool vram_motion_blit_supported(VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return vram_blit_supported(format, VK_FORMAT_R16G16_SFLOAT);
+    default:
+        return false;
+    }
+}
+
+// Whether `resource` can be copied raw (or, for colour/motion/exposure, blitted)
 // to/from the canonical layout of `plane`.
 static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& copy, bool output = false)
 {
@@ -2374,6 +2446,8 @@ static bool describe_vram_copy(ID3D12Resource* resource, Plane plane, VramCopy& 
     }
     if (plane == Plane::Exposure)
         copy.convert = vram_exposure_blit_supported(format);
+    else if (plane == Plane::Motion)
+        copy.convert = vram_motion_blit_supported(format);
     return copy.convert || vk_texel_bytes(format) == canonical_texel_bytes(plane);
 }
 
@@ -2415,9 +2489,10 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
             g_vk.copyImageToBuffer(cmd, copy.image, layout, slot.vram[index].buffer, 1, &region);
             continue;
         }
-        // Convert colour to RGBA16F or exposure's first component to R32F,
-        // then copy from the canonical image into the shared buffer.
+        // Convert colour to RGBA16F, motion to RG16F or exposure's first component
+        // to R32F, then copy from the canonical image into the shared buffer.
         VkImage conversion = kPlanes[index] == Plane::Exposure ? feature.exposureConversion.image
+                             : kPlanes[index] == Plane::Motion ? feature.motionConversion.image
                                                                : feature.colorConversion.image;
         VkImageMemoryBarrier toDestination = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toDestination.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -2633,14 +2708,15 @@ static void release_vram(Feature& feature)
         g_vk.destroySemaphore(g_vk.device, feature.splitSemaphore, nullptr);
     for (InputSlot& slot : feature.inputs)
         for (VramBuffer& buffer : slot.vram)
-            destroy_vram_buffer(buffer);
+            recycle_vram_buffer(buffer);
     for (OutputSlot& slot : feature.outputs)
-        destroy_vram_buffer(slot.vram);
-    destroy_vram_buffer(feature.gpuMarker);
+        recycle_vram_buffer(slot.vram);
+    recycle_vram_buffer(feature.gpuMarker);
     for (VramBuffer& buffer : feature.retiredBuffers)
-        destroy_vram_buffer(buffer);
+        recycle_vram_buffer(buffer);
     feature.retiredBuffers.clear();
     destroy_vram_image(feature.colorConversion);
+    destroy_vram_image(feature.motionConversion);
     destroy_vram_image(feature.exposureConversion);
     destroy_vram_image(feature.outputConversion);
     for (VramImage& image : feature.retiredImages)
@@ -4437,6 +4513,10 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                                                                vramInputs[0].width, vramInputs[0].height,
                                                                VK_FORMAT_R16G16B16A16_SFLOAT))
             return NGX_FAIL_PLATFORM_ERROR;
+        if (vramInputs[2].convert && !ensure_conversion_image(*feature, feature->motionConversion,
+                                                               vramInputs[2].width, vramInputs[2].height,
+                                                               VK_FORMAT_R16G16_SFLOAT))
+            return NGX_FAIL_PLATFORM_ERROR;
         if (inputCount == 4 && vramInputs[3].convert &&
             !ensure_conversion_image(*feature, feature->exposureConversion,
                                      vramInputs[3].width, vramInputs[3].height, VK_FORMAT_R32_SFLOAT))
@@ -4688,6 +4768,8 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_Shutdown()
     }
     for (Feature* feature : features)
         release_feature(feature);
+    if (g_vk.ready)
+        free_vram_pool();
     std::lock_guard<std::mutex> lock(g.mutex);
     if (g.ngxInitialized)
     {

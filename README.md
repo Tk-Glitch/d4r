@@ -14,7 +14,7 @@ See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
 [DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
 
-Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, the same 62-second street walk for every run, frame rates from MangoHud frametime logs. Every DLSS result is presented in the frame it belongs to (no added latency).
+Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, every DLSS result is presented in the frame it belongs to (no added latency).
 
 | Mode | DLSS 3 CNN (preset E) | DLSS 4 (preset K) | DLSS 4.5 (preset M) | FSR 4 |
 |---|---|---|---|---|
@@ -29,7 +29,20 @@ On the same GPU DLSS starts at a disadvantage: its networks were designed for NV
 
 ## Known issues
 
-- Native upscaling can show visible artifacting.
+- In some games native upscaling can show visible artifacting.
+
+## GPU support
+
+d4r needs RDNA3 (Radeon RX 7000 series), but full speed depends on the chip: the release ships its native kernels only for **gfx1101 (Navi 32)**, and on other GPUs DLSS 4 and 4.5 fall back to the much slower translated NVIDIA code.
+
+| GPU | Chip | DLSS 3 CNN (E) | DLSS 4 (K) | DLSS 4.5 (M) |
+|---|---|---|---|---|
+| RX 7700 XT (tested), RX 7800 XT, RX 7700, Radeon PRO W7700 | gfx1101 | full speed | full speed | full speed |
+| RX 7900 GRE / XT / XTX, Radeon PRO W7800 / W7900 | gfx1100 | full speed | runs without its transformer (worse image, slower) | about half speed |
+| RX 7600 / 7600 XT, RX 7650 GRE | gfx1102 | full speed | runs without its transformer (worse image, slower) | about half speed |
+| RDNA4, RDNA2 and older | | not supported | not supported | not supported |
+
+Only the RX 7700 XT has been tested; the other gfx1101 cards use the same chip. Without the native kernels, NVIDIA's translated DLSS 4 layers produce invalid values and DLSS discards the network's output, so K loses the transformer's image quality. Preset E is unaffected on any RDNA3 GPU. The kernels can be built for gfx1100 and gfx1102 (`D4R_GPU_ARCHS` in `scripts/package_release.sh`), but those builds are untested.
 
 ## How it works
 
@@ -68,7 +81,7 @@ ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubu
 
 ## Requirements (building from source)
 
-- Linux with an AMD RDNA3 GPU. The native kernels use gfx11 WMMA; they are built for gfx1101 by default (`D4R_GPU_ARCH` for other RDNA3 chips, untested). Without them DLSS still runs through ZLUDA, much more slowly.
+- Linux with an AMD RDNA3 GPU. The native kernels use gfx11 WMMA; they are built for gfx1101 by default (`D4R_GPU_ARCH` for other RDNA3 chips, untested). Without them DLSS runs through ZLUDA alone: much more slowly, and DLSS 4 (K) without its transformer (see [GPU support](#gpu-support)).
 - ROCm with HIP and its clang (tested with ROCm 7.2).
 - GE-Proton with OptiScaler integration (tested with GE-Proton11-3).
 - Build tools: a Rust toolchain and git-lfs (ZLUDA), meson and ninja (vkd3d-proton), `winegcc`/`winebuild` (bridge), `x86_64-w64-mingw32-g++` and `clang-cl` (shim), Python 3.

@@ -2589,8 +2589,10 @@ CUresult WINAPI cuGetProcAddress(const char* symbol, void** pointer, int cuda_ve
    handles (Wine 11 layout: a VkDevice client object holds the unix object
    pointer at offset 8; a non-dispatchable client handle is the unix object
    pointer; every unix object starts with its host handle), the host fd is
-   exported with vkGetMemoryFdKHR and imported into HIP, which takes ownership
-   of the fd. */
+   exported with vkGetMemoryFdKHR and imported into HIP. HIP does not take
+   ownership of the fd (hipDestroyExternalMemory leaves it open, and an open fd
+   keeps the memory alive after vkFreeMemory), so it is closed once imported, as
+   ROCm's own GL interop does after mapping. */
 typedef struct
 {
     int type; /* hipExternalMemoryHandleTypeOpaqueFd = 1 */
@@ -2697,11 +2699,11 @@ CUresult WINAPI d4rImportVulkanMemory(void* client_device, uint64_t client_memor
     desc.flags = 1; /* dedicated allocation */
     void* external = NULL;
     int result = import(&external, &desc);
+    close(fd);
     if (result != 0)
     {
         tracef("d4rImportVulkanMemory: hipImportExternalMemory(fd=%d, %llu bytes) failed: %d", fd,
                (unsigned long long)bytes, result);
-        close(fd);
         return CUDA_ERROR_INVALID_VALUE;
     }
     D4rHipExternalMemoryBufferDesc buffer;
@@ -2835,5 +2837,7 @@ CUresult WINAPI d4rSetArrayRedirect(CUarray array, CUdeviceptr pointer, uint32_t
 CUresult WINAPI d4rReleaseVulkanMemory(void* memory)
 {
     HIP_DESTROY_EXTERNAL_MEMORY_FN destroy = (HIP_DESTROY_EXTERNAL_MEMORY_FN)hip_symbol("hipDestroyExternalMemory");
-    return destroy != NULL && destroy(memory) == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+    const int result = destroy != NULL ? destroy(memory) : -1;
+    tracef("d4rReleaseVulkanMemory: hipDestroyExternalMemory(%p) -> %d", memory, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
