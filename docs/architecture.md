@@ -88,3 +88,12 @@ The release zip (`scripts/package_release.sh`) is unpacked into the folder that 
 ## Logs
 
 The launcher writes each run's logs to `~/.cache/d4r-dlss-captures/game-<exe>-<time>/`. `d4r_nvngx.log` holds the shim's log. With `[Debug] Profile = true` it also records one `D4R_PROFILE` line per frame, with the stage timings.
+
+For a CPU-use A/B check, set `D4R_SHIM_BLOCKING_SYNC = 1` under `[Env]` in the game's `d4r.ini`.
+The VRAM path then requests a blocking event wait for its null-stream output. If ZLUDA and HIP
+honour the event flag, the waiting thread yields the CPU; an unavailable or failed event falls back
+to the original context sync. This is opt-in because it changes the wait scope and may add wakeup
+latency. The profile reports `output_sync_wall`, `output_sync_cpu`, and `output_sync_blocking`;
+compare CPU use and frame rate in the same scene.
+The `d2h` field on this path includes the output synchronization wait, even when direct output
+skips the array-to-buffer copy.

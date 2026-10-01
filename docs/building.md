@@ -27,6 +27,13 @@ cp target/release/libnvcuda.so ~/.cache/d4r-zluda-current/
 ln -sf libnvcuda.so ~/.cache/d4r-zluda-current/libcuda.so
 ```
 
+Build the release ZLUDA library on a system or in a container with GLIBC 2.41 or older. A binary
+linked on a newer system can require newer GLIBC symbols even when the ZLUDA source does not need new
+GLIBC features. Before packaging, check it with
+`scripts/check_glibc_compat.sh 2.41 /path/to/libnvcuda.so`. The release packager runs the same
+check on ZLUDA, the Wine CUDA bridge, and every bundled ROCm library. Test the rebuilt library
+with the D3D12 harness and in a game before publishing a release.
+
 The launcher looks for ZLUDA in `D4R_ZLUDA_DIR` (default `~/.cache/d4r-zluda-current`, or `ZludaDir` in d4r.ini).
 
 What the patches add:

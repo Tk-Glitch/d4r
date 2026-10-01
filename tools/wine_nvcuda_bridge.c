@@ -2263,7 +2263,18 @@ CUresult WINAPI cuArrayDestroy(CUarray array)
     CUARRAYDESTROY_FN function = (CUARRAYDESTROY_FN)find_zluda_symbol("cuArrayDestroy");
     CUresult result = function != NULL ? function(array) : missing("cuArrayDestroy");
     if (result == CUDA_SUCCESS)
+    {
+        /* A recycled array handle must not inherit a released feature's output target. */
+        pthread_mutex_lock(&instrumentation_lock);
+        if (redirect_array == array)
+        {
+            redirect_array = NULL;
+            redirect_pointer = 0;
+            redirect_pitch = 0;
+        }
+        pthread_mutex_unlock(&instrumentation_lock);
         forget_array_descriptor(array);
+    }
     TRACE_CALL(result, "cuArrayDestroy array=%p result=%d", array, result);
     return result;
 }
@@ -2535,6 +2546,18 @@ CUresult WINAPI cuEventSynchronize(D4rArg a0)
     function_type function = (function_type)find_zluda_symbol("cuEventSynchronize");
     CUresult result = function != NULL ? function(a0) : missing("cuEventSynchronize");
     TRACE_CALL(result, "cuEventSynchronize->cuEventSynchronize result=%d", result);
+    return result;
+}
+/* The shim's output wait must not inherit D4R_ELIDE_NGX_SYNC: it releases the
+   game's split command list only after this event has actually completed. */
+CUresult WINAPI d4rEventSynchronize(D4rArg a0)
+{
+    typedef CUresult(__attribute__((sysv_abi)) * function_type)(D4rArg);
+    function_type function = (function_type)find_zluda_symbol("cuEventSynchronize");
+    CUresult result = function != NULL ? function(a0) : missing("cuEventSynchronize");
+    if (result == CUDA_SUCCESS)
+        flush_kernel_profiles();
+    TRACE_CALL(result, "d4rEventSynchronize result=%d", result);
     return result;
 }
 D4R_FORWARD(cuEventQuery, cuEventQuery, 1, (D4rArg a0), (a0))

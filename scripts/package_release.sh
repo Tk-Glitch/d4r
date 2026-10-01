@@ -13,6 +13,7 @@
 #   D4R_ROCM_DIR     ROCm with clang, for the kernels                       default /opt/rocm
 #   D4R_ROCM_RUNTIME ROCm runtime bundled as d4r/rocm (scripts/fetch_rocm_runtime.sh)
 #                                                                           default ~/.cache/d4r-rocm-runtime
+#   D4R_MAX_GLIBC     highest GLIBC ABI the Linux libraries may require     default 2.41
 #   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201
 #                    (RDNA4 targets also get a <target>-fp8 folder: the kernels for d4r.ini NativeFp8 = on)
 #   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: the system's SPDX copy
@@ -101,6 +102,8 @@ cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r/nvngx.dll"
 cp "$ROOT/build/wine-nvcuda/x86_64-unix/nvcuda.dll.so" "$STAGE/d4r/nvcuda.dll"
 cp "$ZLUDA/libnvcuda.so" "$STAGE/d4r/zluda/libcuda.so"
 cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
+"$ROOT/scripts/check_glibc_compat.sh" "${D4R_MAX_GLIBC:-2.41}" \
+  "$STAGE/d4r/nvcuda.dll" "$STAGE/d4r/zluda/libcuda.so" "$STAGE/d4r/rocm/lib/"*
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
 if [[ "$VARIANT" == full ]]; then

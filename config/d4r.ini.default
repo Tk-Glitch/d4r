@@ -127,3 +127,4 @@ LogDir = auto
 [Env]
 ; Anything else, passed through as environment variables (one per line):
 ;   D4R_SHIM_SPLIT_TIMEOUT_MS = 200
+;   D4R_SHIM_BLOCKING_SYNC = 1  ; yield CPU while waiting for DLSS output
