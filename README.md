@@ -37,6 +37,16 @@ On the same GPU DLSS starts at a disadvantage: its networks were designed for NV
 - [FSR 4.1.1 standalone video](https://cdn.ayois.gay/sk-ant-api03-YZpWqINTI2HBt6KWJTeyY2b9JJbxUTZdBVRR06KZD7b1x27QLjvQrZZX8Um5sZqkquuOlzJTHUh84FOOLsetNy-PAIiWxAA)
 - [DLSS 4.5 preset M standalone video](https://cdn.ayois.gay/sk-ant-api03-0GLTr6qEYGfUKWYoZeseLdTzPslh1AvlVLdlBEUvV893bi19b7qha5wKnuQXN2tl6l4ffaRKj5warfAFDDjOlYJNYWVQ3AA)
 
+DLSS 4.5 was using the following settings,
+
+```
+PreferAccuracy = true
+
+NativeSwinEncoders = false
+
+MotionVectorDilation = 2
+```
+
 ## Known issues
 
 - In some games using some models native upscaling can show visible artifacting.
