@@ -754,6 +754,18 @@ int main(int argc, char** argv)
     const float scaleX = static_cast<float>(outWidth) / inWidth, scaleY = static_cast<float>(outHeight) / inHeight;
     const uint32_t phases = static_cast<uint32_t>(std::lround(8.0f * scaleX * scaleY));
 
+    // A discarded recording followed by a submitted frame must not make the
+    // discarded inputs appear ready, or contaminate the new feature's history.
+    if (std::getenv("D4R_HARNESS_SKIP_RECORDED_INPUT") != nullptr)
+    {
+        if (evaluate(g_list, feature, parameters, nullptr) != NGX_SUCCESS ||
+            !check(g_list->Close(), "skip input list close") ||
+            !check(g_allocator->Reset(), "skip input allocator reset") ||
+            !check(g_list->Reset(g_allocator, nullptr), "skip input list reset"))
+            return 1;
+        lifecycle_report("SKIP input: discarded recording before submitting the next frame");
+    }
+
     for (int frame = 1; frame <= frames; ++frame)
     {
         if (qualityScene)
@@ -998,9 +1010,11 @@ int main(int argc, char** argv)
     // D4R_HARNESS_RECREATE=N: N more release/create cycles at alternating render sizes (as when a game's DLSS
     // quality setting changes), a few evaluations each, logging this process's VRAM to find leaks per cycle.
     const int recreateCycles = std::getenv("D4R_HARNESS_RECREATE") != nullptr ? std::atoi(std::getenv("D4R_HARNESS_RECREATE")) : 0;
+    const bool verifyRecreation = std::getenv("D4R_HARNESS_VERIFY_RECREATION") != nullptr;
+    std::vector<uint8_t> recreationReference[2];
     for (int cycle = 1; cycle <= recreateCycles; ++cycle)
     {
-        release(feature);
+        if (release(feature) != NGX_SUCCESS) return 1;
         feature = nullptr;
         const UINT width = cycle % 2 != 0 ? inWidth * 10 / 13 : inWidth;
         const UINT height = cycle % 2 != 0 ? inHeight * 10 / 13 : inHeight;
@@ -1017,12 +1031,23 @@ int main(int argc, char** argv)
         for (int frame = 0; frame < 4; ++frame)
         {
             d4r_ngx_set_int(parameters, "Reset", frame == 0 ? 1 : 0);
-            evaluate(g_list, feature, parameters, nullptr);
+            if (evaluate(g_list, feature, parameters, nullptr) != NGX_SUCCESS) return 1;
             submit_and_wait();
             Sleep(frameWaitMs);
         }
         const std::vector<uint8_t> cycleOutput = read_back(outputTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                                            outWidth * (rgba8 ? 4 : 8));
+        if (verifyRecreation)
+        {
+            auto& reference = recreationReference[cycle % 2];
+            if (reference.empty())
+                reference = cycleOutput;
+            else if (reference != cycleOutput)
+            {
+                lifecycle_report("RECREATE coherence FAILED: identical inputs and render size changed output");
+                return 1;
+            }
+        }
         if (FILE* cycleFile = std::fopen((std::string(argv[2]) + ".cycle" + std::to_string(cycle)).c_str(), "wb"))
         {
             std::fwrite(cycleOutput.data(), 1, cycleOutput.size(), cycleFile);
@@ -1038,6 +1063,8 @@ int main(int argc, char** argv)
         if (report != nullptr)
             std::fclose(report);
     }
+    if (verifyRecreation && recreateCycles >= 4)
+        lifecycle_report("RECREATE coherence: repeated render sizes match byte-for-byte");
 
     release(feature);
     shutdown();
