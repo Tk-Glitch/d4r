@@ -14,6 +14,15 @@ problems=0
 ok() { printf '  ok       %s\n' "$1"; }
 bad() { printf '  MISSING  %s\n' "$1"; problems=$((problems + 1)); }
 note() { printf '  note     %s\n' "$1"; }
+misconfigured() { printf '  CONFIG   %s\n' "$1"; problems=$((problems + 1)); }
+external_backend=$(awk '
+  { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+  line ~ /^\[/ { dlss = (tolower(line) == "[dlss]"); next }
+  dlss && tolower(line) ~ /^allowexternalbackend[ \t]*=/ {
+    count++; sub(/^[^=]*=[ \t]*/, "", line); value = tolower(line)
+  }
+  END { if (count == 1 && value == "true") print "true" }
+' "$GAME/OptiScaler.ini" 2>/dev/null)
 
 printf 'd4r install in %s\n' "$(cd "$GAME" 2>/dev/null && pwd || echo "$GAME")"
 [ -d "$D4R" ] || { printf 'no d4r folder here; run this from the folder with the game .exe\n'; exit 1; }
@@ -21,6 +30,34 @@ ls "$GAME"/*.exe >/dev/null 2>&1 && ok "game executable next to d4r/" || note "n
 for f in dxgi.dll OptiScaler.ini d3d12.dll d3d12core.dll d4r/nvngx.dll d4r/nvcuda.dll d4r/zluda/libcuda.so d4r/d4r.ini; do
   [ -f "$GAME/$f" ] && ok "$f" || bad "$f (re-extract the d4r zip)"
 done
+# File presence alone does not establish NGX routing: OptiDllPath=d4r can still
+# select system32/_nvngx.dll before d4r/nvngx.dll. Check the per-DLL override.
+if [ -f "$GAME/OptiScaler.ini" ]; then
+  nvngx_path=$(awk '
+    { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^\[/ { libraries = (tolower(line) == "[libraries]"); next }
+    libraries && tolower(line) ~ /^nvngxpath[ \t]*=/ {
+      count++; sub(/^[^=]*=[ \t]*/, "", line); value = line
+    }
+    END { if (count != 1) exit 1; print value }
+  ' "$GAME/OptiScaler.ini") && unique_path=yes || unique_path=no
+  normalized_path=$(printf '%s' "$nvngx_path" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+  # Also recognize an absolute Wine Z: path to this install's shim (as used
+  # by developer launches); do not accept an arbitrary nvngx.dll elsewhere.
+  game_path=$(cd "$GAME" 2>/dev/null && pwd -P)
+  absolute_path=$(printf 'z:%s/d4r/nvngx.dll' "$game_path" | tr '[:upper:]' '[:lower:]')
+  if [ "$unique_path" = yes ] && { [ "$normalized_path" = 'd4r/nvngx.dll' ] ||
+       [ "$normalized_path" = './d4r/nvngx.dll' ] || [ "$normalized_path" = "$absolute_path" ]; }; then
+    ok "OptiScaler NGX routing: NvngxPath=$nvngx_path (d4r shim)"
+    case "$normalized_path" in
+      z:*) ;;
+      *) [ "$external_backend" = true ] || note "relative NvngxPath requires the game's working directory to be this folder" ;;
+    esac
+  else
+    misconfigured 'OptiScaler NGX routing: set [Libraries] NvngxPath=d4r\nvngx.dll (exactly once); OptiDllPath alone can load system _nvngx.dll'
+    note 'd4r/ngx/_nvngx.dll is the NVIDIA core for the shim, not the OptiScaler target'
+  fi
+fi
 [ -f "$D4R/nvngx_dlss.dll" ] && ok "d4r/nvngx_dlss.dll (NVIDIA DLSS library)" || bad "d4r/nvngx_dlss.dll: copy NVIDIA's DLSS library here"
 [ -f "$D4R/ngx/_nvngx.dll" ] && ok "d4r/ngx/_nvngx.dll (NVIDIA NGX runtime)" || bad "d4r/ngx/_nvngx.dll: copy NVIDIA's NGX runtime here"
 if [ -f "$D4R/nvngx_dlss.dll" ] && command -v strings >/dev/null 2>&1; then
@@ -49,5 +86,11 @@ if [ -n "$target" ]; then
   else note "GPU $arch: no native kernels for it in this release (DLSS runs, much slower)"; fi
 fi
 
-printf '\nSteam launch options for this game:\n  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %%command%%\n'
-[ "$problems" -eq 0 ] && printf '\nEverything d4r needs is in place.\n' || printf '\n%d thing(s) to fix above.\n' "$problems"
+if [ "$external_backend" = true ]; then
+  note "AllowExternalBackend requires the patched OptiScaler DLL; keep native AMD identity visible for FSR4"
+  printf '\nSteam launch options for this patched setup:\n  PROTON_ENABLE_NVAPI=1 DXVK_NVAPI_ALLOW_OTHER_DRIVERS=1 DXVK_NVAPI_GPU_ARCH=AD100 WINE_HIDE_AMD_GPU=0 %%command%%\n'
+else
+  printf '\nSteam launch options for this game:\n  PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %%command%%\n'
+fi
+[ "$problems" -eq 0 ] && printf '\nFiles and OptiScaler NGX routing checks passed (runtime initialization is not tested).\n' || printf '\n%d thing(s) to fix above.\n' "$problems"
+[ "$problems" -eq 0 ]

@@ -146,7 +146,7 @@ def main(argv):
         value = flag("Interop", key)
         if value is not None:
             env[var] = "1" if value else "0"
-    value = get("Interop", "MarkerPollUs")
+    value = get("Interop", "MarkerPollUs") or "200"
     dilation = get("Interop", "MotionVectorDilation")
     if dilation is not None and dilation not in ("0", "1", "2"):
         fail("[Interop] MotionVectorDilation must be 0, 1 or 2")

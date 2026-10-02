@@ -24,6 +24,7 @@ __pycache__/
 /vkd3d-proton.cache
 .vscode/
 videos/
+.tools/
 
 # Machine-specific notes, CI runner setup, local experiments, benchmark automation (kept locally, never published)
 /private/

@@ -77,27 +77,8 @@ else
   esac
 fi
 cp "$OPTI/OptiScaler.dll" "$STAGE/dxgi.dll"
-python3 - "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini" <<'PY'
-import re, sys
-lines = open(sys.argv[1], encoding="utf-8", newline="").read().split("\n")  # keeps the file's line endings
-for setting in open(sys.argv[2], encoding="utf-8"):
-    setting = setting.strip()
-    if not setting or setting.startswith("#"):
-        continue
-    path, value = setting.split("=", 1)
-    section, key = path.split(".", 1)
-    start = next((i for i, l in enumerate(lines) if l.strip() == f"[{section}]"), None)
-    if start is None:
-        sys.exit(f"OptiScaler.ini has no [{section}]")
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
-    for i in range(start + 1, end):
-        if re.match(rf"{re.escape(key)}\s*=", lines[i]):
-            lines[i] = f"{key}={value}" + ("\r" if lines[i].endswith("\r") else "")
-            break
-    else:
-        sys.exit(f"OptiScaler.ini has no {key} in [{section}]")
-open(sys.argv[3], "w", encoding="utf-8", newline="").write("\n".join(lines))
-PY
+python3 "$ROOT/scripts/configure_optiscaler.py" \
+  "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini"
 
 # d4r-patched vkd3d-proton: same-frame DLSS results
 cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"

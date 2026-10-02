@@ -110,7 +110,7 @@ scripts/package_release.sh            # -> dist/d4r-<version>.zip
 The script:
 - builds the shim, the bridge and both fast and accuracy network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);
-- stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`;
+- stages OptiScaler as `dxgi.dll` with the settings in `packaging/optiscaler.settings`, applied by `scripts/configure_optiscaler.py`; both full and clean ZIPs set `NvngxPath=d4r\nvngx.dll` explicitly, retaining `OptiDllPath=d4r` for other libraries;
 - adds NVIDIA's two DLLs and any supplied texture kernels (built from NVIDIA's PTX by `kernels/build.sh tex`); builds accuracy texture sets with `D4R_ZLUDA_EMIT` unless marked prebuilt sets are supplied in `D4R_BUNDLE_TEX/accuracy/<target>`;
 - zips the result together with the ZLUDA and vkd3d-proton builds, the ROCm runtime (as `d4r/rocm`), `packaging/d4r.ini`, the licenses and the patches.
 
@@ -143,6 +143,7 @@ Run `bash scripts/build_release_glibc241.sh` inside the container. The script ch
 
 ## Checks
 
+- `python3 -m unittest discover -s tests -v` includes OptiScaler INI generation, full/clean package staging and NGX-routing checker regressions. Package tests use fixture binaries and GPU-build stand-ins; real DLL loading still needs the OptiScaler/Proton harness.
 - `scripts/check_environment.sh` lists the tools, GPU and Proton builds it finds.
 - The D3D12 harness (`scripts/run_d3d12_dlss_harness_proton.sh`) drives DLSS outside a game.
 - Native kernels have their own validation path; see [native-kernels.md](native-kernels.md).

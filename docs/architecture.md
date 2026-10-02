@@ -63,13 +63,19 @@ The release zip (`scripts/package_release.sh`) is unpacked into the folder that 
 
 | File | Role |
 |---|---|
-| `dxgi.dll`, `OptiScaler.ini` | OptiScaler 0.9.4. Its INI sets DLSS as the DX12 upscaler and `OptiDllPath=d4r`, so OptiScaler loads the shim as `d4r\nvngx.dll`. |
+| `dxgi.dll`, `OptiScaler.ini` | OptiScaler 0.9.4. Its INI sets DLSS as the DX12 upscaler, `NvngxPath=d4r\nvngx.dll` to select the shim explicitly, and `OptiDllPath=d4r` for the other libraries. |
 | `d3d12.dll`, `d3d12core.dll` | the d4r-patched vkd3d-proton. Proton loads DLLs from the game folder before `system32`. |
 | `d4r\nvngx.dll`, `d4r\nvcuda.dll` | the shim and the CUDA bridge |
 | `d4r\zluda\libcuda.so` | ZLUDA |
 | `d4r\kernels\<gfx target>\` | native kernels and their manifest `d4r-kernels.txt` |
 | `d4r\d4r.ini` | this game's settings |
 | `d4r\nvngx_dlss.dll`, `d4r\ngx\_nvngx.dll` | NVIDIA's files (the packager's `D4R_BUNDLE_NVIDIA=0` leaves them for the user to add) |
+
+**NGX routing.** OptiScaler tries `_nvngx.dll` before `nvngx.dll`, with system fallback for each name. `OptiDllPath=d4r` alone can therefore select Proton's system `_nvngx.dll` before reaching the shim. A file-valued `NvngxPath` takes priority on the first probe, regardless of the probe's name. It must select `d4r\nvngx.dll`, never `d4r\ngx\_nvngx.dll`: the latter is NVIDIA's core, which the shim loads internally. See OptiScaler 0.9.4's [NGX loader](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler/proxies/NVNGX_Proxy.h) and [override handling](https://github.com/optiscaler/OptiScaler/blob/v0.9.4/OptiScaler/Util.cpp).
+
+OptiScaler 0.9.4 checks a relative `NvngxPath` against the process working directory; it does not anchor that override to the executable like it does `OptiDllPath`. The portable INI assumes the game's working directory is the executable folder. Launchers that use another working directory need an absolute Windows filename for the shim. The Proton developer game launcher and OptiScaler harness already generate that form for `bin/d4r_nvngx.dll`.
+
+`sh d4r/d4r-check.sh` checks file presence and the explicit NGX route separately; it does not prove runtime initialization. OptiScaler's startup `nvngx.dll not found!` warning checks the executable folder and already loaded modules, not the override. It can appear before the shim loads from `d4r/`; verify the later `NVNGXProxy::InitNVNGX Loaded from ...\d4r\nvngx.dll` line and `d4r/d4r_nvngx.log` instead. Keep the shim in `d4r/`.
 
 **Settings.** When an `d4r.ini` sits next to the shim, the shim turns it into the same environment variables the developer launcher sets, with the release's defaults. A variable that is already set, for example in the launch options, wins. Settings for the Linux side (ZLUDA's and the bridge's) are handed to the bridge through `d4rSetEnv` right after it is loaded, before its first CUDA call.
 

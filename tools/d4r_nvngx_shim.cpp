@@ -273,7 +273,7 @@ static FILE* g_log = nullptr;
 static HMODULE g_selfModule = nullptr;
 
 // --- portable install ----------------------------------------------------------
-// The drag-in release keeps this DLL (as nvngx.dll, which OptiScaler finds through its OptiDllPath),
+// The drag-in release keeps this DLL (as nvngx.dll, explicitly selected by OptiScaler's NvngxPath),
 // the nvcuda bridge, ZLUDA and the native kernels in an d4r folder next to the game's executable,
 // with that game's settings in d4r\d4r.ini. The file's settings become the environment variables the
 // developer launcher sets (config/d4r.ini.default documents them), and a variable that is already set,
@@ -563,7 +563,7 @@ static void load_portable_config()
         portable_set(setting.variable, ini_flag(ini, "interop", setting.key, setting.fallback) ? "1" : "0");
     portable_set_unix("D4R_ELIDE_NGX_SYNC", ini_flag(ini, "interop", "ElideNgxSync", 1) ? "1" : "0");
     const std::string poll = ini_value(ini, "interop", "MarkerPollUs");
-    portable_set("D4R_SHIM_MARKER_POLL_US", poll.empty() ? "20" : poll);
+    portable_set("D4R_SHIM_MARKER_POLL_US", poll.empty() ? "200" : poll);
     // Direct output takes effect only while NGX runs the native output kernel (the bridge reports it); the
     // release cannot ship that kernel, which is built from NVIDIA's PTX.
     portable_set("D4R_SHIM_OUTPUT_DIRECT", ini_flag(ini, "interop", "DirectOutput", nativeOn) ? "1" : "0");
@@ -4429,6 +4429,11 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     if (!forced.empty())
     {
         const unsigned int value = static_cast<unsigned int>(strtoul(forced.c_str(), nullptr, 0));
+        const char* model = value == 5 ? "E" : value == 11 ? "K" : value == 12 ? "L" : value == 13 ? "M" : "custom";
+        logf("DLSS model override: D4R_DLSS_PRESET=%s (model %s) overrides game/OptiScaler presets "
+             "[DLAA=%u Quality=%u Balanced=%u Performance=%u UltraPerformance=%u UltraQuality=%u]; "
+             "using preset=%u for all quality modes",
+             forced.c_str(), model, presets[0], presets[1], presets[2], presets[3], presets[4], presets[5], value);
         for (unsigned int& preset : presets)
             preset = value;
     }

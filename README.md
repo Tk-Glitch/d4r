@@ -31,6 +31,12 @@ For reference, native 2560×1440 without upscaling (the game's TSR at 100%) runs
 
 On the same GPU DLSS starts at a disadvantage: its networks were designed for NVIDIA's tensor cores, and parts of them still run as translated NVIDIA code. How the numbers were measured, and what each optimisation contributed, is in [docs/performance.md](docs/performance.md).
 
+## FSR 4.1.1 vs. DLSS 4.5 comparison
+
+- [Side-by-side comparison: FSR 4.1.1 (left) and DLSS 4.5 preset M (right)](https://cdn.ayois.gay/sk-ant-api03-4Dr0yN5YAzsuAOcyp7KEfeRyB0pbh2iAv2vfywa9QITHIbQScnVQnef9jsxJzDcvWMD13r8C1qGAoQQevjLqzGPT0bAQ9AA)
+- [FSR 4.1.1 standalone video](https://cdn.ayois.gay/sk-ant-api03-YZpWqINTI2HBt6KWJTeyY2b9JJbxUTZdBVRR06KZD7b1x27QLjvQrZZX8Um5sZqkquuOlzJTHUh84FOOLsetNy-PAIiWxAA)
+- [DLSS 4.5 preset M standalone video](https://cdn.ayois.gay/sk-ant-api03-0GLTr6qEYGfUKWYoZeseLdTzPslh1AvlVLdlBEUvV893bi19b7qha5wKnuQXN2tl6l4ffaRKj5warfAFDDjOlYJNYWVQ3AA)
+
 ## Known issues
 
 - In some games using some models native upscaling can show visible artifacting.
@@ -40,6 +46,8 @@ For users who prioritize fidelity over speed, set `[Kernels] PreferAccuracy = tr
 ## GPU support
 
 d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and 4.5 network kernels for the targets below and selects the matching set at runtime. Only the RX 7700 XT has been tested by this project on a real GPU; an external video reports DLSS 4.5 running through d4r 0.1.2 on an RX 7900 XTX. RDNA4 runtime and performance remain unverified on hardware.
+
+!WE ARE LOOKING FOR VIDEOS OF IT WORKING, IF YOU HAVE A MENTIONED HERE AND DOESNT HAVE A VIDEO PLEASE TAKE ONE!
 
 | GPU | Chip | FP8 math | Runtime testing |
 |---|---|---|---|

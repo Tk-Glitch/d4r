@@ -78,6 +78,11 @@ Settings
   some GPU time. Restart after changing it; other scenes and RDNA4 hardware still need testing.
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
+  [Libraries] NvngxPath=d4r\nvngx.dll explicitly selects d4r's shim; OptiDllPath=d4r is also
+  needed for the other DLLs. Keep this route when restoring a customized INI during an update.
+  Do not point NvngxPath at d4r\ngx\_nvngx.dll: that is NVIDIA's core for the shim's internal use.
+  OptiScaler 0.9.4 resolves this relative override from the game's working directory. If a custom
+  launcher uses a different working directory, use the shim's absolute Windows filename instead.
 
 Each game has its own copy of both files.
 
@@ -112,8 +117,11 @@ If something goes wrong
 - d4r's log is d4r/d4r_nvngx.log. It is rewritten at every launch. Lines starting with "d4r:" and
   "nvcuda bridge:" name missing files or libraries.
 - DLSS missing in the game's menu, or no d4r_nvngx.log: check the launch options and that the
-  files are next to the game's main .exe. For OptiScaler's own log, set LogToFile=true in
-  OptiScaler.ini's [Log] section.
+  files are next to the game's main .exe. Run sh d4r/d4r-check.sh: it checks file presence and
+  OptiScaler's explicit NGX route separately. For OptiScaler's own log, set LogToFile=true in
+  OptiScaler.ini's [Log] section. Its later "NVNGXProxy::InitNVNGX Loaded from" line should name
+  d4r\nvngx.dll, not C:\windows\system32\_nvngx.dll. The startup "nvngx.dll not found!" warning
+  can be expected with the shim under d4r/; do not move it into the game root to silence that check.
 - A wrong image: try Model = E in d4r/d4r.ini, and report the problem with both logs.
 - Do not use d4r in games with anti-cheat. OptiScaler's DLL injection can get an account banned.
 - Not supported: DLSS Frame Generation, DLSS Ray Reconstruction, DirectX 11 and Vulkan games.
