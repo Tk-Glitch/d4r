@@ -747,9 +747,13 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #ifndef SWIN_PREP_SLOTS
 #define SWIN_PREP_SLOTS 0 // weight images kept per weights pointer (0: one image, re-prepared when the pointer changes)
 #endif
+#ifndef SWIN_PREP_KEY_AT
+#define SWIN_PREP_KEY_AT 1 // weights pointer at offset 0; 0 forces preparation on every launch
+#endif
 
-// Weight-image slots for kernels launched with several weight sets (the six enc3 tube blocks). The ZLUDA
-// hook runs the prep only for a weights pointer it has not seen (d4r_prep_key_at / d4r_prep_key_slots);
+// Optional weight-image slots for several weight sets with stable address identity. The ZLUDA
+// hook can run prep only for a weights pointer it has not seen (d4r_prep_key_at / d4r_prep_key_slots);
+// enc3 disables this policy because NGX recycles weight addresses across feature lifetimes.
 // the prep claims the first free slot for that pointer, and pointers beyond S share the overflow slot S,
 // which the hook re-prepares on every launch. Keys are written by one thread of the prep; any prep
 // thread that reads before that write finds the same (first free) slot.
@@ -790,8 +794,8 @@ template <int S> __device__ __forceinline__ int prep_slot_claim(uint64_t* keys, 
     __constant__ SwinDescs<C, NH, NPM, CIN> g_descs = make_descs<C, NH, NPM, CIN>();                                    \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_block_z = NWAVES;                                         \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_blocks = (NAME##_L::TOTAL + 127) / 128;              \
-    /* the prep reads only p.w (offset 0): skip it while the image for that pointer is resident */                     \
-    extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_at = 0 + 1;                                      \
+    /* enc3 disables address-only reuse: a recreated feature may recycle a weights address */                        \
+    extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_at = SWIN_PREP_KEY_AT;                             \
     extern "C" __device__ __attribute__((used)) uint32_t d4r_prep_key_slots = NAME##_S;                                \
     extern "C" __global__ void __launch_bounds__(128) NAME##_prep(PARAMS p)                                             \
     {                                                                                                                   \

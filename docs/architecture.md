@@ -24,13 +24,13 @@ With VRAM interop and split frames (the defaults when the patched vkd3d-proton i
    - A frame marker.
    - A split. vkd3d-proton submits everything the game records after the DLSS call separately, gated on a timeline semaphore reaching this frame's number.
    - At the start of that second part, a copy of the DLSS result into the game's output texture. Linear R11G11B10, RGB10A2, and RGBA8/BGRA8 outputs are converted from RGBA16F on the GPU. sRGB formats continue through host staging to preserve their existing byte interpretation.
-2. **The CUDA worker queues DLSS.** The prep thread checks the GPU-written input marker with short CPU sleeps. It drops recorded-but-unsubmitted frames when they time out or their feature retires, before any DLSS work is queued. The CUDA worker then queues:
+2. **The CUDA worker queues DLSS.** The prep thread checks the GPU-written marker for that input slot with short CPU sleeps. A later frame's marker cannot make a discarded frame's stale inputs appear ready. It drops recorded-but-unsubmitted frames when the queue skips them, they time out or their feature retires, before any DLSS work is queued. The CUDA worker then queues:
    - the input copies into CUDA arrays, or none when NGX samples the buffers in place (`LinearInputs`);
    - NGX's evaluation (NGX's own CPU synchronisations are elided with `ElideNgxSync`);
    - the result, written straight into the output buffer by the native output kernel (`DirectOutput`, preset K) or copied there.
 3. **Release.** When the GPU finishes, the worker signals the timeline semaphore and the rest of the game's frame runs, now with this frame's result.
 
-The watchdog reports delayed output but never signals an unfinished producer as ready. Retiring features remain registered until their CPU/CUDA jobs drain. The lifetime-aware vkd3d extension retains their staging buffers, imported buffers, conversion images and split semaphore through command-allocator reset or destruction after GPU completion. Discarded recordings are covered too; cleanup no longer relies on a 50 ms delay.
+The watchdog reports delayed output but never signals an unfinished producer as ready. Cancellation and completion can occur out of order across the prep and CUDA threads, so the output timeline advances only through a completed prefix of admitted frames. Cancelling a later frame cannot release a game copy while an earlier producer is still writing. Retiring features remain registered until their CPU/CUDA jobs drain. The lifetime-aware vkd3d extension retains their staging buffers, imported buffers, conversion images and split semaphore through command-allocator reset or destruction after GPU completion. Discarded recordings are covered too; cleanup no longer relies on a 50 ms delay.
 
 The shim requires the matching lifetime-aware d3d12.dll and d3d12core.dll, even for host staging. It rejects older runtimes rather than recording references whose lifetime it cannot protect. FrameAge > 0 shows the newest finished result; without VRAM interop, inputs and output are staged through host memory.
 

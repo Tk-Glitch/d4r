@@ -59,6 +59,7 @@
 #include <thread>
 #include <vector>
 #include "d4r_event_wait.h"
+#include "d4r_frame_completion.h"
 #include "d4r_win32_wait.h"
 #include "d4r_vkd3d_interop.h"
 
@@ -1635,11 +1636,12 @@ struct Feature
     VramImage exposureConversion;
     VramImage outputConversion;
     // Split frames: the rest of frame N's command list is submitted only once
-    // splitSemaphore reaches N (signalled when N retires, or by the watchdog).
+    // splitSemaphore reaches N (all admitted frames through N have retired).
     std::atomic<bool> split{false};
     VkSemaphore splitSemaphore = VK_NULL_HANDLE;
     std::mutex splitMutex;
     uint64_t splitSignalled = 0; // under splitMutex
+    D4rFrameCompletion splitCompletion; // under splitMutex; cancellation can finish out of order
     // Inputs become ready on the CPU before CUDA work is queued. GPU-side waits
     // for recorded-but-discarded command lists can otherwise wedge the device.
     // D4R_SHIM_OUTPUT_DIRECT: this frame's result is stored by the native output kernel straight into its
@@ -1653,7 +1655,7 @@ struct Feature
     std::vector<VramBuffer> retiredBuffers; // may still be read by queued command lists
     std::vector<VramImage> retiredImages;
     ID3D12Resource* marker = nullptr;
-    volatile uint32_t* markerValue = nullptr;
+    volatile uint32_t* markerValue = nullptr; // [0] latest input; [1 + slot] exact input frame
     uint32_t frame = 0;
     uint32_t rejectedFormatCount = 0; // game thread; rate-limits format diagnostics
     std::atomic<int> latestOutput{-1};
@@ -2606,13 +2608,14 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
 // the game's command list right after the input copies and the frame marker;
 // vkd3d-proton submits the second half separately, waiting (at queue submission
 // level, so no GPU ring is ever blocked) for splitSemaphore to reach N. The
-// worker writes N's result into output slot N % kOutputSlots and signals N when
-// the frame retires; a dropped frame signals too, and a watchdog signals any
-// frame the GPU has reached but nobody released within the timeout.
+// worker writes N's result into output slot N % kOutputSlots. Completed and
+// dropped frames advance the signal only past earlier retired frames. The
+// watchdog reports delays without releasing an unfinished producer.
 
-static void signal_split(Feature* feature, uint64_t value, const char* reason)
+static void release_split_frame(Feature* feature, uint32_t frame)
 {
     std::lock_guard<std::mutex> lock(feature->splitMutex);
+    const uint64_t value = feature->splitCompletion.retire(frame);
     if (value <= feature->splitSignalled)
         return;
     VkSemaphoreSignalInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
@@ -2621,14 +2624,8 @@ static void signal_split(Feature* feature, uint64_t value, const char* reason)
     const VkResult result = g_vk.signalSemaphore(g_vk.device, &info);
     if (result == VK_SUCCESS)
         feature->splitSignalled = value;
-    if (result != VK_SUCCESS || reason != nullptr)
-        logf("split frame %llu released%s%s (VkResult %d)", static_cast<unsigned long long>(value),
-             reason != nullptr ? " by " : "", reason != nullptr ? reason : "", result);
-}
-
-static void release_split_frame(Feature* feature, uint32_t frame)
-{
-    signal_split(feature, frame, nullptr);
+    if (result != VK_SUCCESS)
+        logf("split frame %llu signal failed (VkResult %d)", static_cast<unsigned long long>(value), result);
 }
 
 static void split_watchdog()
@@ -4003,14 +4000,23 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
 {
     InputSlot& slot = feature->inputs[slotIndex];
     const auto start = ProfileClock::now();
-    // Wait for actual input readiness without queueing an unbounded GPU-side wait.
-    while (static_cast<int32_t>(*feature->markerValue - frame) < 0)
+    // A later input marker does not prove this slot's copies were submitted:
+    // the game may have discarded this frame's command list. Require its own
+    // tag, otherwise stale input data can enter DLSS's temporal history.
+    const volatile uint32_t* inputMarker = feature->markerValue + 1 + slotIndex;
+    while (*inputMarker != frame)
     {
         std::atomic_thread_fence(std::memory_order_acquire);
-        if (feature->retiring.load() || std::chrono::steady_clock::now() - start > std::chrono::seconds(5))
+        const bool skipped = static_cast<int32_t>(*feature->markerValue - frame) > 0;
+        // The GPU may have filled our slot between the loop condition and
+        // the aggregate-marker read. Recheck before deciding it was skipped.
+        if (*inputMarker == frame)
+            break;
+        if (feature->retiring.load() || skipped || std::chrono::steady_clock::now() - start > std::chrono::seconds(5))
         {
             logf("frame %u: %s waiting for GPU marker (at %u); dropping", frame,
-                 feature->retiring.load() ? "feature retired while" : "timed out", *feature->markerValue);
+                 feature->retiring.load() ? "feature retired while" : skipped ? "input submission skipped while" : "timed out",
+                 *inputMarker);
             slot.busy = false;
             frame_retired(feature, frame);
             return;
@@ -4522,7 +4528,8 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         delete feature;
         return NGX_FAIL_PLATFORM_ERROR;
     }
-    *feature->markerValue = 0;
+    for (int index = 0; index <= kSlots; ++index)
+        feature->markerValue[index] = 0;
     feature->resources = new DeferredResources(feature);
     feature->handle.Id = g.nextHandleId++;
     {
@@ -4809,9 +4816,15 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         logf("ID3D12GraphicsCommandList2 unavailable; cannot place frame marker");
         return NGX_FAIL_PLATFORM_ERROR;
     }
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER marker = {feature->marker->GetGPUVirtualAddress(), frame};
-    D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
-    list2->WriteBufferImmediate(1, &marker, &mode);
+    const D3D12_GPU_VIRTUAL_ADDRESS markerAddress = feature->marker->GetGPUVirtualAddress();
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER markers[] = {
+        {markerAddress + sizeof(uint32_t) * (1 + slotIndex), frame},
+        {markerAddress, frame},
+    };
+    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[] = {
+        D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+    };
+    list2->WriteBufferImmediate(2, markers, modes);
     list2->Release();
 
     // Present the most recent finished DLSS result.
@@ -4873,6 +4886,11 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
 
     slot.busy = true;
     feature->inFlight.fetch_add(1);
+    if (feature->split)
+    {
+        std::lock_guard<std::mutex> lock(feature->splitMutex);
+        feature->splitCompletion.admit(frame);
+    }
     g.prep.post([feature, slotIndex, frame, p, timing] { prepare_inputs(feature, slotIndex, frame, p, timing); });
     if (frame <= 3 || frame % 600 == 0 || GetEnvironmentVariableA("D4R_SHIM_TRACE_FRAMES", nullptr, 0) != 0)
         logf("evaluate frame %u queued (slot %d, showing result %d, jitter %.6f,%.6f, reset %d, "

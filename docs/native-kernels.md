@@ -12,7 +12,7 @@ With `D4R_ZLUDA_NATIVE_DIR=DIR`, whenever NGX loads a PTX module and asks for ke
 | `u32 d4r_prep_blocks` | grid size of the prep kernel (128 threads per block) |
 | `u32 d4r_prep_key_offset` | byte offset of a u64 in the parameter block; the prep is skipped while that value (the weights pointer) repeats (0 = no key) |
 | `u32 d4r_prep_key_at` | the same as offset + 1, so a key at offset 0 can be named (M's layers keep their weights pointer there) |
-| `u32 d4r_prep_key_slots` | N > 0: the kernel keeps one prepared image per key for up to N keys, so the prep runs once per weight set (the six enc3 tube blocks); keys beyond N share an overflow image and are prepared on every launch |
+| `u32 d4r_prep_key_slots` | N > 0: the kernel keeps one prepared image per key for up to N keys; keys beyond N share an overflow image. This requires stable weight-address identity. Enc3 disables key caching and prepares every launch instead. |
 | `u32 d4r_block_z` | replaces the launch's block z dimension (more waves per window) |
 | `u32 d4r_grid_x` | replaces the grid (persistent kernels) |
 
@@ -36,7 +36,7 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
 - **Weights:** prep kernels expand the weights into WMMA operand images once.
 
 **DLSS 4.5, presets L/M (`kernels/m`, `rrlite_*`).**
-- **Network:** the Swin blocks of DLSS 4.5, whose weights are FP8. Their prep kernels expand the weights to f16 WMMA operands, once per weight set.
+- **Network:** the Swin blocks of DLSS 4.5, whose weights are FP8. Their prep kernels expand the weights to f16 WMMA operands. The enc3 tube layer prepares on every launch: NGX can recycle a weights address for a different tube block after feature recreation, so persistent address-only reuse can return stale weights and corrupt the image after quality changes. Other layers retain their existing preparation policy.
 - **Template:** `swin_block.h` covers encoders, the tube-shaped enc3 and decoders.
 - **Output encoding:** the FP8 output is encoded two values at a time with packed 16-bit operations (`enc8x2`, exhaustively equal to the scalar encoder), and the 2×2 patch merge reads the rounded f16 values the codes decode to, from a row layout without LDS bank conflicts, instead of decoding the bytes again in every wave.
 - **Weight loads:** enc1 forms each weight tile's address in scalar registers (`SWIN_SCALAR_BLOAD`); the 8-wave layers are faster without it.
