@@ -1,5 +1,5 @@
-// CU mode: the waves of a window share one L0 cache (1-6% faster here; slower in the wide layers)
-// d4r-build-flags: -mcumode
+// Exact single-buffer enc1: reload the original input for the residual, preserve WGP mode.
+// d4r-build-flags: -DPOS_VSHARE1 -DPWIN_VEC_SCALAR -DPWIN_PK_ELEM
 #define PWIN_F32ACC
-#include "pwin_layer.h"
-PWIN_ENCODER_POS(dltss_pwin_enc1_layer, 2, 64, 64, true)
+#include "pwin_pos_recompute.h"
+POS_RECOMPUTE_ENCODER(dltss_pwin_enc1_layer, 2, 64, 64, 0, 1)

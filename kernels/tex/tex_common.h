@@ -303,6 +303,13 @@ __attribute__((device)) static inline uint32_t redirect_pitch(uint64_t surface)
     const uint32_t word = ((const __attribute__((address_space(4))) uint32_t*)surface)[21];
     return (word >> 16) == 0x5232u ? (word & 0xffffu) << 3 : 0u;
 }
+// D4R_AS1_STORES: redirect stores through address-space-1 pointers (global_store instead of flat_store; the
+// redirect target is linear device memory)
+#ifdef D4R_AS1_STORES
+#define D4R_REDIRECT_PTR(T, address) ((__attribute__((address_space(1))) T*)(uintptr_t)(address))
+#else
+#define D4R_REDIRECT_PTR(T, address) ((T*)(address))
+#endif
 __attribute__((device)) static inline uint8_t* redirect_row(uint64_t surface, int32_t y)
 {
     const uint64_t base = *(const __attribute__((address_space(4))) uint64_t*)(surface + 88);
@@ -325,7 +332,7 @@ DEV __attribute__((always_inline)) void d4r_sust_p_v4b32(uint64_t surface, int32
         {
             const uint32_t lo = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(__builtin_bit_cast(float, a), __builtin_bit_cast(float, b)));
             const uint32_t hi = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(__builtin_bit_cast(float, c), __builtin_bit_cast(float, d)));
-            *(uint2_t*)(redirect_row(surface, y) + 8 * x) = (uint2_t){lo, hi};
+            *D4R_REDIRECT_PTR(uint2_t, redirect_row(surface, y) + 8 * x) = (uint2_t){lo, hi};
         }
         return;
     }
@@ -430,7 +437,7 @@ DEV __attribute__((always_inline)) void d4r_sust_b32(uint64_t surface, int32_t x
     {
         // raw bits at byte offset x (RGBA16F rows are 8 bytes per pixel)
         if (x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
-            *(uint32_t*)(redirect_row(surface, y) + x) = data;
+            *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + x) = data;
         return;
     }
     const int dt = __ockl_image_channel_data_type_2D(image), order = __ockl_image_channel_order_2D(image);

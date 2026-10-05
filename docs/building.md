@@ -4,7 +4,7 @@ These steps produce the pieces the launcher needs: a patched ZLUDA, a patched vk
 
 | Component | Tested version |
 |---|---|
-| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0007` in order |
+| ZLUDA | `ee2f25a` (upstream), plus `patches/zluda/0002` through `0008` in order |
 | vkd3d-proton | `3dfc6f07` (the base GE-Proton11-3 ships), plus `patches/vkd3d-proton/0001` and `0002` |
 | ROCm | 7.2 (HIP runtime, clang, device libraries) |
 | Proton | GE-Proton11-3 (with its OptiScaler integration) |
@@ -17,7 +17,7 @@ git clone https://github.com/vosen/ZLUDA zluda && cd zluda
 git checkout ee2f25a
 git submodule update --init --recursive
 git lfs pull
-for p in 0002 0003 0004 0005 0006 0007; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
+for p in 0002 0003 0004 0005 0006 0007 0008; do git apply /path/to/d4r/patches/zluda/$p-*.patch; done
 # rebuild the device helpers the patches changed (ptx/lib/zluda_ptx_impl*.bc)
 ZLUDA_SOURCE_ROOT=$PWD ROCM_ROOT=/opt/rocm /path/to/d4r/scripts/build_zluda_ptx_helpers.sh
 LIBRARY_PATH=/opt/rocm/lib cargo build --release -p zluda
@@ -44,6 +44,7 @@ What the patches add:
 - **0005**: a null texture object (CUDA handle 0) reads as zeros, as on NVIDIA GPUs, instead of faulting the GPU. DLSS samples absent optional inputs that way in some configurations (low-resolution motion vectors without HDR, as in Ghost of Tsushima).
 - **0006**: `m16n8k8` f16 MMAs (DLSS 3 CNN, presets E/F) on RDNA3 WMMA like the k16 ones (`D4R_ZLUDA_WMMA_K8=0` disables it); weight-image slots for native prep kernels (`d4r_prep_key_at`, `d4r_prep_key_slots`); and wave64 compilation for offline texture-kernel builds (`D4R_ZLUDA_WAVE64=1`, with wave64 builds of the helper bitcode). `scripts/build_zluda_ptx_helpers.sh` now writes the `_w64` helper variants too.
 - **0007**: gfx12 WMMA layout lowering, optional native e4m3 FP8 WMMA (`D4R_ZLUDA_WMMA_FP8_NATIVE=1`), and an architecture argument for `d4r_emit`. `D4R_ZLUDA_WMMA_LAYOUT=12` on gfx11 is a validation shim, not a release setting.
+- **0008**: post-phase kernels for native overrides (`NAME_post1` … `NAME_post8`, see [native-kernels.md](native-kernels.md)). Preset K's dec5 layer runs as four phase kernels, so the K set needs this patch: an older `libnvcuda.so` would skip the phases.
 
 When linking on a system with ROCm libraries outside the default search path, include their library directory in `LIBRARY_PATH`. The build also needs the appropriate ROCm link libraries. `CARGO_BUILD_JOBS=8` caps parallel Rust compilation if memory is limited.
 
@@ -131,7 +132,7 @@ Mount the repository at `/work`, ROCm's compiler/headers/device libraries at `/o
 | Variable | Input |
 |---|---|
 | `D4R_RELEASE_BUILD_ROOT` | writable directory under `/work/build/` |
-| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0007` applied |
+| `D4R_ZLUDA_SRC` | isolated checkout inside that directory, with both pinned LLVM and HiGHS submodules, the real OCKL LFS payload, and patches `0002`–`0008` applied |
 | `D4R_VKD3D_SRC` | isolated vkd3d-proton checkout inside that directory, with its submodules and patches `0001` and `0002` applied |
 | `CARGO_HOME` | writable build-local Cargo cache; prefetch the locked dependencies for an offline build |
 | `D4R_ROCM_DIR` | `/opt/rocm` |
