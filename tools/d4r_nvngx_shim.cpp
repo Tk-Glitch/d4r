@@ -853,7 +853,8 @@ static bool supported_input(Plane plane, DXGI_FORMAT format)
                format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
                format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
                format == DXGI_FORMAT_R8G8B8A8_TYPELESS || format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-               format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+               format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+               format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     case Plane::Depth:
         return format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_R32_FLOAT ||
                format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
@@ -880,7 +881,8 @@ static bool supported_output(DXGI_FORMAT format)
            format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R11G11B10_FLOAT ||
            format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
            format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
-           format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+           format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+           format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
 }
 
 static float unorm(uint32_t value, int bits)
@@ -943,6 +945,20 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
                 rgba[2] = unorm(source[x * 4 + 0], 8);
                 rgba[3] = unorm(source[x * 4 + 3], 8);
                 break;
+            case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+            {
+                // Microsoft spec: c = (p >> offset) & 0x1FF, E = (p >> 27) & 0x1F,
+                // v = c * 2^(E - 24). E == 0 means an exact zero.
+                uint32_t packed;
+                std::memcpy(&packed, source + x * 4, 4);
+                uint32_t e = (packed >> 27) & 0x1Fu;
+                float scale = (e == 0) ? 0.0f : std::ldexp(1.0f, (int)e - 24);
+                rgba[0] = static_cast<float>((packed >> 0) & 0x1FFu) * scale;
+                rgba[1] = static_cast<float>((packed >> 9) & 0x1FFu) * scale;
+                rgba[2] = static_cast<float>((packed >> 18) & 0x1FFu) * scale;
+                rgba[3] = 1.0f;
+                break;
+            }
             default: // RGBA8 variants
                 for (int c = 0; c < 4; ++c)
                     rgba[c] = unorm(source[x * 4 + c], 8);
@@ -1073,6 +1089,56 @@ static void convert_r11g11b10_row(const uint8_t* source, uint16_t* half, UINT wi
     }
 }
 
+// Packs one RGBA16F DLSS texel into the 9-9-9-5 shared-exponent layout.
+// Microsoft spec: v = c * 2^(E - 24), c in [0, 511]. The exponent is chosen as
+// the smallest E such that all channels fit in 9 bits, then each channel is
+// rounded to the nearest representable value (round-half-even, matching
+// D3D's conversion semantics). Values above the format's max (65024.0) are
+// clamped, like D3D12 does.
+static void rgbe_pack(const float rgba[4], uint8_t* destination)
+{
+    const float MAX_VALUE = 65024.0f; // 511 * 2^(24 - 24)
+    float r = rgba[0] < 0.0f ? 0.0f : (rgba[0] > MAX_VALUE ? MAX_VALUE : rgba[0]);
+    float g = rgba[1] < 0.0f ? 0.0f : (rgba[1] > MAX_VALUE ? MAX_VALUE : rgba[1]);
+    float b = rgba[2] < 0.0f ? 0.0f : (rgba[2] > MAX_VALUE ? MAX_VALUE : rgba[2]);
+
+    float mx = fmaxf(fmaxf(r, g), b);
+    int e;
+    if (mx == 0.0f)
+    {
+        e = 0; // exponent 0 encodes an exact zero in this format
+    }
+    else
+    {
+        // Smallest scale (i.e. smallest e) such that mx / scale <= 511. This
+        // puts the largest channel in the normalized 9-bit range [256, 511],
+        // which gives every channel the maximum precision the format allows.
+        e = 31;
+        for (int et = 1; et <= 31; ++et)
+        {
+            if (mx / std::ldexp(1.0f, et - 24) <= 511.0f) { e = et; break; }
+        }
+    }
+    const float scale = std::ldexp(1.0f, e - 24);
+    const float inv = 1.0f / scale;
+
+    // Round to nearest, ties to even (D3D round-to-nearest-even semantics).
+    auto to_c = [](float v, float inv) -> uint32_t
+    {
+        double d = std::nearbyint(v * inv); // round-half-even
+        if (d < 0.0) d = 0.0;
+        if (d > 511.0) d = 511.0;
+        return static_cast<uint32_t>(d);
+    };
+
+    uint32_t packed = 0;
+    packed |= to_c(r, inv) << 0;
+    packed |= to_c(g, inv) << 9;
+    packed |= to_c(b, inv) << 18;
+    packed |= (e & 0x1Fu) << 27;
+    std::memcpy(destination, &packed, 4);
+}
+
 // Converts one row of RGBA16F DLSS output into the game's output format.
 static void convert_row_out(DXGI_FORMAT format, const uint16_t* source, uint8_t* destination, UINT width)
 {
@@ -1117,6 +1183,12 @@ static void convert_row_out(DXGI_FORMAT format, const uint16_t* source, uint8_t*
             destination[x * 4 + 2] = static_cast<uint8_t>(to_unorm(half_to_float(texel[0]), 8));
             destination[x * 4 + 3] = static_cast<uint8_t>(to_unorm(half_to_float(texel[3]), 8));
             break;
+        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+        {
+            float rgba[4] = {half_to_float(texel[0]), half_to_float(texel[1]), half_to_float(texel[2]), 1.0f};
+            rgbe_pack(rgba, destination + x * 4);
+            break;
+        }
         default: // RGBA8
             for (int c = 0; c < 4; ++c)
                 destination[x * 4 + c] = static_cast<uint8_t>(to_unorm(half_to_float(texel[c]), 8));
@@ -2410,6 +2482,7 @@ static bool vram_color_blit_supported(VkFormat format, bool output)
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
         break;
     default:
         return false;
