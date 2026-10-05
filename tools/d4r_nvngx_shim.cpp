@@ -1676,6 +1676,8 @@ struct Feature
     void* cudaParams = nullptr;
     CudaDevicePtr scratch = 0;
     unsigned int width = 0, height = 0, outWidth = 0, outHeight = 0;
+    unsigned int cudaWidth = 0, cudaHeight = 0; // render size the NGX feature was created with (worker only)
+    unsigned int refusedWidth = 0, refusedHeight = 0; // render size NGX would not create a feature for (worker only)
     int quality = 0, flags = 0;
     unsigned int preset = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
@@ -3894,6 +3896,53 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     finish_publish(feature, target, frame, params, timing, start);
 }
 
+// Worker. Streamline can create the feature at one quality's render size while the game still renders at
+// another's (PRAGMATA starts with an Ultra Performance 854x480 frame on a Performance 1280x720 feature), and NGX
+// rejects a subrect outside the feature's dynamic range on every frame until the game recreates it: a black
+// screen. Recreate the NGX feature at the size actually rendered; the game's handle and output stay the same.
+static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint32_t frame)
+{
+    if ((params.renderWidth == feature.cudaWidth && params.renderHeight == feature.cudaHeight) ||
+        (params.renderWidth == feature.refusedWidth && params.renderHeight == feature.refusedHeight))
+        return false;
+    logf("frame %u: NGX rejected render %ux%u on a %ux%u feature; recreating it at %ux%u", frame, params.renderWidth,
+         params.renderHeight, feature.cudaWidth, feature.cudaHeight, params.renderWidth, params.renderHeight);
+    // earlier frames' kernels may still be running on the old feature
+    synchronize_default_stream(feature);
+    if (feature.cudaHandle != nullptr)
+        g.ngx.releaseFeature(feature.cudaHandle);
+    feature.cudaHandle = nullptr;
+    void* p = feature.cudaParams;
+    d4r_ngx_set_uint(p, "Width", params.renderWidth);
+    d4r_ngx_set_uint(p, "Height", params.renderHeight);
+    NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+    unsigned int width = params.renderWidth, height = params.renderHeight;
+    if (created != NGX_SUCCESS)
+    {
+        logf("frame %u: recreating the NGX feature at %ux%u failed (0x%08x); restoring %ux%u", frame, width, height,
+             created, feature.cudaWidth, feature.cudaHeight);
+        feature.refusedWidth = width;
+        feature.refusedHeight = height;
+        width = feature.cudaWidth;
+        height = feature.cudaHeight;
+        d4r_ngx_set_uint(p, "Width", width);
+        d4r_ngx_set_uint(p, "Height", height);
+        feature.cudaHandle = nullptr;
+        created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+        if (created != NGX_SUCCESS)
+        {
+            logf("frame %u: restoring the NGX feature failed (0x%08x)", frame, created);
+            feature.cudaHandle = nullptr;
+        }
+    }
+    // a new feature has no history
+    feature.cudaWidth = width;
+    feature.cudaHeight = height;
+    params.reset = 1;
+    d4r_ngx_set_int(p, "Reset", 1);
+    return feature.cudaHandle != nullptr && width == params.renderWidth && height == params.renderHeight;
+}
+
 static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, FrameParams params, FrameTiming timing)
 {
     InputSlot& slot = feature->inputs[slotIndex];
@@ -3993,7 +4042,9 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     const int eventStartResult = timing.enabled && feature->profileEventsReady
                                      ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
     const auto evalStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
-    const NgxResult result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
+    NgxResult result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
+    if (result == NGX_FAIL_INVALID_PARAMETER && recreate_for_render_size(*feature, params, frame))
+        result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
     if (feature->outputRedirected && g.cu.outputKernelNative != nullptr && g.cu.outputKernelNative() != 1)
     {
         // this frame's output kernel ignored the redirect: publish from the array as usual
@@ -4555,6 +4606,8 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
         else
             feature->scratch = 0;
         const NgxResult created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature->cudaHandle);
+        feature->cudaWidth = feature->width;
+        feature->cudaHeight = feature->height;
         if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0 &&
             g.cu.eventCreate != nullptr && g.cu.eventRecord != nullptr &&
             g.cu.eventSynchronize != nullptr && g.cu.eventQuery != nullptr && g.cu.eventDestroy != nullptr)

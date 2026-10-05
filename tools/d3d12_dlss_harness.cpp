@@ -679,8 +679,13 @@ int main(int argc, char** argv)
     void* parameters = nullptr;
     result = allocate(&parameters);
     std::printf("AllocateParameters -> 0x%08x\n", result);
-    d4r_ngx_set_uint(parameters, "Width", inWidth);
-    d4r_ngx_set_uint(parameters, "Height", inHeight);
+    // D4R_HARNESS_CREATE_SIZE=WxH creates the feature for another render size than the frames use, as
+    // Streamline does for a frame or more after a quality change (PRAGMATA: 1280x720 feature, 854x480 frames).
+    unsigned int createWidth = inWidth, createHeight = inHeight;
+    if (const char* size = std::getenv("D4R_HARNESS_CREATE_SIZE"))
+        std::sscanf(size, "%ux%u", &createWidth, &createHeight);
+    d4r_ngx_set_uint(parameters, "Width", createWidth);
+    d4r_ngx_set_uint(parameters, "Height", createHeight);
     d4r_ngx_set_uint(parameters, "OutWidth", outWidth);
     d4r_ngx_set_uint(parameters, "OutHeight", outHeight);
     // D4R_HARNESS_QUALITY selects NVSDK_NGX_PerfQuality_Value (default 2,
