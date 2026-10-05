@@ -44,6 +44,20 @@ DLSS 4 (K) at Quality, frames per second on the walk:
 
 DLSS 4.5 (M) at Quality went from 28 fps (ZLUDA only) to 42 with the first native Swin layers, 46 with more waves per window, 50 with fast numerics and the texture-kernel tails, and 51.5 with the hand-off changes.
 
+## DLSS 4 (K) tuning round, 2026-10-04
+
+A separate work copy of this tree tuned the K kernels with byte-identical output (see [native-kernels.md](native-kernels.md)). Numbers from that copy, RX 7700 XT, D3D12 harness, motion scene, FrameAge 0, warmed medians of back-to-back runs; the shipped 0.1.4 kernels against the tuned set:
+
+| | shipped | tuned |
+|---|---|---|
+| 2560×1440 Quality: DLSS GPU time (`gpu_eval`) | 2.89 ms | 2.41 ms |
+| 1920×1080 Quality: DLSS GPU time | 1.86 ms | 1.50 ms |
+| 2560×1440 Quality: sum of kernels | 2.90 ms | 2.40 ms |
+
+In SILENT HILL Townfall (static scene, K Quality 1706×960 → 2560×1440, MangoHud, two alternating rounds): 63.1 / 63.3 fps → 65.4 / 65.1 fps with default settings (frame time −0.5 ms), DLSS GPU time 2.92 → 2.41 ms. At 1920×1080: 86.1 → 89.3 fps. DLSS 4.5 (M) gained little from its own round (DLSS GPU time 7.96 → 7.91 ms at 2560×1440 Quality, Townfall 1080p +0.7%).
+
+These were measured in the work copy. They have not been re-measured from this repository since the port.
+
 ## What did not help
 
 - **Accumulating in f16 on the WMMA units.** The error grows about 20× and the image degrades.

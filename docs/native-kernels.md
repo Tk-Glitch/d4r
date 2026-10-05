@@ -15,6 +15,7 @@ With `D4R_ZLUDA_NATIVE_DIR=DIR`, whenever NGX loads a PTX module and asks for ke
 | `u32 d4r_prep_key_slots` | N > 0: the kernel keeps one prepared image per key for up to N keys; keys beyond N share an overflow image. This requires stable weight-address identity. Enc3 disables key caching and prepares every launch instead. |
 | `u32 d4r_block_z` | replaces the launch's block z dimension (more waves per window) |
 | `u32 d4r_grid_x` | replaces the grid (persistent kernels) |
+| `NAME_post1` … `NAME_post8` kernels | launched after `NAME` on the same stream with the same parameters (patches/zluda/0008); `u32 d4r_postK_grid_x` / `_grid_y` replace the grid (0 = the launch's), `d4r_postK_block_x` / `_y` / `_z` the block (0 = 32 / 1 / 1). One layer can run as several dependent phases. |
 
 Kernels without a file in `DIR` are compiled from PTX as usual, so a partial set works.
 
@@ -34,12 +35,23 @@ The release is built this way, with hashes from DLSS 310.7.0 and 310.9.1. The PT
   - `pwin_pos.h`: position-only layers with two token tiles per wave, which halves weight traffic.
   - `pwin_wide.h`: the deep layers, which have only 6–77 windows per frame. It uses 4·NG waves per window, split by token tile and channel group, so the GPU stays busy.
 - **Weights:** prep kernels expand the weights into WMMA operand images once.
+- **Exact tuning round (2026-10-04, RX 7700 XT):** every change keeps all captured buffers and the harness image byte-identical to the previous build.
+  - LDS rows are padded (`PWIN_PAD`) so the 16 lanes of a WMMA operand load hit distinct banks.
+  - enc1/enc2/dec1/dec2 build in WGP mode; enc0, dec0 and dec3 move the half-wave exchange to `ds_bpermute`.
+  - `common/wmma_layout.h` removes the dynamic vector indexing of accumulator elements and adds packed f16 conversions (`wm_cvt2`, `WM_CVT_ASM`, `PWIN_PK_ELEM`).
+  - Weight tiles load through raw buffer loads with a uniform offset (`op_imgt`); the f32 accumulator-init vectors are prepared once into image slots.
+  - The deep layers use more waves per window (`NG = 8` for enc4, dec4, dec5).
+  - dec5 runs as four dependent phase kernels (`pwin_phase.h`, post kernels, needs patch 0008).
+  - enc1 keeps one LDS buffer and reloads its input for the residual (`pwin_pos_recompute.h`); dec1 computes its Q, K and V chains two at a time.
+  - Tried and not kept (slower or not exact): interleaved WMMA chains, a GELU lookup table, streaming attention, f16-accumulating WMMA, persistent or megakernel layers, phase kernels for the other deep layers, fast math.
+- **Texture kernels as native code:** `kernels/native/ptx2hip.py` translates a DLSS PTX kernel into HIP, each instruction as ZLUDA's lowering of it (`ptx_rt.h`, `native_rt.h`). `kernels/build.sh` uses it, at build time and from your own DLL, for two kernels of the fast set: `hiluma_engine_output_depthinv_mvhi_hdr_max_v2_rel` (`--ctile`, the path-B LDS tile as a function in `output_tile.h`, no unused depth prefetch, global-memory redirect stores) and `hiluma_engine_input_depthinv_mvhi_hdr_v2_rel` (`--ifconv --sink`, `in_fuse.py` moves its scratch arrays into registers, `in_regs.hip`, wave32). Both match ZLUDA's compile byte for byte in the harness. The generated sources are never stored. Other flag combinations of these kernels still use the PTX route above, and the accuracy set keeps ZLUDA's compile because the native code flushes f32 denormals.
 
 **DLSS 4.5, presets L/M (`kernels/m`, `rrlite_*`).**
 - **Network:** the Swin blocks of DLSS 4.5, whose weights are FP8. Their prep kernels expand the weights to f16 WMMA operands. The enc3 tube layer prepares on every launch: NGX can recycle a weights address for a different tube block after feature recreation, so persistent address-only reuse can return stale weights and corrupt the image after quality changes. Other layers retain their existing preparation policy.
 - **Template:** `swin_block.h` covers encoders, the tube-shaped enc3 and decoders.
 - **Output encoding:** the FP8 output is encoded two values at a time with packed 16-bit operations (`enc8x2`, exhaustively equal to the scalar encoder), and the 2×2 patch merge reads the rounded f16 values the codes decode to, from a row layout without LDS bank conflicts, instead of decoding the bytes again in every wave.
 - **Weight loads:** enc1 forms each weight tile's address in scalar registers (`SWIN_SCALAR_BLOAD`); the 8-wave layers are faster without it.
+- **gfx1101 tuning (`// d4r-build-flags-gfx1101:` lines):** enc2 uses a packed FP8 decode, packed norm sums, a `ds_bpermute` half-wave exchange and a 4x unrolled MLP loop; dec1 caps VGPRs at 160 (no scratch); dec2 uses the memory-clause scheduler. All are byte-identical to the default build; the total gain is small (about 0.07 ms of 7.9 ms).
 
 **Preset L texture variants.** L uses unfolded `rrlite_enc0_4x4_*`, `rrlite_dec0_4x4`, and `rrlite_post_3_*` kernels. The L build keeps their full neural arithmetic and replaces surface stores with the existing native format-conversion functions. M's folded enc0 tail and dec0 head cannot be used for these variants. All four input flag combinations and all eight post variants are built, along with the shared downsample kernels. `all` and `tex` include these variants; `l` builds the shared Swin layers plus only the L texture set. L remains experimental; these replacements do not establish RTX parity or game performance.
 

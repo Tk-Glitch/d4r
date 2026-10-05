@@ -105,6 +105,18 @@ __device__ __forceinline__ half_t q8_exact(half_t h)
 typedef _Float16 hv2 __attribute__((ext_vector_type(2)));
 typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
 typedef short i16x2 __attribute__((ext_vector_type(2)));
+typedef _Float16 h4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ h4 decode4(uint32_t bytes)
+{
+    uint32_t m = bytes & 0x7f7f7f7fu, sign = bytes & 0x80808080u;
+    uint32_t lo = (__builtin_amdgcn_perm(0u, m, 0x0c010c00u) << 7) |
+                  __builtin_amdgcn_perm(0u, sign, 0x010c000cu);
+    uint32_t hi = (__builtin_amdgcn_perm(0u, m, 0x0c030c02u) << 7) |
+                  __builtin_amdgcn_perm(0u, sign, 0x030c020cu);
+    const hv2 scale = {(half_t)256.0f, (half_t)256.0f};
+    hv2 a = __builtin_bit_cast(hv2, lo) * scale, b = __builtin_bit_cast(hv2, hi) * scale;
+    return (h4){a[0], a[1], b[0], b[1]};
+}
 
 // q8_exact on two halves with packed 16-bit integer / f16 ops (same per-half logic; no carries cross halves)
 __device__ __forceinline__ hv2 q8x2_exact(hv2 h)
@@ -138,6 +150,34 @@ __device__ __forceinline__ uint32_t enc8x2(hv2 h, hv2& q)
 {
     q = q8x2_exact(h);
     return codes8x2(q);
+}
+
+// Direct encoder for stores that do not also consume the rounded f16 values.
+// The codes remain in the low byte of each 16-bit half, as codes8x2 expects.
+__device__ __forceinline__ uint32_t direct_codes8x2(hv2 h)
+{
+    const u16x2 bits = __builtin_bit_cast(u16x2, h), m = bits & (unsigned short)0x7fff;
+    const u16x2 normal = (m + ((m >> 7) & (unsigned short)1) + (unsigned short)0xe03f) >> 7;
+#ifdef SWIN_CODES_SHIFT
+    const u16x2 exp = m >> 10;
+    const u16x2 bounded = __builtin_elementwise_max(__builtin_elementwise_min(exp, (u16x2)8), (u16x2)1);
+    const u16x2 shift = (unsigned short)16 - bounded;
+    const u16x2 sig = (m & (unsigned short)0x3ff) |
+                     (__builtin_elementwise_min(m, (u16x2)0x400) & (unsigned short)0x400);
+    const u16x2 sub = (sig + (((u16x2)1 << (shift - (unsigned short)1)) - (unsigned short)1) +
+                       ((sig >> shift) & (unsigned short)1)) >> shift;
+#else
+    // Below 2^-6, f16(2 + |h|) has the rounded e4m3 subnormal code
+    // directly in its low bits (ULP at 2 is 2^-9). No decode round trip.
+    const hv2 biased = __builtin_bit_cast(hv2, m) + (hv2){(half_t)2.0f, (half_t)2.0f};
+    const u16x2 sub = __builtin_bit_cast(u16x2, biased) - (unsigned short)0x4000;
+#endif
+    const u16x2 tiny = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)(m - (unsigned short)0x2400)) >> 15));
+    u16x2 code = __builtin_elementwise_min((sub & tiny) | (normal & ~tiny), (u16x2)0x7e);
+    const u16x2 nan = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)((unsigned short)0x7c00 - m)) >> 15));
+    code |= nan & (unsigned short)0x7f;
+    code |= (bits >> 8) & (unsigned short)0x80;
+    return __builtin_bit_cast(uint32_t, code);
 }
 
 // the e4m3 codes of two halves that already hold e4m3 values (q8_exact results), in the low bytes of the
@@ -332,7 +372,13 @@ struct T16
 {
 #ifdef SWIN_F32ACC
     f8v f;
-    __device__ hv2 pair(int k) const { return (hv2){(half_t)f[2 * k], (half_t)f[2 * k + 1]}; }
+    __device__ hv2 pair(int k) const {
+#ifdef SWIN_CVT_ASM
+        return __builtin_bit_cast(hv2, wm_cvt2(f[2 * k], f[2 * k + 1]));
+#else
+        return (hv2){(half_t)f[2 * k], (half_t)f[2 * k + 1]};
+#endif
+    }
     __device__ void set_pair(int k, hv2 p) { f[2 * k] = (float)p[0]; f[2 * k + 1] = (float)p[1]; }
     __device__ half_t get(int i) const { return (half_t)f[i]; }
     __device__ void set(int i, half_t h) { f[i] = (float)h; }
@@ -413,7 +459,11 @@ template <int MASK> __device__ __forceinline__ uint32_t xor_lane(uint32_t v)
     else if constexpr (MASK == 8)
         return __builtin_amdgcn_update_dpp(0, (int)v, 0x168, 0xf, 0xf, false);
     else
+#ifdef SWIN_HALF_BPERMUTE
+        return __builtin_amdgcn_ds_bpermute(((int)threadIdx.x ^ 16) * 4, v);
+#else
         return __builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210, 0xfedcba98, false, false);
+#endif
 }
 template <int MASK> __device__ __forceinline__ half_t hxor(half_t v)
 {
@@ -463,6 +513,16 @@ struct GemmDesc
 // is formed in scalar registers and the load uses a scalar base plus the lane's constant offset.
 __device__ __forceinline__ gop bload(const wslot* w16, int gemm_dst, int NT, int kc, int s, int nt, int l16)
 {
+#if defined(SWIN_BUFFER_BLOAD) && D4R_WMMA_LAYOUT == 11
+    // Same 32-byte slot as the original load; only address formation changes.
+    const int tile = __builtin_amdgcn_readfirstlane(gemm_dst + ((kc * 2 + s) * NT + nt) * 16);
+    const __amdgpu_buffer_rsrc_t r = __builtin_amdgcn_make_buffer_rsrc((void*)w16, (short)0, 0x7fffffff, 0x31004000);
+    const uint32_t vo = (uint32_t)l16 * 32u, so = (uint32_t)tile * 32u;
+    const u4v_t a = __builtin_amdgcn_raw_buffer_load_b128(r, vo, so, 0);
+    const u4v_t b = __builtin_amdgcn_raw_buffer_load_b128(r, vo + 16, so, 0);
+    typedef uint32_t u8 __attribute__((ext_vector_type(8)));
+    return __builtin_bit_cast(gop, (u8){a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]});
+#else
 #ifdef SWIN_SCALAR_BLOAD
     const int tile = __builtin_amdgcn_readfirstlane(gemm_dst + ((kc * 2 + s) * NT + nt) * 16);
     const wslot* t = w16 + tile;
@@ -475,6 +535,16 @@ __device__ __forceinline__ gop bload(const wslot* w16, int gemm_dst, int NT, int
     return ((const gop*)t)[2 * at + m_half()];
 #else
     return t[at];
+#endif
+#endif
+}
+
+__device__ __forceinline__ uint32_t input_word(const uint32_t* p)
+{
+#ifdef SWIN_NT_INPUT
+    return __builtin_nontemporal_load(p);
+#else
+    return *p;
 #endif
 }
 

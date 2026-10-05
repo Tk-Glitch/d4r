@@ -6,6 +6,8 @@
 #pragma once
 #include "swin_common.h"
 #include <type_traits>
+#define SWIN_PRAGMA_IMPL(x) _Pragma(#x)
+#define SWIN_PRAGMA(x) SWIN_PRAGMA_IMPL(x)
 
 template <int C, int NW, int NPM, int CIN = 0> struct SwinLayout
 {
@@ -136,7 +138,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
         const int T = idx / (C / 4), c4 = 4 * (idx % (C / 4));
         const int X = mirror(8 * bx - p.sx + tok_x(T), p.tw), Y = mirror(8 * by - p.sy + tok_y(T), p.th);
         const uint8_t* src = CIN ? p.p32 : p.in;
-        inw[k] = *(const uint32_t*)(src + ((size_t)((c4 >> 5) * p.th + Y) * p.tw + X) * 32 + (c4 & 31));
+        inw[k] = input_word((const uint32_t*)(src + ((size_t)((c4 >> 5) * p.th + Y) * p.tw + X) * 32 + (c4 & 31)));
     }
     // the input words as f16 into X0 (natural channel order); decoders add the patch expand to them later
     auto stage_input_words = [&]() {
@@ -146,9 +148,13 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             const int idx = tid + 32 * NW * k;
             const int T = idx / (C / 4), c4 = 4 * (idx % (C / 4));
             const uint32_t bytes = inw[k];
+#ifdef SWIN_PACKED_INPUT
+            *(h4*)(X0 + T * AST + c4) = decode4(bytes);
+#else
 #pragma unroll
             for (int b = 0; b < 4; ++b)
                 X0[T * AST + c4 + b] = e4m3_to_half((bytes >> (8 * b)) & 0xffu);
+#endif
         }
     };
 
@@ -162,10 +168,14 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             const int r = idx / (CIN / 4), c4 = 4 * (idx % (CIN / 4));
             const int MX = mirror((8 * bx - p.sx) / 2 + (r & 3), W2), MY = mirror((8 * by - p.sy) / 2 + (r >> 2), H2);
             const uint32_t bytes =
-                *(const uint32_t*)(p.in + ((size_t)((c4 >> 5) * H2 + MY) * W2 + MX) * 32 + (c4 & 31));
+                input_word((const uint32_t*)(p.in + ((size_t)((c4 >> 5) * H2 + MY) * W2 + MX) * 32 + (c4 & 31)));
+#ifdef SWIN_PACKED_INPUT
+            *(h4*)(PA + r * PAST + apos(c4)) = decode4(bytes);
+#else
 #pragma unroll
             for (int b = 0; b < 4; ++b)
                 PA[r * PAST + apos(c4 + b)] = e4m3_to_half((bytes >> (8 * b)) & 0xffu);
+#endif
         }
         stage_input_words(); // the skip input
         __syncthreads();
@@ -207,7 +217,11 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     // residual accumulators of the output projection: f16(x0 + b_o) in the C-fragment layout
     // (wave owns pair columns of n tiles ng*NTW.. for m tiles mg*MT..)
     const int ng = wv % (NW / MG), mg = wv / (NW / MG);
-    T16 x[MT][NTW]; // packed f16 accumulators: residual f16(x0 + b_o), live through stage 2
+#ifdef SWIN_PACKED_RESIDUAL
+    hv2 residual[MT][NTW][4]; // Only f16 is needed until the output projection.
+#else
+    T16 x[MT][NTW];
+#endif
 #pragma unroll
     for (int mm = 0; mm < MT; ++mm)
 #pragma unroll
@@ -218,8 +232,15 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             const int ch = ginv(n);
 #pragma unroll
             for (int i = 0; i < 8; i += 2)
-                x[mm][j].set_pair(i / 2, (hv2){X0[(16 * (mg * MT + mm) + mrow(i)) * AST + ch],
-                                         X0[(16 * (mg * MT + mm) + mrow(i + 1)) * AST + ch]} + (hv2){bo, bo});
+            {
+                const hv2 v = (hv2){X0[(16 * (mg * MT + mm) + mrow(i)) * AST + ch],
+                                   X0[(16 * (mg * MT + mm) + mrow(i + 1)) * AST + ch]} + (hv2){bo, bo};
+#ifdef SWIN_PACKED_RESIDUAL
+                residual[mm][j][i / 2] = v;
+#else
+                x[mm][j].set_pair(i / 2, v);
+#endif
+            }
         }
     __syncthreads(); // stage 1 overwrites x0 rows with h1
 
@@ -240,6 +261,30 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                         v[pl][ww][b] = X0[T * AST + 32 * pl + 4 * (t + 4 * ww) + b];
             // the 4 lanes of a token read the whole row before any of them writes h1 over it
             wave_sync();
+#ifdef SWIN_PACKED_NORM1
+            hv2 ws[2];
+#pragma unroll
+            for (int ww = 0; ww < 2; ++ww)
+            {
+                hv2 pp[NPL];
+#pragma unroll
+                for (int pl = 0; pl < NPL; ++pl)
+                {
+                    hv2 a = {v[pl][ww][0], v[pl][ww][1]}, b = {v[pl][ww][2], v[pl][ww][3]};
+                    pp[pl] = (hv2)(a * a) + (hv2)(b * b);
+                }
+                if constexpr (NPL == 4)
+                    ws[ww] = (pp[0] + pp[1]) + (pp[2] + pp[3]);
+                else if constexpr (NPL == 3)
+                    ws[ww] = (pp[0] + pp[1]) + pp[2];
+                else
+                    ws[ww] = pp[0] + pp[1];
+            }
+            hv2 a = ws[0] + ws[1];
+            a += __builtin_bit_cast(hv2, xor_lane<1>(__builtin_bit_cast(uint32_t, a)));
+            a += __builtin_bit_cast(hv2, xor_lane<2>(__builtin_bit_cast(uint32_t, a)));
+            const half_t rn = rsqrt16(a[0] + a[1]);
+#else
             half_t ws[2][2];
 #pragma unroll
             for (int ww = 0; ww < 2; ++ww)
@@ -271,6 +316,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             a0 = a0 + hxor<2>(a0);
             a1 = a1 + hxor<2>(a1);
             const half_t rn = rsqrt16(a0 + a1);
+#endif
             const hv2 rn2 = {rn, rn};
 #pragma unroll
             for (int pl = 0; pl < NPL; ++pl)
@@ -294,6 +340,48 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     {
         constexpr int MW = 4 / (NW / NH); // windows per wave
         const int h = NW == NH ? wv : wv % NH, m0 = NW == NH ? 0 : MW * (wv / NH);
+        hv2 qp[MW][2][4], vp[MW][2][4];
+#ifdef SWIN_QV_SPLIT
+        // Q and V have independent k32 chains. Retain Q as packed halves while
+        // calculating V, instead of keeping both sets of f32 chains live.
+        auto project = [&](auto value_tag, hv2 (&dest)[MW][2][4]) {
+            constexpr bool VALUE = decltype(value_tag)::value;
+            T16 part[MW][2];
+#pragma unroll
+            for (int m = 0; m < MW; ++m)
+#pragma unroll
+                for (int q = 0; q < 2; ++q)
+                    part[m][q] = t16_splat((half_t)0.0f);
+#pragma unroll
+            for (int kc = 0; kc < C / 32; ++kc) {
+                gop b[2][2];
+#pragma unroll
+                for (int s = 0; s < 2; ++s)
+#pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        b[s][q] = bload(w16, L::qv(h, VALUE ? 1 : 0), 2, kc, s, q, l16);
+#pragma unroll
+                for (int m = 0; m < MW; ++m) {
+                    const gop a0 = lda(A + (16 * (m0 + m) + l16) * AST + 32 * kc);
+                    const gop a1 = lda(A + (16 * (m0 + m) + l16) * AST + 32 * kc + 16);
+#pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        k32(part[m][q], a0, b[0][q], a1, b[1][q]);
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < MW; ++m)
+#pragma unroll
+                for (int q = 0; q < 2; ++q)
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        if constexpr (VALUE) dest[m][q][k] = part[m][q].pair(k);
+                        else dest[m][q][k] = q8x2(part[m][q].pair(k));
+                    }
+        };
+        project(std::false_type{}, qp);
+        project(std::true_type{}, vp);
+#else
         T16 acc[MW][4]; // [window][Q nt0, Q nt1, V nt0, V nt1]
 #pragma unroll
         for (int m = 0; m < MW; ++m)
@@ -320,7 +408,6 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             }
         }
         // pack: Q as q8 pairs, V as f16 pairs (all that attention needs), halving the live registers
-        hv2 qp[MW][2][4], vp[MW][2][4];
 #pragma unroll
         for (int m = 0; m < MW; ++m)
 #pragma unroll
@@ -331,6 +418,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                     qp[m][q][i / 2] = q8x2(acc[m][q].pair(i / 2));
                     vp[m][q][i / 2] = acc[m][2 + q].pair(i / 2);
                 }
+#endif
         __syncthreads(); // every wave is done reading h1; O may overwrite A
 
         half_t* Qs = QP + wv * 16 * QST;
@@ -435,6 +523,16 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     __syncthreads();
 
     // ------------------------------------------------ stage 3: output projection + residual
+#ifdef SWIN_PACKED_RESIDUAL
+    T16 x[MT][NTW];
+#pragma unroll
+    for (int mm = 0; mm < MT; ++mm)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j)
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                x[mm][j].set_pair(k, residual[mm][j][k]);
+#endif
 #pragma unroll
     for (int kc = 0; kc < NH; ++kc)
     {
@@ -465,6 +563,43 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             for (int i = 0; i < 8; ++i)
                 A[(16 * (mg * MT + mm) + mrow(i)) * AST + 16 * (ng * NTW + j) + l16] = x[mm][j].get(i);
     __syncthreads();
+#ifdef SWIN_PARALLEL_NORM2
+    // Four lanes per token. Preserve the original per-column and even/odd trees.
+#pragma unroll
+    for (int r = 0; r < 8 / NW; ++r)
+    {
+        const int T = (64 / NW) * wv + (lane >> 2) + 8 * r;
+        const int c = 2 * (lane & 3);
+        hv2 sq[L::NT8];
+#pragma unroll
+        for (int j = 0; j < L::NT8; ++j)
+        {
+            const hv2 v = *(const hv2*)(A + T * AST + 8 * j + c);
+            sq[j] = v * v;
+        }
+        hv2 even, odd;
+        if constexpr (L::NT8 == 16)
+        {
+            even = ((sq[0] + sq[2]) + (sq[4] + sq[6])) + ((sq[8] + sq[10]) + (sq[12] + sq[14]));
+            odd = ((sq[1] + sq[3]) + (sq[5] + sq[7])) + ((sq[9] + sq[11]) + (sq[13] + sq[15]));
+        }
+        else if constexpr (L::NT8 == 12)
+        {
+            even = ((sq[0] + sq[2]) + (sq[4] + sq[6])) + (sq[8] + sq[10]);
+            odd = ((sq[1] + sq[3]) + (sq[5] + sq[7])) + (sq[9] + sq[11]);
+        }
+        else
+        {
+            even = (sq[0] + sq[2]) + (sq[4] + sq[6]);
+            odd = (sq[1] + sq[3]) + (sq[5] + sq[7]);
+        }
+        hv2 sum = even + odd;
+        sum += __builtin_bit_cast(hv2, xor_lane<1>(__builtin_bit_cast(uint32_t, sum)));
+        sum += __builtin_bit_cast(hv2, xor_lane<2>(__builtin_bit_cast(uint32_t, sum)));
+        if ((lane & 3) == 0)
+            R2[T] = rsqrt16(sum[0] + sum[1]);
+    }
+#else
     if (tid < 64)
     {
         // the row as 128-bit LDS loads: element 8 j + c of n8 tile j
@@ -502,6 +637,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
         const half_t b1 = (L8[1] + L8[3]) + (L8[5] + L8[7]);
         R2[tid] = rsqrt16(b0 + b1);
     }
+#endif
     __syncthreads();
 #pragma unroll
     for (int j = 0; j < NTW; ++j)
@@ -529,7 +665,11 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     {
         constexpr int WPC = NW / R, MPW = 4 / WPC; // waves per chunk, fc1 m tiles per wave
         const int cw = wv / WPC, mb = MPW * (wv % WPC);
+#ifdef SWIN_UNROLL_MLP
+    SWIN_PRAGMA(unroll SWIN_UNROLL_MLP)
+#else
 #pragma unroll 1
+#endif
         for (int r = 0; r < L::NC / R; ++r)
         {
             const int c = R * r + cw;
@@ -636,7 +776,17 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
         {
             const uint2 pr = xs[k];
             hv2 qa, qb;
-            const uint32_t ca = enc8x2(__builtin_bit_cast(hv2, pr.x), qa), cb = enc8x2(__builtin_bit_cast(hv2, pr.y), qb);
+            uint32_t ca, cb;
+#ifdef SWIN_DIRECT_CODES
+            if constexpr (NPM == 0) {
+                ca = direct_codes8x2(__builtin_bit_cast(hv2, pr.x));
+                cb = direct_codes8x2(__builtin_bit_cast(hv2, pr.y));
+            } else
+#endif
+            {
+                ca = enc8x2(__builtin_bit_cast(hv2, pr.x), qa);
+                cb = enc8x2(__builtin_bit_cast(hv2, pr.y), qb);
+            }
             w[k] = pack_codes(ca, cb);
             // the patch merge consumes decode(code) = q8_exact(x), written back over x (this thread's own values)
             if constexpr (NPM > 0)

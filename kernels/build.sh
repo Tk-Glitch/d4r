@@ -52,8 +52,15 @@ build_hip() {
     name="$(basename "$src" .hip)"
     local tmp flags
     tmp="$(mktemp -d)"
-    # per-kernel compiler flags from a "// d4r-build-flags: ..." line in the source
+    # per-kernel compiler flags from a "// d4r-build-flags: ..." line in the source. A line for the target
+    # ("// d4r-build-flags-gfx1101:", or "// d4r-build-flags-gfx12:" for any gfx12 target) replaces it.
     flags="$(sed -n 's|^// d4r-build-flags: *||p' "$src")"
+    for tag in "$ARCH" "${ARCH%??}"; do
+        if grep -q "^// d4r-build-flags-$tag:" "$src"; then
+            flags="$(sed -n "s|^// d4r-build-flags-$tag: *||p" "$src")"
+            break
+        fi
+    done
     [[ "$ACCURACY" == 1 ]] && extra+=" -DD4R_ACCURACY"
     # shellcheck disable=SC2086
     (cd "$tmp" && "$CLANG" -x hip --offload-arch="$ARCH" --offload-device-only -O3 $flags $extra -I"$ROCM/include" \
@@ -114,12 +121,38 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     for mode in static dynamic; do
         for range in hdr ldr; do specs+=("rrlite_downsample_kernel_${mode}_${range}:sust_only"); done
     done
+    # The fast set serves two K kernels from native code translated from the PTX (kernels/native): these builds
+    # replace the sust_only build of the same name. The accuracy set keeps ZLUDA's compile (denormals preserved).
+    native_out=hiluma_engine_output_depthinv_mvhi_hdr_max_v2_rel
+    native_in=hiluma_engine_input_depthinv_mvhi_hdr_v2_rel
     for spec in "${specs[@]}"; do
         IFS=: read -r kernel src mode <<< "$spec"
+        [[ "$ACCURACY" == 0 && "$kernel" == "$native_out" ]] && continue
         D4R_PREFER_ACCURACY="$ACCURACY" \
             D4R_ZLUDA_WAVE64="$([[ "$mode" == w64 && "$ACCURACY" == 0 ]] && echo 1 || echo 0)" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
             D4R_TEX_FP8="$FP8" D4R_DLSS_PTX_DIR="$PTX_DIR" "$HERE/tex/build_tex.sh" "$kernel" "$src" "$OUT"
     done
+    if [[ "$WHAT" != l && "$ACCURACY" == 0 ]]; then
+        # NVIDIA's PTX translated to HIP (native/ptx2hip.py) and rebuilt natively; the generated sources stay in a
+        # temporary directory. Both kernels run through the same texture/surface helpers as the other texture
+        # kernels and are byte-identical to ZLUDA's compile of the PTX.
+        ptx_of() { grep -l -E "\.entry[[:space:]]+$1[[:space:]]*\(" "$PTX_DIR"/*.ptx | head -1; }
+        NAT="$HERE/native"
+        NT="$(mktemp -d)"
+        trap 'rm -rf "$NT"' EXIT
+        ptx="$(ptx_of "$native_out")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_out" >&2; exit 2; }
+        # hiluma output (path B for Quality..UltraPerf), LDS tile as a function, global-memory redirect stores
+        python3 "$NAT/ptx2hip.py" --ctile --as1 "$ptx" "$native_out" > "$NT/output_translated.hip"
+        python3 "$NAT/rewrite_output.py" "$NT/output_translated.hip" > "$NT/$native_out.hip"
+        D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" "$NAT/build_native.sh" "$NT/$native_out.hip" "$OUT/$native_out.hsaco" \
+            -DD4R_NATIVE_F2I -DD4R_K_NO_DEPTH_TILE -DD4R_AS1_STORES
+        # hiluma input: scratch arrays in registers, wave32
+        ptx="$(ptx_of "$native_in")"; [[ -n "$ptx" ]] || { echo "no PTX defines $native_in" >&2; exit 2; }
+        python3 "$NAT/ptx2hip.py" --ifconv --sink "$ptx" "$native_in" > "$NT/in_ifs.hip"
+        python3 "$NAT/in_fuse.py" "$NT/in_ifs.hip" > "$NT/in_unit.h"
+        cp "$NAT/in_regs.hip" "$NT/in_regs.hip"
+        D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" WAVE=32 "$NAT/build_native.sh" "$NT/in_regs.hip" "$OUT/$native_in.hsaco"
+    fi
 fi
 [[ "$ACCURACY" == 1 ]] && printf '1\n' > "$OUT/d4r-accuracy.txt"
 echo "native kernels in $OUT"
