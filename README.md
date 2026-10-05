@@ -12,6 +12,9 @@ See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
 
 > **Not affiliated with NVIDIA or AMD.**
 
+
+To contact me my discord is `._ayo`. or join the [d4r discord server](https://discord.gg/mgTWpSq8f5)
+
 ## Results
 
 [DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
@@ -173,5 +176,3 @@ Gameplay recordings of each DLSS model at the Quality, Performance and Ultra Per
 ## License
 
 Apache License 2.0 (see [LICENSE](LICENSE)). The patches in `patches/` are offered under the licenses of the projects they modify: ZLUDA (Apache-2.0 or MIT) and vkd3d-proton (LGPL-2.1). See [NOTICE](NOTICE).
-
-To contact me my discord is `._ayo`.
