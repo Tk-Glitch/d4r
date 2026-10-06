@@ -3,7 +3,8 @@
 # part of it calls functions from SRC.hip, is compiled by ZLUDA with SRC's bitcode linked in
 # (D4R_ZLUDA_EXTRA_BC) and the resulting code object is saved as OUT_DIR/KERNEL.hsaco.
 # Called by kernels/build.sh, which sets D4R_ROCM_DIR, D4R_GPU_ARCH, D4R_DLSS_PTX_DIR, D4R_ZLUDA_EMIT,
-# D4R_ZLUDA_WAVE64 (1 = wave64 code object) and D4R_TEX_FP8 (1 = the gfx12 native-FP8 variant).
+# D4R_ZLUDA_WAVE64 (1 = wave64 code object; accuracy builds only with D4R_TEX_ACCURACY_WAVE64=1) and
+# D4R_TEX_FP8 (1 = the gfx12 native-FP8 variant).
 # ZLUDA compiles offline for D4R_GPU_ARCH with its d4r_emit tool, so any target builds on any machine.
 set -euo pipefail
 K=$1 SRC=$2 OUT=$3
@@ -31,7 +32,7 @@ D4R_PREFER_ACCURACY="$ACCURACY" python3 "$D/make_ptx.py" "$K" "$B/$K.ptx" >/dev/
 env LD_LIBRARY_PATH="$R/lib" D4R_ZLUDA_EXTRA_BC="$B/extra.bc" D4R_ZLUDA_WMMA=1 D4R_ZLUDA_WMMA_FP8=1 \
     D4R_ZLUDA_WMMA_FP8_NATIVE="$FP8" D4R_ZLUDA_IGNORE_DENORMAL="$((1 - ACCURACY))" \
     D4R_ZLUDA_WMMA_F32ACC=0 D4R_ZLUDA_FAST_MATH=0 D4R_ZLUDA_IMPLICIT_MAX_BLOCK=256 \
-    D4R_ZLUDA_WAVE64="$([[ "$ACCURACY" == 1 ]] && echo 0 || echo "${D4R_ZLUDA_WAVE64:-0}")" \
+    D4R_ZLUDA_WAVE64="$([[ "$ACCURACY" == 1 && "${D4R_TEX_ACCURACY_WAVE64:-0}" != 1 ]] && echo 0 || echo "${D4R_ZLUDA_WAVE64:-0}")" \
     "$D4R_ZLUDA_EMIT" "$B/$K.ptx" "$B/dump" "$ARCH" >/dev/null
 cp "$B/dump/module.hsaco" "$OUT/$K.hsaco"
 printf '%-52s %s\n' "$K" "$(grep -E '^\s+\.(vgpr_count|private_segment_fixed_size|wavefront_size):' "$B/dump/asm.s" | tr -s ' ' | paste -sd' ')"

@@ -28,6 +28,19 @@
 #undef SWIN_F32ACC
 #endif
 
+// SWIN_A8 (RDNA4 native FP8): the e4m3 GEMMs' activations live in LDS as e4m3 bytes, encoded once where they
+// are produced (v_cvt_pk_fp8_f32) instead of as f16 values that every operand load encodes again. The bytes
+// are the codes of the same q8 values, so results are unchanged.
+#if defined(D4R_FP8_WMMA) && defined(__GFX12__) && !defined(SWIN_NO_A8)
+#define SWIN_A8 1
+#endif
+// The exact SWIN_A8 build rounds each k32 step with v_fma_mix (f16(P + C) in one rounding) instead of
+// converting the accumulator to f32 and back: the same codes as the conversion form on the recorded launches
+// and as tools/swin_model.py, at about half the cost. K32_NO_MIX keeps the conversion form.
+#if defined(SWIN_A8) && defined(SWIN_EXACT) && !defined(K32_NO_MIX) && !defined(K32_MIX)
+#define K32_MIX
+#endif
+
 #pragma clang fp contract(off)
 
 typedef _Float16 half_t;
@@ -199,6 +212,21 @@ __device__ __forceinline__ uint32_t codes8x2(hv2 q)
     return __builtin_bit_cast(uint32_t, (u16x2)(((qb >> 8) & (unsigned short)0x80) | code));
 }
 
+#ifdef SWIN_A8
+// e4m3 codes of four halves (RNE, satfinite) in the bytes of one word. The instruction rounds like NVIDIA's
+// conversion but encodes overflow as 0x7f, so the values are clamped to +-448 first, with the NaN-propagating
+// minimum / maximum. Equal to half_to_e4m3 for every non-NaN input; a NaN encodes as the NaN code 0xff (the
+// reference keeps its sign: 0x7f or 0xff).
+__device__ __forceinline__ uint32_t codes4(hv2 a, hv2 b)
+{
+    const hv2 lim = {(half_t)448.0f, (half_t)448.0f};
+    a = __builtin_elementwise_maximum(__builtin_elementwise_minimum(a, lim), -lim);
+    b = __builtin_elementwise_maximum(__builtin_elementwise_minimum(b, lim), -lim);
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], (float)b[1], (int)w, true);
+}
+#endif
+
 // four e4m3 codes (a, b from enc8x2) as the bytes of one word in element order
 __device__ __forceinline__ uint32_t pack_codes(uint32_t a, uint32_t b)
 {
@@ -336,6 +364,13 @@ __device__ __forceinline__ gop lda(const half_t* p)
 {
     return to_fp8(lds16(p));
 }
+#ifdef SWIN_A8
+// GEMM A operand from an e4m3 byte image in LDS: this half's 8 K values
+__device__ __forceinline__ gop lda(const uint8_t* p)
+{
+    return *(const u2v*)(p + 8 * m_half());
+}
+#endif
 #else
 __device__ __forceinline__ f8v wmma8(gop a, gop b, f8v c)
 {
