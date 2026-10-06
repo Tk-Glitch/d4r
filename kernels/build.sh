@@ -18,6 +18,7 @@
 #                   which compiles PTX offline for D4R_GPU_ARCH (no GPU of that kind needed)
 #   D4R_DLSS_PTX_DIR optional pre-extracted PTX directory for parallel per-target builds
 set -euo pipefail
+shopt -s extglob
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WHAT="${1:-all}"
@@ -131,8 +132,15 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
     for spec in "${specs[@]}"; do
         IFS=: read -r kernel src mode <<< "$spec"
         [[ "$ACCURACY" == 0 && "$kernel" == "$native_out" ]] && continue
-        D4R_PREFER_ACCURACY="$ACCURACY" \
-            D4R_ZLUDA_WAVE64="$([[ "$mode" == w64 && "$ACCURACY" == 0 ]] && echo 1 || echo 0)" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
+        # accuracy sets are wave32, except M's post and downsample kernels on RDNA4: their wave64 builds keep the
+        # denormal handling and gave the same image on an RX 9070 XT (post 0.79 -> 0.67 ms, downsample 0.43 -> 0.39 ms)
+        w64=0
+        if [[ "$mode" == w64 ]]; then
+            [[ "$ACCURACY" == 0 ]] && w64=1
+            [[ "$ARCH" == gfx12* && "$kernel" == rrlite_@(post|downsample)_* ]] && w64=1
+        fi
+        D4R_PREFER_ACCURACY="$ACCURACY" D4R_TEX_ACCURACY_WAVE64="$w64" \
+            D4R_ZLUDA_WAVE64="$w64" D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$ARCH" \
             D4R_TEX_FP8="$FP8" D4R_DLSS_PTX_DIR="$PTX_DIR" "$HERE/tex/build_tex.sh" "$kernel" "$src" "$OUT"
     done
     if [[ "$WHAT" != l && "$ACCURACY" == 0 ]]; then
