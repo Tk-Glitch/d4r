@@ -866,7 +866,7 @@ static bool supported_input(Plane plane, DXGI_FORMAT format)
         return format == DXGI_FORMAT_R16G16_FLOAT || format == DXGI_FORMAT_R16G16_TYPELESS ||
                format == DXGI_FORMAT_R32G32_FLOAT || format == DXGI_FORMAT_R32G32_TYPELESS ||
                format == DXGI_FORMAT_R16G16B16A16_FLOAT || format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
-               format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+               format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R8G8B8A8_UNORM;
     case Plane::Exposure:
         return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS ||
                format == DXGI_FORMAT_R16_FLOAT || format == DXGI_FORMAT_R16_TYPELESS ||
@@ -1016,6 +1016,13 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
                 std::memcpy(mv, source + x * stride, 8);
                 half[x * 2] = float_to_half(mv[0]);
                 half[x * 2 + 1] = float_to_half(mv[1]);
+                break;
+            }
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            {
+                const uint8_t* rgba = source + x * 4;
+                half[x * 2] = float_to_half(static_cast<float>(rgba[0]) / 255.0f);
+                half[x * 2 + 1] = float_to_half(static_cast<float>(rgba[1]) / 255.0f);
                 break;
             }
             default:
@@ -2515,6 +2522,7 @@ static bool vram_motion_blit_supported(VkFormat format)
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R32G32_SFLOAT:
     case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R8G8B8A8_UNORM:
         return vram_blit_supported(format, VK_FORMAT_R16G16_SFLOAT);
     default:
         return false;
