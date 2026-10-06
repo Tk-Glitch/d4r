@@ -42,10 +42,10 @@ def config_path(argv):
 
 def main(argv):
     path = config_path(argv)
-    ini = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None)
+    ini = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None, strict=False)
     ini.optionxform = str  # keep [Env] variable names as written
     if path.exists():
-        ini.read(path)
+        ini.read(path, encoding="utf-8-sig")
 
     def get(section, key):
         value = ini.get(section, key, fallback="").strip()
@@ -193,6 +193,8 @@ def main(argv):
 
     if ini.has_section("Env"):
         for key, value in ini.items("Env"):
+            if not (key.isascii() and key.isidentifier()):
+                fail(f"[Env] key {key!r} must be an ASCII identifier")
             env[key] = value.strip()
 
     final = {key: value for key, value in env.items() if key not in os.environ}
