@@ -475,7 +475,7 @@ static void prepare_native_kernels(const char* cache_home)
         return;
     }
     snprintf(path, sizeof(path), "%s/d4r-kernels.txt", source);
-    manifest = fopen(path, "r");
+    manifest = cache_home != NULL ? fopen(path, "r") : NULL; /* a manifest set is served from the cache */
     if (manifest == NULL)
     {
         unsetenv("D4R_ZLUDA_NATIVE_DIR");
@@ -511,7 +511,7 @@ static void prepare_native_kernels(const char* cache_home)
 
     /* <cache>/d4r-native/<pid>; directories of processes that no longer exist are removed */
     char base[1024];
-    snprintf(base, sizeof(base), "%s/d4r-native", cache_home != NULL ? cache_home : "/tmp");
+    snprintf(base, sizeof(base), "%s/d4r-native", cache_home);
     make_directories(base);
     DIR* directory = opendir(base);
     if (directory != NULL)
@@ -531,15 +531,18 @@ static void prepare_native_kernels(const char* cache_home)
     }
     snprintf(native_served, sizeof(native_served), "%s/%ld", base, (long)getpid());
     remove_directory(native_served);
-    if (mkdir(native_served, 0755) != 0)
+    char* resolved = realpath(source, NULL);
+    if (resolved == NULL || strlen(resolved) >= sizeof(native_source) || mkdir(native_served, 0755) != 0)
     {
-        set_load_error("cannot create %s; native kernels disabled", native_served);
+        free(resolved);
+        set_load_error("cannot create %s from %s; native kernels disabled", native_served, source);
         native_served[0] = '\0';
         native_kernel_count = 0;
         unsetenv("D4R_ZLUDA_NATIVE_DIR");
         return;
     }
-    snprintf(native_source, sizeof(native_source), "%s", source);
+    snprintf(native_source, sizeof(native_source), "%s", resolved);
+    free(resolved);
     setenv("D4R_ZLUDA_NATIVE_DIR", native_served, 1);
     atexit(native_cleanup);
     tracef("native kernels: %zu in %s, each served from %s once DLSS's PTX for it matches",
@@ -696,7 +699,7 @@ static void verify_native_kernels(const void* image)
             memcpy(&flags, bytes + offset + 40, sizeof(flags));
             if (entry_header >= 64)
                 memcpy(&decompressed, bytes + offset + 56, sizeof(decompressed));
-            if (entry_header < 16 || entry_size > end - offset - entry_header)
+            if (entry_header < 16 || entry_header > end - offset || entry_size > end - offset - entry_header)
                 break;
             const unsigned char* payload = bytes + offset + entry_header;
             if (kind == 1) /* PTX */
@@ -727,8 +730,8 @@ static struct
 {
     CUfunction function;
     int native;
-} output_kernels[OUTPUT_KERNEL_CAPACITY];
-static int output_kernel_count;
+} output_kernels[OUTPUT_KERNEL_CAPACITY]; /* the latest lookups, newest last */
+static pthread_mutex_t output_kernel_lock = PTHREAD_MUTEX_INITIALIZER;
 static int last_output_native = -1;
 
 static void note_function_lookup(CUfunction function, const char* name)
@@ -745,25 +748,24 @@ static void note_function_lookup(CUfunction function, const char* name)
         snprintf(path, sizeof(path), "%s/%s.hsaco", directory, name);
         native = access(path, R_OK) == 0;
     }
-    pthread_mutex_lock(&native_lock);
-    if (output_kernel_count < OUTPUT_KERNEL_CAPACITY)
-    {
-        output_kernels[output_kernel_count].function = function;
-        output_kernels[output_kernel_count].native = native;
-        __atomic_store_n(&output_kernel_count, output_kernel_count + 1, __ATOMIC_RELEASE);
-    }
-    pthread_mutex_unlock(&native_lock);
+    pthread_mutex_lock(&output_kernel_lock);
+    memmove(output_kernels, output_kernels + 1, sizeof(output_kernels) - sizeof(output_kernels[0]));
+    output_kernels[OUTPUT_KERNEL_CAPACITY - 1].function = function;
+    output_kernels[OUTPUT_KERNEL_CAPACITY - 1].native = native;
+    pthread_mutex_unlock(&output_kernel_lock);
 }
 
 static void note_launch(CUfunction function)
 {
-    const int count = __atomic_load_n(&output_kernel_count, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < count; ++i)
+    pthread_mutex_lock(&output_kernel_lock);
+    /* newest first, so a recycled handle resolves with its latest lookup */
+    for (int i = OUTPUT_KERNEL_CAPACITY - 1; i >= 0 && output_kernels[i].function != NULL; --i)
         if (output_kernels[i].function == function)
         {
             __atomic_store_n(&last_output_native, output_kernels[i].native, __ATOMIC_RELAXED);
-            return;
+            break;
         }
+    pthread_mutex_unlock(&output_kernel_lock);
 }
 
 /* 1 when the last output kernel launched was d4r's native one, 0 when it was ZLUDA's compile of
@@ -805,35 +807,33 @@ static void load_zluda(void)
     }
     load_error[0] = '\0';
     const char* cache = getenv("D4R_ZLUDA_CACHE_HOME");
-    char cache_home[1024] = {0};
+    const char* xdg = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    char cache_home[1024] = {0}, root[1024] = {0};
     if (cache != NULL && cache[0] != '\0')
     {
         expand_home(cache, cache_home, sizeof(cache_home));
         make_directories(cache_home);
     }
+    /* the cache root; no /tmp fallback, since other users can plant links there */
+    if (cache_home[0] != '\0')
+        snprintf(root, sizeof(root), "%s", cache_home);
+    else if (xdg != NULL && xdg[0] != '\0')
+        snprintf(root, sizeof(root), "%s", xdg);
+    else if (home != NULL)
+        snprintf(root, sizeof(root), "%s/.cache", home);
     if (accuracy)
     {
         /* FAST_MATH is not fingerprinted by older ZLUDA runtimes. Use a separate cache even
            when a previous run explicitly enabled that experimental compiler switch. */
-        char base[1024];
-        const char* xdg = getenv("XDG_CACHE_HOME");
-        if (cache_home[0] != '\0')
-            snprintf(base, sizeof(base), "%s", cache_home);
-        else if (xdg != NULL && xdg[0] != '\0')
-            snprintf(base, sizeof(base), "%s", xdg);
-        else
-        {
-            const char* home = getenv("HOME");
-            snprintf(base, sizeof(base), "%s/.cache", home != NULL ? home : "/tmp");
-        }
-        if (snprintf(cache_home, sizeof(cache_home), "%s/d4r-accuracy", base) >= (int)sizeof(cache_home))
+        if (snprintf(cache_home, sizeof(cache_home), "%s/d4r-accuracy", root[0] != '\0' ? root : "/tmp/.cache") >= (int)sizeof(cache_home))
         {
             set_load_error("accuracy cache path is too long");
             return;
         }
         make_directories(cache_home);
     }
-    prepare_native_kernels(cache_home[0] != '\0' ? cache_home : NULL);
+    prepare_native_kernels(root[0] == '\0' ? NULL : accuracy ? cache_home : root);
     if (cache_home[0] != '\0')
     {
         /* ZLUDA picks its cache directory once, in cuInit */
@@ -2482,6 +2482,8 @@ CUresult WINAPI cuDestroyExternalMemory(CUexternalMemory memory)
     return result;
 }
 
+CUresult WINAPI cuSurfObjectDestroy(CUsurfObject object);
+
 CUresult WINAPI cuSurfObjectCreate(CUsurfObject* object, const void* descriptor)
 {
     CUSURFOBJECTCREATE_FN function = (CUSURFOBJECTCREATE_FN)find_zluda_symbol("cuSurfObjectCreate");
@@ -2495,8 +2497,8 @@ CUresult WINAPI cuSurfObjectCreate(CUsurfObject* object, const void* descriptor)
         const CUdeviceptr pointer = redirect_pointer;
         const uint32_t pitch = redirect_pitch;
         pthread_mutex_unlock(&instrumentation_lock);
-        if (redirected)
-            write_redirect_tail(*object, pointer, pitch, 0);
+        if (redirected && (result = write_redirect_tail(*object, pointer, pitch, 0)) != CUDA_SUCCESS)
+            cuSurfObjectDestroy(*object);
     }
     TRACE_CALL(result, "cuSurfObjectCreate descriptor=%p result=%d object=0x%llx", descriptor, result,
            (unsigned long long)(object != NULL ? *object : 0));
