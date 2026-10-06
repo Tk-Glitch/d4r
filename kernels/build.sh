@@ -118,8 +118,11 @@ if [[ "$WHAT" == all || "$WHAT" == tex || "$WHAT" == l ]]; then
             for v in 3_1 3_2; do specs+=("rrlite_post_${v}_${mv}_${range}:sust_only:w64"); done
         done
     done
+    # downsample: wave64 is slower on RDNA3 and faster on RDNA4 (RX 9070 XT: 0.37 -> 0.34 ms at 4K, same output)
+    downsample_mode=""
+    [[ "$ARCH" == gfx12* ]] && downsample_mode=":w64"
     for mode in static dynamic; do
-        for range in hdr ldr; do specs+=("rrlite_downsample_kernel_${mode}_${range}:sust_only"); done
+        for range in hdr ldr; do specs+=("rrlite_downsample_kernel_${mode}_${range}:sust_only${downsample_mode}"); done
     done
     # The fast set serves two K kernels from native code translated from the PTX (kernels/native): these builds
     # replace the sust_only build of the same name. The accuracy set keeps ZLUDA's compile (denormals preserved).

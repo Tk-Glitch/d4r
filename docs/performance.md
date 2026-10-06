@@ -1,6 +1,6 @@
 # Performance
 
-All frame rates and kernel timings on this page were measured on an RX 7700 XT (gfx1101). RDNA4 (gfx1200/gfx1201) has compile and emulator validation only; no RDNA4 frame rate, latency, or kernel timing has been measured. Native FP8 may change both arithmetic and cost, so the gfx11 results cannot be projected to it.
+Unless stated otherwise, the frame rates and kernel timings on this page were measured on an RX 7700 XT (gfx1101). Native FP8 changes both arithmetic and cost, so the gfx11 results cannot be projected to RDNA4; the one RDNA4 measurement is in [RDNA4](#rdna4). No RDNA4 game frame rate has been measured.
 
 ## Method
 
@@ -75,3 +75,23 @@ For DLSS 4 at Quality the GPU spends about 2.8 ms per frame in DLSS kernels:
 - The input kernel, exposure and miscellaneous kernels: about 0.35 ms.
 
 The game-side input and output copies add about 0.3 ms. [native-kernels.md](native-kernels.md) lists every kernel.
+
+## RDNA4
+
+DLSS 4.5 (M) on an RX 9070 XT (gfx1201, native FP8, fast set), 1280×720 → 3840×2160 in the D3D12 harness with DLSS 310.7. Median GPU time per frame in milliseconds, from `D4R_CUDA_KERNEL_PROFILE` (frames 21–40); "before" is the same texture set with the previous Swin layers.
+
+| Kernel | before | now |
+|---|---|---|
+| enc3 tube (6 launches) | 1.50 | 0.52 |
+| enc1 | 1.32 | 0.33 |
+| dec1 | 0.94 | 0.33 |
+| post (texture kernel) | 0.67 | 0.68 |
+| enc2 | 0.51 | 0.19 |
+| dec2 | 0.50 | 0.17 |
+| downsample (texture kernel, now wave64) | 0.36 | 0.34 |
+| dec0, enc0 (texture kernels) | 0.18, 0.13 | 0.18, 0.13 |
+| **total** | **6.10** | **2.86** |
+
+The shim's whole-evaluation GPU time (`D4R_PROFILE`, no per-kernel synchronisation) went from 5.9–6.0 ms to 2.80 ms with the harness's 200 ms pause between frames, and to 2.39–2.43 ms with frames 0–4 ms apart (2000 frames at 4 ms spacing: median 2.39, maximum 2.56). The difference is the driver's clock governor: with the 200 ms pause the GPU is about 9% busy and runs at about 2790 MHz, with frames 0–4 ms apart it is 80–98% busy and runs at 3180–3300 MHz, as it does under a game's rendering load. Other GPU users on the desktop add occasional slower frames to any of these figures; the previous kernels show the same disturbances.
+
+The change is in [native-kernels.md](native-kernels.md#rdna4): the FP8 layers keep their activations as e4m3 bytes, and the downsample kernel is built as wave64 on gfx12. The output image is byte-identical before and after.
