@@ -1450,7 +1450,10 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
             logf("d4r: %s", note.c_str());
     }
     if (g.core == nullptr && !load_libraries())
+    {
+        g.core = nullptr;
         return NGX_FAIL_PLATFORM_ERROR;
+    }
     if (device != nullptr)
     {
         device->AddRef();
@@ -3917,18 +3920,19 @@ static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint
     {
         logf("frame %u: recreating the NGX feature at %ux%u failed (0x%08x); restoring %ux%u", frame, width, height,
              created, feature.cudaWidth, feature.cudaHeight);
-        feature.refusedWidth = width;
-        feature.refusedHeight = height;
         width = feature.cudaWidth;
         height = feature.cudaHeight;
         d4r_ngx_set_uint(p, "Width", width);
         d4r_ngx_set_uint(p, "Height", height);
-        feature.cudaHandle = nullptr;
-        created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+        if (width != 0 && height != 0)
+            created = g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING, p, &feature.cudaHandle);
+        feature.refusedWidth = created == NGX_SUCCESS ? params.renderWidth : 0;
+        feature.refusedHeight = created == NGX_SUCCESS ? params.renderHeight : 0;
         if (created != NGX_SUCCESS)
         {
             logf("frame %u: restoring the NGX feature failed (0x%08x)", frame, created);
             feature.cudaHandle = nullptr;
+            width = height = 0;
         }
     }
     // a new feature has no history
@@ -4299,6 +4303,7 @@ static void drain_pipeline()
     g.finish.call([] { return 0; });
 }
 
+static void release_feature(Feature* feature);
 static void destroy_recorded_resources(Feature* feature);
 static void finish_shutdown();
 
@@ -4641,13 +4646,13 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, u
     logf("NVSDK_NGX_CUDA_CreateFeature -> 0x%08x", result);
     if (result != NGX_SUCCESS)
     {
-        delete feature;
+        release_feature(feature);
         return result;
     }
     if (!create_buffer(D3D12_HEAP_TYPE_READBACK, 256, &feature->marker,
                        reinterpret_cast<uint8_t**>(const_cast<uint32_t**>(&feature->markerValue))))
     {
-        delete feature;
+        release_feature(feature);
         return NGX_FAIL_PLATFORM_ERROR;
     }
     for (int index = 0; index <= kSlots; ++index)
@@ -4889,9 +4894,6 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         // before the output buffers go away.
         drain_pipeline();
         feature->latestOutput = -1;
-        feature->outputFormat = outputDesc.Format;
-        feature->outputWidth = static_cast<UINT>(outputDesc.Width);
-        feature->outputHeight = outputDesc.Height;
         for (OutputSlot& outputSlot : feature->outputs)
         {
             outputSlot.staging.retire();
@@ -4900,6 +4902,9 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                        : !ensure_staging(outputSlot.staging, output, D3D12_HEAP_TYPE_UPLOAD))
                 return NGX_FAIL_PLATFORM_ERROR;
         }
+        feature->outputFormat = outputDesc.Format;
+        feature->outputWidth = static_cast<UINT>(outputDesc.Width);
+        feature->outputHeight = outputDesc.Height;
     }
 
     const auto inputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_INPUT_STATE", 0x40));
@@ -5090,7 +5095,10 @@ static void release_feature(Feature* feature)
     }
     // Recorded lists retain this owner through their allocator. Reset/discard
     // or GPU completion followed by allocator destruction releases those refs.
-    feature->resources->Release();
+    if (feature->resources != nullptr)
+        feature->resources->Release();
+    else
+        delete feature;
 }
 
 static void destroy_recorded_resources(Feature* feature)
