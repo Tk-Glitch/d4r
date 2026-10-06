@@ -28,6 +28,13 @@
 #undef SWIN_F32ACC
 #endif
 
+// SWIN_A8 (RDNA4 native FP8): the e4m3 GEMMs' activations live in LDS as e4m3 bytes, encoded once where they
+// are produced (v_cvt_pk_fp8_f32) instead of as f16 values that every operand load encodes again. The bytes
+// are the codes of the same q8 values, so results are unchanged.
+#if defined(D4R_FP8_WMMA) && defined(__GFX12__) && !defined(SWIN_NO_A8)
+#define SWIN_A8 1
+#endif
+
 #pragma clang fp contract(off)
 
 typedef _Float16 half_t;
@@ -199,6 +206,35 @@ __device__ __forceinline__ uint32_t codes8x2(hv2 q)
     return __builtin_bit_cast(uint32_t, (u16x2)(((qb >> 8) & (unsigned short)0x80) | code));
 }
 
+#ifdef SWIN_A8
+// e4m3 codes of two halves (RNE, satfinite, NaN -> 0x7f | sign: equal to half_to_e4m3 for all inputs) in bytes 0
+// and 1. The instruction rounds like NVIDIA's conversion but encodes overflow as 0x7f, so magnitudes are
+// clamped to 448 first and NaNs enter as infinities.
+__device__ __forceinline__ uint32_t codes2(hv2 h)
+{
+    const u16x2 u = __builtin_bit_cast(u16x2, h);
+    const u16x2 m = u & (unsigned short)0x7fff;
+    const u16x2 nan = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)((unsigned short)0x7c00 - m)) >> 15));
+    const u16x2 k = __builtin_elementwise_max(__builtin_elementwise_min(m, (u16x2){0x5f00, 0x5f00}), (u16x2)(nan & (unsigned short)0x7c00));
+    const hv2 c = __builtin_bit_cast(hv2, (u16x2)(k | (u & (unsigned short)0x8000)));
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)c[0], (float)c[1], 0, false) & 0xffffu;
+}
+// e4m3 codes of four halves in the bytes of one word. Exact builds use codes2. The fast build converts
+// first and then turns the instruction's overflow code into the saturated one in all four bytes at once
+// (low seven bits 0x7f -> 0x7e); it equals half_to_e4m3 for every non-NaN input, and a NaN encodes as the
+// negative saturated value 0xfe instead of 0x7f | sign.
+__device__ __forceinline__ uint32_t codes4(hv2 a, hv2 b)
+{
+#ifdef SWIN_EXACT
+    return codes2(a) | (codes2(b) << 16);
+#else
+    uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0, false);
+    w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], (float)b[1], (int)w, true);
+    return w - ((((w & 0x7f7f7f7fu) + 0x01010101u) >> 7) & 0x01010101u);
+#endif
+}
+#endif
+
 // four e4m3 codes (a, b from enc8x2) as the bytes of one word in element order
 __device__ __forceinline__ uint32_t pack_codes(uint32_t a, uint32_t b)
 {
@@ -336,6 +372,13 @@ __device__ __forceinline__ gop lda(const half_t* p)
 {
     return to_fp8(lds16(p));
 }
+#ifdef SWIN_A8
+// GEMM A operand from an e4m3 byte image in LDS: this half's 8 K values
+__device__ __forceinline__ gop lda(const uint8_t* p)
+{
+    return *(const u2v*)(p + 8 * m_half());
+}
+#endif
 #else
 __device__ __forceinline__ f8v wmma8(gop a, gop b, f8v c)
 {
