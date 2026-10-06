@@ -481,12 +481,12 @@ static void load_portable_config()
         return;
     std::wstring dir(module, length);
     dir.resize(dir.find_last_of(L"\\/"));
+    g_portable.dir = dir; // also without d4r.ini: the default log goes here
     std::string text;
     if (!read_whole_file(dir + L"\\d4r.ini", text))
         return; // developer layout: the launcher's environment has everything
     const std::vector<IniEntry> ini = parse_ini(text);
     g_portable.active = true;
-    g_portable.dir = dir;
     g_portable.unixDir = unix_path(dir);
     if (g_portable.unixDir.empty())
         g_portable.notes.push_back("cannot map the d4r folder to a Linux path (not running under Wine?)");
@@ -607,14 +607,10 @@ static void log_open()
     ensure_portable_config();
     wchar_t path[MAX_PATH] = {};
     DWORD length = GetEnvironmentVariableW(L"D4R_SHIM_LOG", path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH)
-    {
-        GetModuleFileNameW(g_selfModule, path, MAX_PATH);
-        wchar_t* slash = wcsrchr(path, L'\\');
-        if (slash != nullptr)
-            wcscpy(slash + 1, L"d4r_nvngx.log");
-    }
-    g_log = _wfopen(path, g_logFresh ? L"w" : L"a");
+    if (length > 0 && length < MAX_PATH)
+        g_log = _wfopen(path, g_logFresh ? L"w" : L"a");
+    else if (!g_portable.dir.empty()) // no log when the DLL's folder is unknown
+        g_log = _wfopen((g_portable.dir + L"\\d4r_nvngx.log").c_str(), g_logFresh ? L"w" : L"a");
 }
 
 static void logf(const char* format, ...)
@@ -648,8 +644,8 @@ static unsigned int env_uint(const char* name, unsigned int fallback)
 {
     char value[64] = {};
     DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
-    if (length == 0 || length >= sizeof(value))
-        return fallback;
+    if (length == 0 || length >= sizeof(value) || value[0] < '0' || value[0] > '9')
+        return fallback; // also signs and text: strtoul turns "-1" into 4294967295
     return static_cast<unsigned int>(std::strtoul(value, nullptr, 0));
 }
 
@@ -948,11 +944,11 @@ static void convert_row_in(Plane plane, DXGI_FORMAT format, const uint8_t* sourc
             case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
             {
                 // Microsoft spec: c = (p >> offset) & 0x1FF, E = (p >> 27) & 0x1F,
-                // v = c * 2^(E - 24). E == 0 means an exact zero.
+                // v = c * 2^(E - 24) for every E: there is no implicit leading bit.
                 uint32_t packed;
                 std::memcpy(&packed, source + x * 4, 4);
                 uint32_t e = (packed >> 27) & 0x1Fu;
-                float scale = (e == 0) ? 0.0f : std::ldexp(1.0f, (int)e - 24);
+                float scale = std::ldexp(1.0f, (int)e - 24);
                 rgba[0] = static_cast<float>((packed >> 0) & 0x1FFu) * scale;
                 rgba[1] = static_cast<float>((packed >> 9) & 0x1FFu) * scale;
                 rgba[2] = static_cast<float>((packed >> 18) & 0x1FFu) * scale;
@@ -1100,31 +1096,23 @@ static void convert_r11g11b10_row(const uint8_t* source, uint16_t* half, UINT wi
 // Microsoft spec: v = c * 2^(E - 24), c in [0, 511]. The exponent is chosen as
 // the smallest E such that all channels fit in 9 bits, then each channel is
 // rounded to the nearest representable value (round-half-even, matching
-// D3D's conversion semantics). Values above the format's max (65024.0) are
+// D3D's conversion semantics). Values above the format's max (65408.0) are
 // clamped, like D3D12 does.
 static void rgbe_pack(const float rgba[4], uint8_t* destination)
 {
-    const float MAX_VALUE = 65024.0f; // 511 * 2^(24 - 24)
+    const float MAX_VALUE = 65408.0f; // 511 * 2^(31 - 24)
     float r = rgba[0] < 0.0f ? 0.0f : (rgba[0] > MAX_VALUE ? MAX_VALUE : rgba[0]);
     float g = rgba[1] < 0.0f ? 0.0f : (rgba[1] > MAX_VALUE ? MAX_VALUE : rgba[1]);
     float b = rgba[2] < 0.0f ? 0.0f : (rgba[2] > MAX_VALUE ? MAX_VALUE : rgba[2]);
 
     float mx = fmaxf(fmaxf(r, g), b);
-    int e;
-    if (mx == 0.0f)
+    // Smallest scale (i.e. smallest e) such that mx / scale rounds to at most 511. This puts
+    // the largest channel in the 9-bit range [256, 511] (lower only at e == 0,
+    // which also encodes zero), the maximum precision the format allows.
+    int e = 31;
+    for (int et = 0; et <= 31; ++et)
     {
-        e = 0; // exponent 0 encodes an exact zero in this format
-    }
-    else
-    {
-        // Smallest scale (i.e. smallest e) such that mx / scale <= 511. This
-        // puts the largest channel in the normalized 9-bit range [256, 511],
-        // which gives every channel the maximum precision the format allows.
-        e = 31;
-        for (int et = 1; et <= 31; ++et)
-        {
-            if (mx / std::ldexp(1.0f, et - 24) <= 511.0f) { e = et; break; }
-        }
+        if (mx / std::ldexp(1.0f, et - 24) < 511.5f) { e = et; break; }
     }
     const float scale = std::ldexp(1.0f, e - 24);
     const float inv = 1.0f / scale;
