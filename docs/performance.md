@@ -92,6 +92,8 @@ DLSS 4.5 (M) on an RX 9070 XT (gfx1201, native FP8, fast set), 1280×720 → 384
 | dec0, enc0 (texture kernels) | 0.18, 0.13 | 0.18, 0.13 |
 | **total** | **6.10** | **2.86** |
 
+With `NativeFp8` off the same card runs the layers as 16-bit math, which never re-encoded its operands: that set takes 3.37 ms here (5.94 ms at 1920×1080 → 3840×2160, against 4.63 ms for the FP8 set). So against a 9070 XT that was already running with `NativeFp8` off, the FP8 set is about 15% faster at 1280×720 and 22% at 1920×1080, not twice as fast. In Ghost of Tsushima at 1920×1080 → 3840×2160 the upscaler time shown in game went from 7.0 ms (16-bit set) to 5.8 ms (this FP8 set).
+
 The shim's whole-evaluation GPU time (`D4R_PROFILE`, no per-kernel synchronisation) went from 5.9–6.0 ms to 2.80 ms with the harness's 200 ms pause between frames, and to 2.39–2.43 ms with frames 0–4 ms apart (2000 frames at 4 ms spacing: median 2.39, maximum 2.56). The difference is the driver's clock governor: with the 200 ms pause the GPU is about 9% busy and runs at about 2790 MHz, with frames 0–4 ms apart it is 80–98% busy and runs at 3180–3300 MHz, as it does under a game's rendering load. Other GPU users on the desktop add occasional slower frames to any of these figures; the previous kernels show the same disturbances.
 
 The change is in [native-kernels.md](native-kernels.md#rdna4): the FP8 layers keep their activations as e4m3 bytes, and the downsample kernel is built as wave64 on gfx12. The output image is byte-identical before and after.
