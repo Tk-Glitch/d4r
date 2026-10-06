@@ -34,6 +34,12 @@
 #if defined(D4R_FP8_WMMA) && defined(__GFX12__) && !defined(SWIN_NO_A8)
 #define SWIN_A8 1
 #endif
+// The exact SWIN_A8 build rounds each k32 step with v_fma_mix (f16(P + C) in one rounding) instead of
+// converting the accumulator to f32 and back: the same codes as the conversion form on the recorded launches
+// and as tools/swin_model.py, at about half the cost. K32_NO_MIX keeps the conversion form.
+#if defined(SWIN_A8) && defined(SWIN_EXACT) && !defined(K32_NO_MIX) && !defined(K32_MIX)
+#define K32_MIX
+#endif
 
 #pragma clang fp contract(off)
 
@@ -207,31 +213,17 @@ __device__ __forceinline__ uint32_t codes8x2(hv2 q)
 }
 
 #ifdef SWIN_A8
-// e4m3 codes of two halves (RNE, satfinite, NaN -> 0x7f | sign: equal to half_to_e4m3 for all inputs) in bytes 0
-// and 1. The instruction rounds like NVIDIA's conversion but encodes overflow as 0x7f, so magnitudes are
-// clamped to 448 first and NaNs enter as infinities.
-__device__ __forceinline__ uint32_t codes2(hv2 h)
-{
-    const u16x2 u = __builtin_bit_cast(u16x2, h);
-    const u16x2 m = u & (unsigned short)0x7fff;
-    const u16x2 nan = __builtin_bit_cast(u16x2, (i16x2)(__builtin_bit_cast(i16x2, (u16x2)((unsigned short)0x7c00 - m)) >> 15));
-    const u16x2 k = __builtin_elementwise_max(__builtin_elementwise_min(m, (u16x2){0x5f00, 0x5f00}), (u16x2)(nan & (unsigned short)0x7c00));
-    const hv2 c = __builtin_bit_cast(hv2, (u16x2)(k | (u & (unsigned short)0x8000)));
-    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)c[0], (float)c[1], 0, false) & 0xffffu;
-}
-// e4m3 codes of four halves in the bytes of one word. Exact builds use codes2. The fast build converts
-// first and then turns the instruction's overflow code into the saturated one in all four bytes at once
-// (low seven bits 0x7f -> 0x7e); it equals half_to_e4m3 for every non-NaN input, and a NaN encodes as the
-// negative saturated value 0xfe instead of 0x7f | sign.
+// e4m3 codes of four halves (RNE, satfinite) in the bytes of one word. The instruction rounds like NVIDIA's
+// conversion but encodes overflow as 0x7f, so the values are clamped to +-448 first, with the NaN-propagating
+// minimum / maximum. Equal to half_to_e4m3 for every non-NaN input; a NaN encodes as the NaN code 0xff (the
+// reference keeps its sign: 0x7f or 0xff).
 __device__ __forceinline__ uint32_t codes4(hv2 a, hv2 b)
 {
-#ifdef SWIN_EXACT
-    return codes2(a) | (codes2(b) << 16);
-#else
-    uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0, false);
-    w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], (float)b[1], (int)w, true);
-    return w - ((((w & 0x7f7f7f7fu) + 0x01010101u) >> 7) & 0x01010101u);
-#endif
+    const hv2 lim = {(half_t)448.0f, (half_t)448.0f};
+    a = __builtin_elementwise_maximum(__builtin_elementwise_minimum(a, lim), -lim);
+    b = __builtin_elementwise_maximum(__builtin_elementwise_minimum(b, lim), -lim);
+    const uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0, false);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)b[0], (float)b[1], (int)w, true);
 }
 #endif
 
