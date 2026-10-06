@@ -92,7 +92,16 @@ DLSS 4.5 (M) on an RX 9070 XT (gfx1201, native FP8, fast set), 1280×720 → 384
 | dec0, enc0 (texture kernels) | 0.18, 0.13 | 0.18, 0.13 |
 | **total** | **6.10** | **2.86** |
 
-With `NativeFp8` off the same card runs the layers as 16-bit math, which never re-encoded its operands: that set takes 3.37 ms here (5.94 ms at 1920×1080 → 3840×2160, against 4.63 ms for the FP8 set). So against a 9070 XT that was already running with `NativeFp8` off, the FP8 set is about 15% faster at 1280×720 and 22% at 1920×1080, not twice as fast. In Ghost of Tsushima at 1920×1080 → 3840×2160 the upscaler time shown in game went from 7.0 ms (16-bit set) to 5.8 ms (this FP8 set).
+Fast and accuracy sets, on the native-FP8 path and on the 16-bit path (`NativeFp8` off), before and after the change, same harness and resolution. Median GPU time per frame in milliseconds from `D4R_CUDA_KERNEL_PROFILE`; the bracketed figures are the whole evaluation (`D4R_PROFILE`) with the GPU otherwise idle and at about 80% utilisation.
+
+| Set | before | now |
+|---|---|---|
+| native FP8, fast | 6.11 (6.01 / 5.89) | 2.88 (2.77 / 2.38) |
+| native FP8, accuracy | 6.38 (6.49 / 6.32) | 3.15 (3.06 / 2.59) |
+| 16-bit, fast | 3.48 | 3.40 |
+| 16-bit, accuracy | 4.38 | 4.20 |
+
+The 16-bit path never re-encoded its operands, so it was already faster than the previous FP8 layers; its small gain here is the wave64 downsample (and post, in the accuracy set). Against a 9070 XT that was running with `NativeFp8` off, the FP8 fast set is about 17% faster at 1280×720 and 22% at 1920×1080 → 3840×2160 (4.63 ms against 5.94 ms, the latter with a 16-bit set from an earlier build), not twice as fast. In Ghost of Tsushima at 1920×1080 → 3840×2160 the upscaler time shown in game went from 7.0 ms (16-bit fast set) to 5.8 ms (this FP8 fast set).
 
 The shim's whole-evaluation GPU time (`D4R_PROFILE`, no per-kernel synchronisation) went from 5.9–6.0 ms to 2.80 ms with the harness's 200 ms pause between frames, and to 2.39–2.43 ms with frames 0–4 ms apart (2000 frames at 4 ms spacing: median 2.39, maximum 2.56). The difference is the driver's clock governor: with the 200 ms pause the GPU is about 9% busy and runs at about 2790 MHz, with frames 0–4 ms apart it is 80–98% busy and runs at 3180–3300 MHz, as it does under a game's rendering load. Other GPU users on the desktop add occasional slower frames to any of these figures; the previous kernels show the same disturbances.
 
