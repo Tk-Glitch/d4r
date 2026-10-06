@@ -16,7 +16,7 @@
 #   D4R_MAX_GLIBC     highest GLIBC ABI the Linux libraries may require     default 2.41
 #   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201
 #                    (RDNA4 targets also get a <target>-fp8 folder: the kernels for d4r.ini NativeFp8 = on)
-#   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: the system's SPDX copy
+#   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: system SPDX or common-licenses copy
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
 #   D4R_ZLUDA_SRC    ZLUDA source checkout, for its license files            default: D4R_ZLUDA_DIR's ../d4r-zluda-upstream
 #   SOURCE_DATE_EPOCH  timestamp given to every packaged file                default: the last commit's
@@ -52,6 +52,9 @@ ARCHS="${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
 for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$ROCM_RUNTIME/lib/libamdhip64.so.7"; do
   [[ -f "$f" ]] || { echo "missing $f (the ROCm runtime comes from scripts/fetch_rocm_runtime.sh)" >&2; exit 2; }
 done
+OPTISCALER_LICENSE="${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-only.txt}"
+[[ -n "${D4R_OPTISCALER_LICENSE:-}" || -f "$OPTISCALER_LICENSE" ]] || OPTISCALER_LICENSE=/usr/share/common-licenses/GPL-3
+[[ -f "$OPTISCALER_LICENSE" ]] || { echo "missing OptiScaler GPL-3.0 license; set D4R_OPTISCALER_LICENSE to an existing file" >&2; exit 2; }
 
 # D4R_SKIP_BUILD=1 packages the shim and bridge already in build/ (e.g. the binaries that were tested)
 if [[ "${D4R_SKIP_BUILD:-0}" != 1 ]]; then
@@ -205,7 +208,7 @@ cp "$ZLUDA_SRC/LICENSE-MIT" "$L/ZLUDA-LICENSE-MIT.txt"
 cp "$ZLUDA_SRC/ext/llvm-project/llvm/LICENSE.TXT" "$L/LLVM-LICENSE.txt"
 cp "$VKD3D_SRC/LICENSE" "$L/vkd3d-proton-LICENSE.txt"
 cp "$VKD3D_SRC/COPYING" "$L/vkd3d-proton-COPYING.txt"
-cp "${D4R_OPTISCALER_LICENSE:-/usr/share/licenses/spdx/GPL-3.0-only.txt}" "$L/OptiScaler-LICENSE-GPL-3.0.txt"
+cp "$OPTISCALER_LICENSE" "$L/OptiScaler-LICENSE-GPL-3.0.txt"
 for f in "$ROCM_RUNTIME"/licenses/*; do cp "$f" "$L/ROCm-$(basename "$f")"; done
 mkdir -p "$STAGE/d4r/source/patches"
 cp -r "$ROOT/patches/zluda" "$ROOT/patches/vkd3d-proton" "$STAGE/d4r/source/patches/"
