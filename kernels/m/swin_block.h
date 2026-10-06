@@ -97,6 +97,25 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     half_t* QP = (half_t*)U;                   // stage 2: per-wave Q / P scratch [NW][16][QST]
     half_t* PA = QP;                           // stage 0: low-res tokens f16 [16][PAST] (apos order)
     half_t* G = (half_t*)U;                    // stage 4: fc1 outputs [R][64][GST]
+#ifdef SWIN_A8
+    // e4m3 byte images of the GEMM operands: the same rows and columns as the f16 images, one byte per value.
+    // A token's bytes start where its f16 row starts, so they stay inside that row.
+    constexpr int ARB = 2 * AST;
+    uint8_t* const A8 = (uint8_t*)A;
+    uint8_t* const G8 = U;
+    // codes of one column in four rows
+    auto put22 = [](uint8_t* p0, uint8_t* p1, uint8_t* p2, uint8_t* p3, hv2 a, hv2 b) {
+        const uint32_t c = codes4(a, b);
+        *p0 = (uint8_t)c;
+        *p1 = (uint8_t)(c >> 8);
+        *p2 = (uint8_t)(c >> 16);
+        *p3 = (uint8_t)(c >> 24);
+    };
+#else
+    constexpr int ARB = AST;
+    half_t* const A8 = A;
+    half_t* const G8 = G;
+#endif
 
     const int lane = threadIdx.x, wv = threadIdx.z, tid = lane + 32 * wv;
     const int l16 = lane & 15, hi = lane >> 4;
@@ -169,7 +188,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             const int MX = mirror((8 * bx - p.sx) / 2 + (r & 3), W2), MY = mirror((8 * by - p.sy) / 2 + (r >> 2), H2);
             const uint32_t bytes =
                 input_word((const uint32_t*)(p.in + ((size_t)((c4 >> 5) * H2 + MY) * W2 + MX) * 32 + (c4 & 31)));
-#ifdef SWIN_PACKED_INPUT
+#ifdef SWIN_A8
+            *(uint32_t*)((uint8_t*)PA + r * PAST + apos(c4)) = bytes; // apos(c4 + b) = apos(c4) + b
+#elif defined(SWIN_PACKED_INPUT)
             *(h4*)(PA + r * PAST + apos(c4)) = decode4(bytes);
 #else
 #pragma unroll
@@ -187,7 +208,11 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
         for (int kc = 0; kc < CIN / 32; ++kc)
         {
+#ifdef SWIN_A8
+            const gop a0 = lda((const uint8_t*)PA + l16 * PAST + 32 * kc), a1 = lda((const uint8_t*)PA + l16 * PAST + 32 * kc + 16);
+#else
             const gop a0 = lda(PA + l16 * PAST + 32 * kc), a1 = lda(PA + l16 * PAST + 32 * kc + 16);
+#endif
 #pragma unroll
             for (int j = 0; j < NTEW; ++j)
             {
@@ -318,6 +343,20 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             const half_t rn = rsqrt16(a0 + a1);
 #endif
             const hv2 rn2 = {rn, rn};
+#ifdef SWIN_A8
+#pragma unroll
+            for (int pl = 0; pl < NPL; ++pl)
+#pragma unroll
+                for (int ww = 0; ww < 2; ++ww)
+                {
+                    const int c = 32 * pl + 4 * (t + 4 * ww);
+                    const hv2 g0 = __builtin_bit_cast(hv2, *(const uint32_t*)(W + L::G1 + 2 * gperm(c)));
+                    const hv2 g1 = __builtin_bit_cast(hv2, *(const uint32_t*)(W + L::G1 + 2 * gperm(c + 2)));
+                    // apos(c + b) = apos(c) + b for b < 4: the four codes are one word
+                    *(uint32_t*)(A8 + T * ARB + apos(c)) = codes4((hv2){v[pl][ww][0], v[pl][ww][1]} * (hv2)(rn2 * g0),
+                                                                  (hv2){v[pl][ww][2], v[pl][ww][3]} * (hv2)(rn2 * g1));
+                }
+#else
 #pragma unroll
             for (int pl = 0; pl < NPL; ++pl)
 #pragma unroll
@@ -332,6 +371,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                         // apos(c + 1) = apos(c) + 1 for even c
                         *(hv2*)(A + T * AST + apos(c)) = hq;
                     }
+#endif
         }
     }
     __syncthreads();
@@ -400,8 +440,8 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
             for (int m = 0; m < MW; ++m)
             {
-                const gop a0 = lda(A + (16 * (m0 + m) + l16) * AST + 32 * kc);
-                const gop a1 = lda(A + (16 * (m0 + m) + l16) * AST + 32 * kc + 16);
+                const gop a0 = lda(A8 + (16 * (m0 + m) + l16) * ARB + 32 * kc);
+                const gop a1 = lda(A8 + (16 * (m0 + m) + l16) * ARB + 32 * kc + 16);
 #pragma unroll
                 for (int q = 0; q < 4; ++q)
                     k32(acc[m][q], a0, b[0][q], a1, b[1][q]);
@@ -415,7 +455,11 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
                 for (int i = 0; i < 8; i += 2)
                 {
+#ifdef SWIN_A8
+                    qp[m][q][i / 2] = acc[m][q].pair(i / 2); // encoded when staged
+#else
                     qp[m][q][i / 2] = q8x2(acc[m][q].pair(i / 2));
+#endif
                     vp[m][q][i / 2] = acc[m][2 + q].pair(i / 2);
                 }
 #endif
@@ -437,6 +481,18 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
         for (int m = 0; m < MW; ++m)
         {
+#ifdef SWIN_A8
+            uint8_t* const Q8 = (uint8_t*)Qs;
+#pragma unroll
+            for (int q = 0; q < 2; ++q)
+#pragma unroll
+                for (int i = 0; i < 8; i += 4)
+                    put22(Q8 + mrow(i) * QST + 16 * q + l16, Q8 + mrow(i + 1) * QST + 16 * q + l16,
+                          Q8 + mrow(i + 2) * QST + 16 * q + l16, Q8 + mrow(i + 3) * QST + 16 * q + l16, qp[m][q][i / 2],
+                          qp[m][q][i / 2 + 1]);
+            wave_sync();
+            const gop a0 = lda(Q8 + l16 * QST), a1 = lda(Q8 + l16 * QST + 16);
+#else
 #pragma unroll
             for (int q = 0; q < 2; ++q)
 #pragma unroll
@@ -447,6 +503,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 }
             wave_sync();
             const gop a0 = lda(Qs + l16 * QST), a1 = lda(Qs + l16 * QST + 16);
+#endif
             T16 S = bias;
             k32(S, a0, a0, a1, a1);
             // rows mrow(2k), mrow(2k+1) of this lane's column, packed: scale, clamp and the cubic
@@ -509,6 +566,15 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #endif
                 const f8v o = wmma(pa, vb, splat(0.0f));
                 const int ocol = apos(32 * h + ginv(16 * nt + l16));
+#ifdef SWIN_A8
+#pragma unroll
+                for (int i = 0; i < 8; i += 4)
+                {
+                    uint8_t* const oc = A8 + 16 * (m0 + m) * ARB + ocol;
+                    put22(oc + mrow(i) * ARB, oc + mrow(i + 1) * ARB, oc + mrow(i + 2) * ARB, oc + mrow(i + 3) * ARB,
+                          (hv2){(half_t)o[i], (half_t)o[i + 1]}, (hv2){(half_t)o[i + 2], (half_t)o[i + 3]});
+                }
+#else
 #pragma unroll
                 for (int i = 0; i < 8; i += 2)
                 {
@@ -516,6 +582,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                     A[(16 * (m0 + m) + mrow(i)) * AST + ocol] = oq[0];
                     A[(16 * (m0 + m) + mrow(i + 1)) * AST + ocol] = oq[1];
                 }
+#endif
             }
             wave_sync();
         }
@@ -545,8 +612,8 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
         for (int mm = 0; mm < MT; ++mm)
         {
-            const gop a0 = lda(A + (16 * (mg * MT + mm) + l16) * AST + 32 * kc);
-            const gop a1 = lda(A + (16 * (mg * MT + mm) + l16) * AST + 32 * kc + 16);
+            const gop a0 = lda(A8 + (16 * (mg * MT + mm) + l16) * ARB + 32 * kc);
+            const gop a1 = lda(A8 + (16 * (mg * MT + mm) + l16) * ARB + 32 * kc + 16);
 #pragma unroll
             for (int j = 0; j < NTW; ++j)
                 k32(x[mm][j], a0, b[0][j], a1, b[1][j]);
@@ -647,6 +714,26 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
         const int col = apos(ginv(n));
 #pragma unroll
         for (int mm = 0; mm < MT; ++mm)
+#ifdef SWIN_A8
+#pragma unroll
+            for (int i = 0; i < 8; i += 4)
+            {
+                hv2 h[2];
+                uint8_t* at[4];
+#pragma unroll
+                for (int e = 0; e < 2; ++e)
+                {
+                    const int row = 16 * (mg * MT + mm) + mrow(i + 2 * e), row2 = 16 * (mg * MT + mm) + mrow(i + 2 * e + 1);
+                    const hv2 v = x[mm][j].pair(i / 2 + e);
+                    const hv2 r2 = {R2[row], R2[row2]};
+                    h[e] = v * (hv2)(r2 * (hv2){g2, g2});
+                    at[2 * e] = A8 + row * ARB + col;
+                    at[2 * e + 1] = A8 + row2 * ARB + col;
+                    x[mm][j].set_pair(i / 2 + e, v + (hv2){b2, b2});
+                }
+                put22(at[0], at[1], at[2], at[3], h[0], h[1]);
+            }
+#else
 #pragma unroll
             for (int i = 0; i < 8; i += 2)
             {
@@ -658,6 +745,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 A[row2 * AST + col] = hq[1];
                 x[mm][j].set_pair(i / 2, v + (hv2){b2, b2});
             }
+#endif
     }
     __syncthreads();
 
@@ -695,8 +783,8 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
                 for (int mm = 0; mm < MPW; ++mm)
                 {
-                    const gop a0 = lda(A + (16 * (mb + mm) + l16) * AST + 32 * kc);
-                    const gop a1 = lda(A + (16 * (mb + mm) + l16) * AST + 32 * kc + 16);
+                    const gop a0 = lda(A8 + (16 * (mb + mm) + l16) * ARB + 32 * kc);
+                    const gop a1 = lda(A8 + (16 * (mb + mm) + l16) * ARB + 32 * kc + 16);
                     k32(z[mm][0], a0, b[0][0], a1, b[1][0]);
                     k32(z[mm][1], a0, b[0][1], a1, b[1][1]);
                 }
@@ -708,6 +796,27 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 for (int nt = 0; nt < 2; ++nt)
                 {
                     const int col = apos(ginv(16 * nt + l16));
+#ifdef SWIN_A8
+#pragma unroll
+                    for (int i = 0; i < 8; i += 4)
+                    {
+                        hv2 gl[2];
+#pragma unroll
+                        for (int e = 0; e < 2; ++e)
+                        {
+                            const hv2 zv = z[mm][nt].pair(i / 2 + e);
+                            const hv2 cz = __builtin_elementwise_max(__builtin_elementwise_min(zv, (hv2){2.0f16, 2.0f16}),
+                                                                     (hv2){-2.0f16, -2.0f16});
+                            const hv2 az = __builtin_bit_cast(hv2, (u16x2)(__builtin_bit_cast(u16x2, cz) & (unsigned short)0x7fff));
+                            const hv2 inner = (hv2){f16(0.41216981f), f16(0.41216981f)} -
+                                              (hv2)((hv2){f16(0.08108133f), f16(0.08108133f)} * az);
+                            gl[e] = zv * (hv2)((hv2){0.5f16, 0.5f16} + (hv2)(cz * inner));
+                        }
+                        uint8_t* const gc = G8 + (cw * 64 + 16 * (mb + mm)) * GST + col;
+                        put22(gc + mrow(i) * GST, gc + mrow(i + 1) * GST, gc + mrow(i + 2) * GST, gc + mrow(i + 3) * GST, gl[0],
+                              gl[1]);
+                    }
+#else
 #pragma unroll
                     for (int i = 0; i < 8; i += 2)
                     {
@@ -722,6 +831,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                         Gc[(16 * (mb + mm) + mrow(i)) * GST + col] = gq[0];
                         Gc[(16 * (mb + mm) + mrow(i + 1)) * GST + col] = gq[1];
                     }
+#endif
                 }
             __syncthreads();
 #pragma unroll
@@ -737,8 +847,8 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
                 for (int mm = 0; mm < MT; ++mm)
                 {
-                    const gop a0 = lda(G + (cc * 64 + 16 * (mg * MT + mm) + l16) * GST);
-                    const gop a1 = lda(G + (cc * 64 + 16 * (mg * MT + mm) + l16) * GST + 16);
+                    const gop a0 = lda(G8 + (cc * 64 + 16 * (mg * MT + mm) + l16) * GST);
+                    const gop a1 = lda(G8 + (cc * 64 + 16 * (mg * MT + mm) + l16) * GST + 16);
 #pragma unroll
                     for (int j = 0; j < NTW; ++j)
                         k32(x[mm][j], a0, b[0][j], a1, b[1][j]);
@@ -752,6 +862,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
     // XO: [64 tokens][C channels] natural order; the row padding keeps the patch merge's 8-byte reads of 16
     // tokens on distinct LDS banks (see xo_row)
     half_t* XO = A;
+#ifdef SWIN_A8
+    constexpr int XB = C + 4; // byte row stride of the patch merge's code image (rows stay 4-byte aligned)
+#endif
     static_assert(xo_row<C>(63) + C <= 64 * AST, "XO fits in A");
 #pragma unroll
     for (int j = 0; j < NTW; ++j)
@@ -775,6 +888,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
         for (int k = 0; k < 4; ++k)
         {
             const uint2 pr = xs[k];
+#ifdef SWIN_A8
+            w[k] = codes4(__builtin_bit_cast(hv2, pr.x), __builtin_bit_cast(hv2, pr.y));
+#else
             hv2 qa, qb;
             uint32_t ca, cb;
 #ifdef SWIN_DIRECT_CODES
@@ -791,8 +907,20 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             // the patch merge consumes decode(code) = q8_exact(x), written back over x (this thread's own values)
             if constexpr (NPM > 0)
                 xs[k] = (uint2){__builtin_bit_cast(uint32_t, qa), __builtin_bit_cast(uint32_t, qb)};
+#endif
         }
         const uint4 v = {w[0], w[1], w[2], w[3]};
+#ifdef SWIN_A8
+        // the patch merge's operands are these codes: a byte image [64][XB] in U (G is dead)
+        if constexpr (NPM > 0)
+        {
+            static_assert(64 * XB <= USIZE, "merge byte image fits in U");
+            uint32_t* xb = (uint32_t*)(U + T * XB + c16);
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                xb[k] = w[k];
+        }
+#endif
         const int X = 8 * bx - p.sx + tok_x(T), Y = 8 * by - p.sy + tok_y(T);
         if (X >= 0 && X < p.tw && Y >= 0 && Y < p.th)
             *(uint4*)(p.out + ((size_t)((c16 >> 5) * p.th + Y) * p.tw + X) * 32 + (c16 & 31)) = v;
@@ -822,6 +950,20 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
 #pragma unroll
             for (int s = 0; s < 2; ++s)
             {
+#ifdef SWIN_A8
+                // this half's two runs of four K slots, as stored codes
+                uint32_t run4[2];
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr)
+                {
+                    const int k = 32 * kc + kslot(s, 4 * (2 * hi + rr));
+                    const int q = k / C, ch = k % C;
+                    const int tx = 2 * mx + (q & 1), ty = 2 * my + (q >> 1);
+                    const int T = (tx & 3) + 4 * (ty & 3) + 16 * (tx >> 2) + 32 * (ty >> 2);
+                    run4[rr] = *(const uint32_t*)(U + T * XB + ch);
+                }
+                as[s] = (u2v){run4[0], run4[1]};
+#else
                 sop a;
                 // the operand's K slots in runs of 4 (gfx12: this half's slots 8 hi .. 8 hi + 7)
                 constexpr int RUNS = sizeof(sop) / sizeof(half_t) / 4;
@@ -840,6 +982,7 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                         a[4 * rr + b] = v[b];
                 }
                 as[s] = as_gop(a);
+#endif
             }
 #pragma unroll
             for (int j = 0; j < NTP; ++j)
@@ -857,6 +1000,9 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
             if (!PM_EVEN && wv * NTP + j >= NPM / 16)
                 continue;
             const int ch = ginv(16 * (wv * NTP + j) + l16);
+#ifdef SWIN_A8
+            const uint32_t code[2] = {codes4(y[j].pair(0), y[j].pair(1)), codes4(y[j].pair(2), y[j].pair(3))};
+#endif
 #pragma unroll
             for (int i = 0; i < 8; ++i)
             {
@@ -865,7 +1011,11 @@ __device__ __forceinline__ void swin_block(const CommonParams& p, const TubePara
                 if (MX < 0 || MX >= W2 || MY < 0 || MY >= H2)
                     continue;
                 p.p48[((size_t)((ch >> 5) * H2 + MY) * W2 + MX) * 32 + (ch & 31)] =
+#ifdef SWIN_A8
+                    (uint8_t)(code[i >> 2] >> (8 * (i & 3)));
+#else
                     (uint8_t)enc8(y[j].get(i));
+#endif
             }
         }
     }
