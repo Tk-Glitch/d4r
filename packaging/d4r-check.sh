@@ -75,10 +75,10 @@ for dir in "$ROCM/lib" /opt/rocm/lib /usr/lib /usr/lib64 /usr/lib/x86_64-linux-g
 done
 [ -n "$found" ] && ok "ROCm HIP runtime ($found/libamdhip64.so.7)" || bad "ROCm HIP runtime 7.x (libamdhip64.so.7); re-extract the d4r zip, which includes it in d4r/rocm"
 [ -e /dev/kfd ] && ok "/dev/kfd (ROCm compute device)" || bad "/dev/kfd: the amdgpu compute interface is not available"
-target=""
+target="" best_simds=0
 for props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
   s=$(sed -n 's/^simd_count //p' "$props" 2>/dev/null); t=$(sed -n 's/^gfx_target_version //p' "$props" 2>/dev/null)
-  [ -n "$s" ] && [ "$s" != 0 ] && [ -n "$t" ] && [ "$t" != 0 ] && { target="$t"; break; }
+  [ -n "$s" ] && [ "$s" -gt "$best_simds" ] && [ -n "$t" ] && [ "$t" != 0 ] && { target="$t"; best_simds="$s"; }
 done
 if [ -n "$target" ]; then
   arch=$(printf 'gfx%d%d%x' $((target / 10000)) $(((target / 100) % 100)) $((target % 100)))
