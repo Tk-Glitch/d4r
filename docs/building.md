@@ -137,6 +137,20 @@ D4R_ZLUDA_DIR=~/.cache/d4r-zluda-current D4R_VKD3D_DIR=~/.cache/d4r-vkd3d-d4r D4
 scripts/package_release.sh            # -> dist/d4r-<version>.zip
 ```
 
+Set `D4R_INSTALL_MODE=asi` to build `d4r-<version>-asi.zip` for an existing
+game-local OptiScaler installation. Its only top-level entries are `d4r.asi`
+and `d4r/`, ready to extract into the configured plugin folder. It omits
+OptiScaler's DLL/INI and does not require `D4R_OPTISCALER`. The runtime and
+`install.sh` are inside `d4r/`; the NVIDIA installer also accepts its original
+proxy-package layout. The native `d4r/d4r-setup.exe` helper installs the supplied
+D3D12 pair beside the game EXE and merges the NGX route into the active loader's
+INI (including GE-Proton's prefix-local INI) with backups, after
+waiting for the invoking game process to exit. Subsequent unchanged launches do
+nothing. `InitializeASI` launches setup without GPU work under the loader lock.
+
+The build writes `build/d4r.asi` and `build/d4r-setup.exe`.
+See [ASI_README.txt](../packaging/ASI_README.txt).
+
 The script:
 - builds the shim, the bridge and both fast and accuracy network-layer kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default (`D4R_GPU_ARCHS` can select fewer targets); each gfx12 target also gets an `<arch>-fp8` variant;
 - writes the kernel manifest from the DLLs you list (it records hashes of their PTX, nothing else);

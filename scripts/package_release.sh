@@ -7,6 +7,7 @@
 #
 # Inputs (environment):
 #   D4R_OPTISCALER   OptiScaler release archive (.7z or .zip) or extracted folder (required; 0.9.4 tested)
+#   D4R_INSTALL_MODE proxy (default), or asi: add-on for an existing OptiScaler install
 #   D4R_DLSS_DLLS    colon-separated nvngx_dlss.dll files whose kernel code the native kernels accept
 #                    (required; only hashes of their PTX go into the release)
 #   D4R_ZLUDA_DIR    ZLUDA build with patches/zluda applied (libnvcuda.so)   default ~/.cache/d4r-zluda-current
@@ -53,13 +54,21 @@ case "${D4R_BUNDLE_NVIDIA:-installer}" in
 esac
 NAME="d4r-$VERSION"
 [[ "$VARIANT" == clean ]] && NAME="$NAME-nonvidia"
+INSTALL_MODE="${D4R_INSTALL_MODE:-proxy}"
+case "$INSTALL_MODE" in
+  proxy) ;;
+  asi) NAME="$NAME-asi" ;;
+  *) echo "D4R_INSTALL_MODE must be proxy or asi" >&2; exit 2 ;;
+esac
 STAGE="$OUT/$NAME"
 ZLUDA="${D4R_ZLUDA_DIR:-$HOME/.cache/d4r-zluda-current}"
 VKD3D="${D4R_VKD3D_DIR:-$HOME/.cache/d4r-vkd3d-d4r}"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
 ROCM_RUNTIME="${D4R_ROCM_RUNTIME:-$HOME/.cache/d4r-rocm-runtime}"
 ARCHS="${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
-: "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
+if [[ "$INSTALL_MODE" == proxy ]]; then
+  : "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
+fi
 : "${D4R_DLSS_DLLS:?set D4R_DLSS_DLLS to the nvngx_dlss.dll files the kernel manifest accepts}"
 for f in "$ZLUDA/libnvcuda.so" "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$ROCM_RUNTIME/lib/libamdhip64.so.7"; do
   [[ -f "$f" ]] || { echo "missing $f (the ROCm runtime comes from scripts/fetch_rocm_runtime.sh)" >&2; exit 2; }
@@ -80,6 +89,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # OptiScaler, as dxgi.dll with its INI preconfigured for d4r
+if [[ "$INSTALL_MODE" == proxy ]]; then
 if [[ -d "$D4R_OPTISCALER" ]]; then
   OPTI="$D4R_OPTISCALER"
 else
@@ -94,9 +104,20 @@ fi
 cp "$OPTI/OptiScaler.dll" "$STAGE/dxgi.dll"
 python3 "$ROOT/scripts/configure_optiscaler.py" \
   "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini"
+else
+  cp "$ROOT/build/d4r-setup.exe" "$STAGE/d4r/d4r-setup.exe"
+  # Same NGX exports and implementation, delivered through the ASI loader.
+  # A custom plugin path requires placing this file in that existing folder.
+  cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r.asi"
+fi
 
 # d4r-patched vkd3d-proton: same-frame DLSS results
-cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"
+if [[ "$INSTALL_MODE" == asi ]]; then
+  python3 "$ROOT/scripts/private_d3d12_core.py" "$VKD3D/d3d12.dll" "$STAGE/d4r/d3d12.dll"
+  cp "$VKD3D/d3d12core.dll" "$STAGE/d4r/d4r12core.dll"
+else
+  cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/"
+fi
 
 # d4r itself
 cp "$ROOT/build/d4r_nvngx.dll" "$STAGE/d4r/nvngx.dll"
@@ -115,8 +136,10 @@ if [[ "$VARIANT" != clean ]]; then
     cp "$D4R_BUNDLE_NGX" "$STAGE/d4r/ngx/_nvngx.dll"
     [[ -z "${D4R_BUNDLE_DLSSD:-}" ]] || cp "$D4R_BUNDLE_DLSSD" "$STAGE/d4r/nvngx_dlssd.dll"
   else
-    cp "$ROOT/install.sh" "$STAGE/install.sh"
-    chmod +x "$STAGE/install.sh"
+    installer_dir="$STAGE"
+    [[ "$INSTALL_MODE" != asi ]] || installer_dir="$STAGE/d4r"
+    cp "$ROOT/install.sh" "$installer_dir/install.sh"
+    chmod +x "$installer_dir/install.sh"
     # The downloader is pinned to DLSS 310.7.0: refuse mismatched release inputs.
     expected=$(sed -n "s/^DLSS_SHA256=//p" "$ROOT/install.sh")
     [[ "$(sha256sum "$D4R_BUNDLE_DLSS" | cut -d' ' -f1)" == "$expected" ]] || {
@@ -277,6 +300,11 @@ if [[ -n "${D4R_BUILD_INFO:-}" ]]; then
   cp "$D4R_BUILD_INFO" "$STAGE/d4r/source/BUILD_INFO.txt"
 fi
 sed -e "s/@VERSION@/$VERSION/g" "$ROOT/packaging/D4R_README.txt" | variant | sed 's/$/\r/' > "$STAGE/D4R_README.txt"
+if [[ "$INSTALL_MODE" == asi ]]; then
+  rm "$STAGE/D4R_README.txt"
+  cp "$ROOT/packaging/ASI_README.txt" "$STAGE/d4r/README.txt"
+  printf '\nASI delivery: drop d4r.asi and d4r/ into the existing plugin folder.\nd4r.asi is d4r/nvngx.dll renamed; d4r/d4r-setup.exe (tools/d4r_asi_setup.cpp) installs the D3D12 pair and configures its route automatically after the game closes.\nThe dxgi.dll / OptiScaler.ini entries above apply only to proxy packages.\nIn ASI mode install.sh, d3d12.dll and the private d4r12core.dll are inside d4r/. The forwarder loader strings are retargeted by scripts/private_d3d12_core.py without changing code addresses.\n' >> "$STAGE/d4r/source/SOURCES.txt"
+fi
 
 # Last line of defence for the published zip: only what this variant contains, never values read from DLSS.
 python3 "$ROOT/scripts/check_redistributable.py" release "$VARIANT" "$STAGE" ||

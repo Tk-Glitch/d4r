@@ -48,6 +48,8 @@
 //                       Independent of D4R_DLSS_PRESET, which only affects Super Sampling.
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
+#include <tlhelp32.h>
+#include "d4r_asi_process.h"
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <vulkan/vulkan_core.h>
@@ -529,7 +531,16 @@ static void load_portable_config()
     if (length == 0 || length >= MAX_PATH)
         return;
     std::wstring dir(module, length);
-    dir.resize(dir.find_last_of(L"\\/"));
+    // ASI delivery keeps its runtime in a companion d4r/ folder beside the ASI.
+    // DLL delivery stays self-relative.
+    const auto dot = dir.find_last_of(L'.');
+    if (dot != std::wstring::npos && _wcsicmp(dir.c_str() + dot, L".asi") == 0)
+    {
+        dir.resize(dir.find_last_of(L"\\/"));
+        dir += L"\\d4r";
+    }
+    else
+        dir.resize(dir.find_last_of(L"\\/"));
     g_portable.dir = dir; // also without d4r.ini: the default log goes here
     std::string text;
     if (!read_whole_file(dir + L"\\d4r.ini", text))
@@ -9457,6 +9468,77 @@ D4R_EXPORT NgxResult NVSDK_NGX_UpdateFeature(const void*, unsigned int)
 }
 
 #include "d4r_vulkan_frontend.inl"
+
+// Proxy filenames vary (dxgi.dll, winmm.dll, ...). Identify OptiScaler by its
+// PE export name rather than guessing from the EXE or plugin folder location.
+static std::wstring optiscaler_config_path()
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return {};
+    MODULEENTRY32W module = {};
+    module.dwSize = sizeof(module);
+    std::wstring result;
+    if (Module32FirstW(snapshot, &module)) do
+    {
+        const BYTE* base = module.modBaseAddr;
+        const size_t size = module.modBaseSize;
+        if (size < sizeof(IMAGE_NT_HEADERS64)) continue;
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+            static_cast<size_t>(dos->e_lfanew) > size - sizeof(IMAGE_NT_HEADERS64)) continue;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) continue;
+        const DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        if (!rva || rva > size - sizeof(IMAGE_EXPORT_DIRECTORY)) continue;
+        const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + rva);
+        if (exports->Name >= size) continue;
+        const char* name = reinterpret_cast<const char*>(base + exports->Name);
+        if (!std::memchr(name, 0, size - exports->Name) || _stricmp(name, "OptiScaler.dll") != 0) continue;
+        result = module.szExePath;
+        result.resize(result.find_last_of(L"\\/"));
+        result += L"\\OptiScaler.ini";
+        break;
+    } while (Module32NextW(snapshot, &module));
+    CloseHandle(snapshot);
+    return result;
+}
+
+// OptiScaler calls this after LoadLibrary returns, outside our DllMain.
+// Launch first-time setup in a separate native process; never do network/GPU
+// work under the loader lock. CUDA/NGX work remains lazy until NGX Init.
+// NvngxPath must name this ASI, so backend calls reuse this module's state.
+D4R_EXPORT void InitializeASI()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        wchar_t exe[MAX_PATH] = {}, plugin[MAX_PATH] = {};
+        if (!GetModuleFileNameW(nullptr, exe, MAX_PATH) ||
+            !GetModuleFileNameW(g_selfModule, plugin, MAX_PATH))
+            return;
+        if (!d4r_asi_game_process(exe)) return;
+        logf("InitializeASI: d4r ASI backend ready (GPU initialization deferred)");
+        if (env_uint("D4R_ASI_AUTOINSTALL", 1) == 0) return;
+        std::wstring game(exe);
+        game.resize(game.find_last_of(L"\\/"));
+        std::wstring pluginDir(plugin);
+        pluginDir.resize(pluginDir.find_last_of(L"\\/"));
+        const std::wstring helper = pluginDir + L"\\d4r\\d4r-setup.exe";
+        const std::wstring optiscalerConfig = optiscaler_config_path();
+        std::wstring command = L"\"" + helper + L"\" \"" + game + L"\" \"" + plugin + L"\" " +
+                               std::to_wstring(GetCurrentProcessId()) + L" \"" + optiscalerConfig + L"\"";
+        STARTUPINFOW startup = {};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process = {};
+        if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                           nullptr, game.c_str(), &startup, &process))
+        {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+        else
+            logf("InitializeASI: automatic setup could not start (%lu); extract the complete ASI archive", GetLastError());
+    });
+}
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {

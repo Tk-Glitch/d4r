@@ -4,6 +4,8 @@ Package tests use disposable runtime files and stand-ins for GPU kernel compilat
 Actual OptiScaler/Proton loading additionally needs the D3D12 harness.
 """
 import configparser
+import hashlib
+import itertools
 import os
 from pathlib import Path
 import shutil
@@ -89,7 +91,7 @@ class OptiScalerConfigTests(unittest.TestCase):
             inputs.mkdir()
             (repo / 'scripts').mkdir(parents=True)
             for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh',
-                         'check_redistributable.py'):
+                         'check_redistributable.py', 'private_d3d12_core.py'):
                 shutil.copy2(ROOT / 'scripts' / name, repo / 'scripts' / name)
             shutil.copytree(ROOT / 'packaging', repo / 'packaging')
             for name in ('LICENSE', 'NOTICE'):
@@ -116,16 +118,22 @@ class OptiScalerConfigTests(unittest.TestCase):
             subprocess.run(['cc', '-shared', '-x', 'c', '-o', str(elf), '-'],
                            input='int fixture(void) { return 0; }\n', text=True, check=True)
             fixture(repo / 'build/d4r_nvngx.dll')
+            fixture(repo / 'build/d4r-setup.exe')
             fixture(repo / 'build/wine-nvcuda/x86_64-unix/nvcuda.dll.so', elf.read_bytes())
             fixture(inputs / 'zluda/libnvcuda.so', elf.read_bytes())
             fixture(inputs / 'rocm/lib/libamdhip64.so.7', elf.read_bytes())
             fixture(inputs / 'rocm/licenses/runtime.txt')
             for name in ('d3d12.dll', 'd3d12core.dll'):
-                fixture(inputs / 'vkd3d' / name)
+                fixture(inputs / 'vkd3d' / name, b'MZ fixture d3d12core.dll\0 then d3d12core.dll\0' if name == 'd3d12.dll' else b'fixture')
             fixture(inputs / 'opti/OptiScaler.dll')
             fixture(inputs / 'opti/OptiScaler.ini', upstream_ini().replace('\n', '\r\n').encode())
             dlss = fixture(inputs / 'nvngx_dlss.dll')
             core = fixture(inputs / '_nvngx.dll')
+            installer = (ROOT / 'install.sh').read_text()
+            installer = '\n'.join('DLSS_SHA256=' + hashlib.sha256(dlss.read_bytes()).hexdigest()
+                                  if line.startswith('DLSS_SHA256=') else line
+                                  for line in installer.splitlines()) + '\n'
+            (repo / 'install.sh').write_text(installer)
             license_path = fixture(inputs / 'license.txt')
             for name in ('LICENSE-APACHE', 'LICENSE-MIT', 'ext/llvm-project/llvm/LICENSE.TXT', 'LICENSE', 'COPYING'):
                 fixture(inputs / 'source' / name)
@@ -153,19 +161,37 @@ class OptiScalerConfigTests(unittest.TestCase):
                          'direct_origins.bin', 'weights.bin', 'offsets.bin', 'lut.bin', 'hipnet.bin', 'model.json'):
                 fixture(inputs / 'engine' / name)
             env['D4R_BUNDLE_ENGINE'] = str(inputs / 'engine')
-            for bundled in ('1', '0'):
-                with self.subTest(bundled=bundled):
+            for mode, bundled in itertools.product(('proxy', 'asi'), ('1', '0', 'installer')):
+                with self.subTest(mode=mode, bundled=bundled):
                     env['D4R_BUNDLE_NVIDIA'] = bundled
+                    env['D4R_INSTALL_MODE'] = mode
+                    if mode == 'asi':
+                        env.pop('D4R_OPTISCALER', None)
                     result = subprocess.run(['bash', str(repo / 'scripts/package_release.sh'), str(repo / 'dist')],
                                             env=env, text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     name = f'd4r-{version}' + ('-nonvidia' if bundled == '0' else '')
+                    if mode == 'asi':
+                        name += '-asi'
                     with zipfile.ZipFile(repo / 'dist' / (name + '.zip')) as archive:
                         self.assertIsNone(archive.testzip())
-                        data = archive.read('OptiScaler.ini')
-                        self.assert_routing(data)
-                        configs.append(data)
-                        self.assertEqual(data, (repo / 'dist' / name / 'OptiScaler.ini').read_bytes())
+                        if mode == 'proxy':
+                            data = archive.read('OptiScaler.ini')
+                            self.assert_routing(data)
+                            configs.append(data)
+                            self.assertEqual(data, (repo / 'dist' / name / 'OptiScaler.ini').read_bytes())
+                        else:
+                            self.assertNotIn('OptiScaler.ini', archive.namelist())
+                            self.assertNotIn('dxgi.dll', archive.namelist())
+                            self.assertEqual(archive.read('d4r.asi'), archive.read('d4r/nvngx.dll'))
+                            self.assertIn('d4r/d4r-setup.exe', archive.namelist())
+                            self.assertEqual('d4r/install.sh' in archive.namelist(), bundled == 'installer')
+                            self.assertFalse(any(n.endswith('.py') for n in archive.namelist()))
+                            self.assertIn(b'ASI add-on', archive.read('d4r/README.txt'))
+                            self.assertEqual({n.split('/')[0] for n in archive.namelist()}, {'d4r.asi', 'd4r'})
+                            self.assertIn('d4r/d3d12.dll', archive.namelist())
+                            self.assertIn('d4r/d4r12core.dll', archive.namelist())
+                            self.assertNotIn('d4r/d3d12core.dll', archive.namelist())
                         self.assertIn('d4r/nvngx.dll', archive.namelist())
                         self.assertNotIn('nvngx.dll', archive.namelist())
                         self.assertNotIn('d4r/_nvngx.dll', archive.namelist())

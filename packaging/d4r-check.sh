@@ -1,20 +1,60 @@
 #!/bin/sh
 # Checks an d4r install: run it from the game folder (the one holding the game's .exe and d4r/),
 # or give that folder as the argument. It only reads files and prints what it finds.
-# usage: sh d4r/d4r-check.sh [GAME_FOLDER] [ROCM_DIR]
+# usage: sh plugins/d4r/d4r-check.sh GAME_FOLDER [ROCM_DIR] (or sh d4r/d4r-check.sh for proxy installs)
 GAME="${1:-.}"
 D4R="$GAME/d4r"
+INI="${D4R_OPTISCALER_INI:-$GAME/OptiScaler.ini}"
+script_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)
+if [ -z "${D4R_OPTISCALER_INI:-}" ] && [ ! -f "$INI" ] && [ "${script_dir##*/}" = d4r ]; then
+  loader_dir=$(cd "$script_dir/../.." 2>/dev/null && pwd -P)
+  [ ! -f "$loader_dir/OptiScaler.ini" ] || INI="$loader_dir/OptiScaler.ini"
+fi
+wine_file() {
+  windows_path=$(printf '%s' "$1" | tr '\\' '/')
+  case "$windows_path" in
+    [zZ]:*) printf '%s\n' "${windows_path#??}" ;;
+    [a-zA-Z]:*)
+      case "$INI" in
+        */drive_c/*)
+          prefix="${INI%/drive_c/*}"
+          drive=$(printf '%s' "${windows_path%%:*}" | tr '[:upper:]' '[:lower:]')
+          drive_root=$(readlink -f "$prefix/dosdevices/$drive:" 2>/dev/null)
+          if [ -n "$drive_root" ]; then printf '%s%s\n' "$drive_root" "${windows_path#??}"; else return 1; fi ;;
+        *) return 1 ;;
+      esac ;;
+    *) printf '%s/%s\n' "$GAME" "$windows_path" ;;
+  esac
+}
+problems=0
+ok() { printf '  ok       %s\n' "$1"; }
+bad() { printf '  MISSING  %s\n' "$1"; problems=$((problems + 1)); }
+note() { printf '  note     %s\n' "$1"; }
+misconfigured() { printf '  CONFIG   %s\n' "$1"; problems=$((problems + 1)); }
+ini_value() {
+  awk -v section="$1" -v key="$2" '
+    { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^\[/ { active = (tolower(line) == "[" section "]"); next }
+    active && tolower(line) ~ "^" key "[ \t]*=" {
+      count++; sub(/^[^=]*=[ \t]*/, "", line); value = line
+    }
+    END { if (count != 1) exit 1; print value }
+  ' "$INI"
+}
+nvngx_path=$(ini_value libraries nvngxpath 2>/dev/null) && unique_path=yes || unique_path=no
+normalized_path=$(printf '%s' "$nvngx_path" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+asi_backend=no
+case "$normalized_path" in */d4r.asi) asi_backend=yes ;; esac
+if [ "$asi_backend" = yes ]; then
+  asi_file=$(wine_file "$nvngx_path") || asi_file=
+  D4R="$(dirname "$asi_file")/d4r"
+fi
 # ROCm: the argument, else d4r.ini's RocmDir, else the bundled d4r/rocm, else D4R_ROCM_DIR, else /opt/rocm
 ini_rocm=$(sed -n 's/^[[:space:]]*RocmDir[[:space:]]*=[[:space:]]*\([^;#]*\).*/\1/p' "$D4R/d4r.ini" 2>/dev/null | tail -1 | sed 's/[[:space:]]*$//')
 [ "$ini_rocm" = auto ] && ini_rocm=
 case "$ini_rocm" in "~/"*) ini_rocm="$HOME/${ini_rocm#\~/}" ;; esac
 [ -z "$ini_rocm" ] && [ -d "$D4R/rocm/lib" ] && ini_rocm="$D4R/rocm"
 ROCM="${2:-${ini_rocm:-${D4R_ROCM_DIR:-/opt/rocm}}}"
-problems=0
-ok() { printf '  ok       %s\n' "$1"; }
-bad() { printf '  MISSING  %s\n' "$1"; problems=$((problems + 1)); }
-note() { printf '  note     %s\n' "$1"; }
-misconfigured() { printf '  CONFIG   %s\n' "$1"; problems=$((problems + 1)); }
 external_backend=$(awk '
   { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
   line ~ /^\[/ { dlss = (tolower(line) == "[dlss]"); next }
@@ -22,31 +62,55 @@ external_backend=$(awk '
     count++; sub(/^[^=]*=[ \t]*/, "", line); value = tolower(line)
   }
   END { if (count == 1 && value == "true") print "true" }
-' "$GAME/OptiScaler.ini" 2>/dev/null)
+' "$INI" 2>/dev/null)
 
 printf 'd4r install in %s\n' "$(cd "$GAME" 2>/dev/null && pwd || echo "$GAME")"
 [ -d "$D4R" ] || { printf 'no d4r folder here; run this from the folder with the game .exe\n'; exit 1; }
 ls "$GAME"/*.exe >/dev/null 2>&1 && ok "game executable next to d4r/" || note "no .exe next to d4r/ (it must be the game's main executable folder)"
-for f in dxgi.dll OptiScaler.ini d3d12.dll d3d12core.dll d4r/nvngx.dll d4r/nvcuda.dll d4r/zluda/libcuda.so d4r/d4r.ini; do
+if [ "$asi_backend" = yes ]; then
+  loader=no
+  loader_dir=$(dirname "$INI")
+  for folder in "$GAME" "$loader_dir"; do
+    for f in dxgi.dll winmm.dll version.dll winhttp.dll wininet.dll dbghelp.dll OptiScaler.dll; do
+      [ ! -f "$folder/$f" ] || { ok "$folder/$f (verify this is your existing OptiScaler loader)"; loader=yes; }
+    done
+  done
+  [ "$loader" = yes ] || bad 'OptiScaler proxy loader (dxgi.dll, winmm.dll, etc.; nvngx.dll mode does not load ASIs)'
+else
+  [ -f "$GAME/dxgi.dll" ] && ok dxgi.dll || bad 'dxgi.dll (re-extract the d4r zip)'
+fi
+[ -f "$INI" ] && ok "OptiScaler config: $INI" || bad "OptiScaler config: $INI"
+core_name=d3d12core.dll
+[ "$asi_backend" != yes ] || [ ! -f "$D4R/d4r12core.dll" ] || core_name=d4r12core.dll
+for f in d3d12.dll "$core_name"; do
   [ -f "$GAME/$f" ] && ok "$f" || bad "$f (re-extract the d4r zip)"
 done
+for f in nvcuda.dll zluda/libcuda.so d4r.ini; do
+  [ -f "$D4R/$f" ] && ok "$D4R/$f" || bad "$D4R/$f (re-extract the d4r zip)"
+done
+[ "$asi_backend" = yes ] || { [ -f "$GAME/d4r/nvngx.dll" ] && ok d4r/nvngx.dll || bad 'd4r/nvngx.dll (re-extract the d4r zip)'; }
 # File presence alone does not establish NGX routing: OptiDllPath=d4r can still
 # select system32/_nvngx.dll before d4r/nvngx.dll. Check the per-DLL override.
-if [ -f "$GAME/OptiScaler.ini" ]; then
-  nvngx_path=$(awk '
-    { sub(/\r$/, ""); line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
-    line ~ /^\[/ { libraries = (tolower(line) == "[libraries]"); next }
-    libraries && tolower(line) ~ /^nvngxpath[ \t]*=/ {
-      count++; sub(/^[^=]*=[ \t]*/, "", line); value = line
-    }
-    END { if (count != 1) exit 1; print value }
-  ' "$GAME/OptiScaler.ini") && unique_path=yes || unique_path=no
-  normalized_path=$(printf '%s' "$nvngx_path" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+if [ -f "$INI" ]; then
   # Also recognize an absolute Wine Z: path to this install's shim (as used
   # by developer launches); do not accept an arbitrary nvngx.dll elsewhere.
   game_path=$(cd "$GAME" 2>/dev/null && pwd -P)
   absolute_path=$(printf 'z:%s/d4r/nvngx.dll' "$game_path" | tr '[:upper:]' '[:lower:]')
-  if [ "$unique_path" = yes ] && { [ "$normalized_path" = 'd4r/nvngx.dll' ] ||
+  if [ "$asi_backend" = yes ]; then
+    plugins_path=$(ini_value plugins path 2>/dev/null) || plugins_path=auto
+    case "$plugins_path" in auto|'') plugins_path=plugins ;; esac
+    plugin_route=$(printf '%s/d4r.asi' "$plugins_path" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+    if [ "$unique_path" = yes ] && [ "$normalized_path" = "$plugin_route" ]; then
+      ok "OptiScaler NGX routing: NvngxPath=$nvngx_path (d4r ASI)"
+    else
+      misconfigured 'NvngxPath must select d4r.asi in the configured [Plugins] Path; relaunch to retry automatic setup'
+    fi
+    [ -f "$asi_file" ] && ok "ASI backend: $asi_file" || bad "ASI backend: $asi_file"
+    load_asi=$(ini_value plugins loadasiplugins 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [ "$load_asi" = true ] || misconfigured 'Set [Plugins] LoadAsiPlugins=true'
+    original_hook=$(ini_value hooks hookoriginalnvngxonly 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [ "$original_hook" = true ] || misconfigured 'Set [Hooks] HookOriginalNvngxOnly=true'
+  elif [ "$unique_path" = yes ] && { [ "$normalized_path" = 'd4r/nvngx.dll' ] ||
        [ "$normalized_path" = './d4r/nvngx.dll' ] || [ "$normalized_path" = "$absolute_path" ]; }; then
     ok "OptiScaler NGX routing: NvngxPath=$nvngx_path (d4r shim)"
     case "$normalized_path" in

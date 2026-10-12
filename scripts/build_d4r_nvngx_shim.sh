@@ -10,6 +10,9 @@ CLANG_CL="${CLANG_CL:-clang-cl}"
 VULKAN_INCLUDE="${VULKAN_INCLUDE:-/usr/include}"
 
 mkdir -p "$ROOT/build"
+# Native configuration helper, launched automatically by InitializeASI.
+"$MINGW_CXX" -std=c++20 -O2 -Wall -Wextra -Werror -static -municode \
+  "$ROOT/tools/d4r_asi_setup.cpp" -o "$ROOT/build/d4r-setup.exe"
 bash "$ROOT/scripts/build_vulkan_staging.sh"
 # Only the Vulkan headers from the host include tree, not its libc headers.
 mkdir -p "$ROOT/build/vulkan-include"
@@ -24,3 +27,5 @@ PARAM_OBJECT="$ROOT/build/d4r_ngx_param_msvc.obj"
   "$ROOT/engine/runtime.cpp" "$ROOT/engine/game.cpp" "$ROOT/engine/game_m.cpp" "$ROOT/engine/game_rr.cpp" "$ROOT/engine/vk_dispatch.cpp" \
   -Wl,--entry,d4r_dll_entry -o "$ROOT/build/d4r_nvngx.dll"
 printf 'Built %s\n' "$ROOT/build/d4r_nvngx.dll"
+cp "$ROOT/build/d4r_nvngx.dll" "$ROOT/build/d4r.asi"
+printf 'Built %s\n' "$ROOT/build/d4r.asi"

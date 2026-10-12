@@ -39,6 +39,10 @@ What you need
 
 Install
 -------
+For an existing game-local OptiScaler installation, the separate -asi.zip add-on
+uses its ASI loader and keeps its proxy DLL and unrelated INI settings. Follow
+that archive's d4r/README.txt: setup runs automatically when the ASI loads.
+
 1. Extract everything in this zip into the folder that holds the game's main .exe. For Unreal
    Engine games that is <game>/<Project>/Binaries/Win64/, next to <Project>-Win64-Shipping.exe.
    You get dxgi.dll, OptiScaler.ini, d3d12.dll, d3d12core.dll, this file and a d4r folder.

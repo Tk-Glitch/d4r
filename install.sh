@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release installer: copy this beside D4R_README.txt and the extracted d4r/ folder.
+# NVIDIA installer: beside the proxy release's d4r/ or inside the ASI's d4r/.
 set -euo pipefail
 DLSS_URL=https://raw.githubusercontent.com/NVIDIA/DLSS/a291cc7d2cc642a51566f3dfd5376f635cd1b284/lib/Windows_x86_64/rel/nvngx_dlss.dll
 DLSS_SHA256=be6e434a94ca32499515eb62ca0e6c274526055d568d0426e4c652dcdfb6ee6e
@@ -18,12 +18,14 @@ if [[ ${1:-} == --help || ${1:-} == -h ]]; then
 fi
 [[ $# -le 1 ]] || fail 'Usage: bash install.sh [extracted-release-directory]'
 ROOT=$(cd -- "${1:-$(dirname -- "${BASH_SOURCE[0]}")}" && pwd)
-[[ -f "$ROOT/d4r/nvngx.dll" && -f "$ROOT/d4r/d4r.ini" ]] || fail "Extract the release ZIP first; no d4r runtime found in $ROOT"
+RUNTIME="$ROOT/d4r"
+[[ ! -f "$ROOT/d4r.ini" ]] || RUNTIME="$ROOT"
+[[ -f "$RUNTIME/nvngx.dll" && -f "$RUNTIME/d4r.ini" ]] || fail "Extract the release ZIP first; no d4r runtime found in $ROOT"
 command -v sha256sum >/dev/null || fail 'Missing sha256sum (install coreutils).'
 valid() { [[ -f "$1" ]] && [[ $(sha256sum -- "$1" | cut -d' ' -f1) == "$2" ]]; }
 need_dlss=1; need_ngx=1
-valid "$ROOT/d4r/nvngx_dlss.dll" "$DLSS_SHA256" && need_dlss=0
-valid "$ROOT/d4r/ngx/_nvngx.dll" "$NGX_SHA256" && need_ngx=0
+valid "$RUNTIME/nvngx_dlss.dll" "$DLSS_SHA256" && need_dlss=0
+valid "$RUNTIME/ngx/_nvngx.dll" "$NGX_SHA256" && need_ngx=0
 if (( need_dlss == 0 && need_ngx == 0 )); then
   echo 'NVIDIA DLLs are already installed and verified.'
   exit 0
@@ -79,6 +81,6 @@ place() {
   STAGED=''
   printf 'Installed: %s\n' "$dst"
 }
-(( need_dlss == 0 )) || place "$TMP/nvngx_dlss.dll" "$ROOT/d4r/nvngx_dlss.dll"
-(( need_ngx == 0 )) || place "$TMP/ngx/_nvngx.dll" "$ROOT/d4r/ngx/_nvngx.dll"
-echo 'NVIDIA DLLs installed and verified. Follow D4R_README.txt for Steam launch options.'
+(( need_dlss == 0 )) || place "$TMP/nvngx_dlss.dll" "$RUNTIME/nvngx_dlss.dll"
+(( need_ngx == 0 )) || place "$TMP/ngx/_nvngx.dll" "$RUNTIME/ngx/_nvngx.dll"
+echo 'NVIDIA DLLs installed and verified. Follow the included README for Steam launch options.'

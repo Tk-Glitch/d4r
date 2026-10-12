@@ -126,6 +126,25 @@ When updating, replace `d3d12.dll` and `d3d12core.dll` together with `d4r/nvngx.
 
 ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubuntu 22.04 packages, which run under Steam's container runtime on any distribution). The downloaded NVIDIA files and the bundled kernels built from NVIDIA's code are not covered by this repository's license (see [NOTICE](NOTICE)). The Proton prefix and the system are not changed. [packaging/D4R_README.txt](packaging/D4R_README.txt) is the full guide that ships in the zip; `scripts/package_release.sh` builds the zip (see [docs/building.md](docs/building.md#7-package-a-release)).
 
+### Existing OptiScaler: ASI add-on
+
+The optional `d4r-<version>-asi.zip` contains only `d4r.asi` and a companion
+`d4r/` folder. Drop both into your existing OptiScaler plugin folder, then run
+`bash install.sh` inside that `d4r/` folder once for NVIDIA's DLLs. Keep the Steam
+launch options above and ensure `[Plugins] LoadAsiPlugins=true` is already enabled.
+
+On the first game launch, the ASI starts its native setup helper. Close the game
+at the setup message; the helper installs the D3D12 wrapper and private core beside the EXE
+and configures OptiScaler after the game exits, with backups. Launch again when
+the ready message appears. Unrelated settings, other plugins and the existing
+OptiScaler loader are preserved. The rest of the runtime stays beside the ASI
+in its companion folder. No Python or configuration command is needed.
+
+Use OptiScaler 0.9.4 through its game-local proxy or GE-Proton's built-in loader;
+setup finds the active loader's INI even when it lives in the prefix. OptiScaler's
+`nvngx.dll` mode does not load ASIs. See [the ASI installation guide](packaging/ASI_README.txt)
+for custom plugin paths, updating and removal. ASI loading still needs game testing.
+
 ## Requirements (building from source)
 
 - Linux with an AMD RDNA3 or RDNA4 GPU. The native kernels use gfx11 or gfx12 WMMA. `scripts/package_release.sh` builds network kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default; `D4R_GPU_ARCH` selects one target for a standalone `kernels/build.sh` invocation. Runtime support outside the RX 7700 XT remains unverified on hardware (see [GPU support](#gpu-support)).
