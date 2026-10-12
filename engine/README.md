@@ -620,6 +620,133 @@ but reduced it by 0.83 dB on the independent capture. All-explicit gains improve
 consistently, so no accuracy variant became the default. `--unfold-gains` remains available;
 the retained enc0 change preserves numerical behavior on this device.
 
+### Kernel-fusion attempts (2026-10-12)
+
+Two dispatch boundaries were examined for fusion. Neither reproduced a gain; both variants were discarded and
+the kernels are unchanged.
+
+**dec5 phase fusion (preset K).** `kernels/k/dltss_pwin_dec5_layer.hip` was rewritten as one kernel: each block
+owns one window and runs `phase_attn`, `phase_wo`, `phase_fc1` and `phase_fc2` in order with `block_sync()`
+between them, keeping every phase's per-unit math and summation order (single-unit `ub` launches). `hip_net.cpp`
+then takes its single-node path (`postCount == 0`), removing three dispatches per layer. The fused kernel
+compiles at 127 VGPRs, 31,232 bytes of LDS and occupancy 4, against 115 VGPRs / 31,232 LDS / occupancy 4 for the
+phase-split main kernel plus 48-93 VGPRs and **zero** LDS for each post kernel.
+
+Outputs were byte-identical to the baseline across three captured 720p frames (head, output and all three
+histories; only `timings.csv` differed). Three alternating baseline/candidate profiling runs, 25 frames per batch:
+
+| Run | Baseline whole-frame median | Fused whole-frame median |
+|---|---:|---:|
+| 1 | 513.7 us | 611.1 us |
+| 2 | 523.9 us | 612.2 us |
+| 3 | 527.5 us | 613.9 us |
+
+The fused kernel is about 90 us per frame **slower**: it holds the 31 KB window scratch across all four phases,
+so the whole layer runs at occupancy 4, while the post kernels run at higher occupancy with no LDS. The saved
+dispatches do not pay for the lost occupancy. It also runs only one block per window: dec5 has 4 windows at
+720p, so 4 blocks on 64 CUs - the idleness the phase split exists to avoid (`pwin_phase.h`).
+
+A second variant fixed the parallelism: a grid-stride fused kernel on a fixed 96-block grid (the baseline's
+phase grids), keeping the baseline's unit -> block assignment exactly, with a software grid barrier (arrival
+counter plus generation flip, `__threadfence` around it) where the dispatch boundaries were. `hip_net.cpp`
+honors a kernel's declared `d4r_grid_x` in its single-node path. Outputs were again byte-identical over three
+captured frames. Three alternating runs, 25 frames per batch: baseline 529.8 / 530.6 / 528.3 us, fused 519.3 /
+532.2 / 525.4 us - no reproducible gain, and the first frame costs 9.9 ms instead of 0.97 ms (the barrier spins
+until every block is resident). Both variants discarded; the phase-split kernel is retained.
+
+**Exposure fold into `enc0_m.comp` (preset M).** Folding the two `cuda_dldn_engine_*` reduction passes into the
+input stage would remove two dispatches and the `expSums` round-trip, but the reduction must finish before any
+token is embedded: the fold needs a grid-wide barrier over the input stage's whole block grid (3726 blocks at
+720p). Vulkan exposes no cooperative dispatch on this device (no grid-sync extension; `maxComputeWorkGroupInvocations`
+is 1024), so the fold is not implementable in the engine's own stages. The measured cost it would save is small
+anyway: on the captured 640x360 -> 1280x720 sequence (`d4r-m`, 10 repeats, Vulkan network) the exposure stage
+medians 6.3 us against 26.9 us input, 598.6 us network, 21.4 us expansion, 83.0 us reconstruction and 22.6 us
+downsample. Not attempted.
+
+**Inter-layer barriers in the M network loop (2026-10-12).** The ten layer dispatches in `runtime_m.inc` were
+separated by a full `vkCmdPipelineBarrier` with a global `memoryBarrier` flush. Only dispatch serialization is
+required there: each layer's cross-block traffic goes through its own buffers, and the preceding stage's flush
+already published them. Replacing the layer-loop barrier with an empty pipeline barrier (compute→compute, no
+memory barriers) kept every stage byte-identical to the captured launches - `test_m.py --chain` reports 10/10
+layers `identical 100.0%`, `test_frame_m.py` reports inf dB, and 8- and 16-frame Balanced outputs matched the
+HEAD outputs byte-for-byte - while removing the flush cost: network median 1863.0 → 1765.6 µs, whole-frame
+median 2515.0 → 2404.6 µs at 1488×837 → 2560×1440 (Quality 3818.9 → 3782.3, Performance 1892.6 → 1829.8, both
+byte-identical). Removing the barriers entirely breaks frames 0-3; the full flush is retained at the
+front→network, expand→post, post→down and exposure sites, where empty barriers measured within noise.
+
+**Register-only half rounding in `layer_m.comp` (2026-10-12).** Replacing the LDS round-trip (`shared f16vec4
+RS[128 * 2]` plus `subgroupMemoryBarrierShared`) with `roundHalfValue`'s integer bit arithmetic is byte-identical
+in the standalone chain test (10/10 layers 100.0%) and neutral there, but pathological in-engine: network median
+5658-5684 µs against 1798.8 µs for the HEAD shaders in the same package/runtime, across every layer (per-layer
+skip deltas confirm the regression is uniform). The per-component rounding chain between dependent `K32H`
+accumulators defeats latency hiding at Balanced wave counts; a branchless variant measured 4990 µs. The LDS
+round-trip is the fast form and is retained. Rounding itself costs about 95 µs network-wide (NO_ROUND floor
+1689-1711 µs); gelu about 10 µs; attention about 55 µs of enc1/dec1.
+
+**Dead levers (2026-10-12).** At Balanced the compact reconstruction tier is already eligible and selected;
+forcing post/quality/compact measured 321.3/340.7/325.6 µs - within noise. Weight traffic is cache-hot: global
+versus LDS `coopMatLoad` measured neutral (249.8 vs 272.6 µs/dispatch). gfx1201 coopmat exposes only M16 N16 K16
+(no K32), and RADV offers no VGPR-cap knob; enc1/enc2 sit at 192 VGPRs (2 workgroups/CU) with zero spills.
+
+**Paired LDS fences in `layer_m.comp` (2026-10-12).** Batching two independent `K32H` chains into one
+`subgroupMemoryBarrierShared` (`K32HP`/`R16P` over a `RS[128 * 4]` scratch) is byte-identical (chain test 10/10
+100.0%) and halves the fence count, but it keeps both accumulators live across the fence: enc1/dec1 rise from
+192 to 240 VGPRs, dropping to 2 workgroups/CU with worse scheduling - network median 1869.4 µs against 1765.6
+for the unpaired form. Register pressure dominates fence count on this device; the unpaired macros are retained.
+
+**Other `layer_m.comp` probes (2026-10-12), all discarded.** Rounding through `coopMatStore`/`coopMatLoad` on an
+f16 LDS tile is not byte-identical (enc1 98.0%, tubes 12-33% identical): the HAC round trip does not reproduce the
+f32->f16->f32 rounding, so the scalar `RS` scratch is required. Staging `h1` through wave-private LDS to free its
+tiles across attention/MLP is byte-identical but raises enc1/dec1 to 240-256 VGPRs (RADV keeps the reloaded tiles
+live plus the addressing) - 1892.3 µs. Splitting the attention loop into a q phase and a v phase, shortening the
+`QV_G` weight-tile live ranges, and staging `v` through `VSH` right after the QV loop are each byte-identical and
+leave enc1 at 192 VGPRs; all measured 1781-1807 µs, within noise of the 1765-1797 µs baseline. enc1/dec1 stay at
+192 VGPRs (2 workgroups/CU) under every restructuring tried; the matmul-only floor (rounding, gelu and attention
+removed) is about 1625 µs network, so no byte-identical engine restructuring reaches a 30% whole-frame gain.
+
+**Non-network stage probes (2026-10-12), all discarded.** Staging the input stage's 10x10 depth/motion
+neighbourhood into LDS (`enc0_m.comp` + `enc0_features.glsl` accessors) is byte-identical (tokens and all three
+motion surfaces 100.0%) but slower: the twelve `texelFetch`es per pixel were already cache-hot, and the extra
+barrier plus the LDS round-trip cost more than they saved - input stage 144.6-150.1 us against 124.5. Splitting
+`enc0_m.comp`'s four independent K32 chains into two sequential passes (two accumulators live at a time) is
+byte-identical and leaves the stage at 240 VGPRs; input 122.0-124.8 us, within noise. Padding the reconstruction's
+shared render-texel tile rows (`TSTRIDE = TILE_W + 2` in `post_m.comp`, addressing only) is byte-identical
+(history and packed output 100.0%) at 322.0-323.7 us against 324.5 - noise. The stages' texture traffic is
+already coherent; none of these stages has a byte-identical restructuring that measures.
+
+**Intra-frame barrier relaxation (2026-10-12), discarded.** Replacing the `nextStage` flushes at the exposure,
+input-stage, expansion and reconstruction sites with empty pipeline barriers is byte-identical (8-frame outputs
+match) and shrinks the measured stage spans (exposure 16.6, input 120.5, reconstruction 323.1), but the whole-frame
+median is unchanged (2431.8 against 2431.7): dispatch pipelining already hides those flushes; only the ten
+layer-loop barriers cost. The full flushes are retained.
+
+**`colSum` subgroup shuffle in `post_m.comp` (2026-10-12), discarded.** The half-resolution mean's neighbour-column
+sum can come from `subgroupShuffleXor` instead of the `colSum` LDS round-trip plus barrier (the reference itself
+uses a `shfl.sync.bfly` there). Byte-identical (8- and 16-frame outputs match, post stage test 100.0%), but eight
+GPU-locked alternating runs against the retained build measure 2446.6 against 2442.8 us whole-frame median - within
+noise. The LDS round-trip is retained.
+
+**Downsample block height and expansion LDS stride (2026-10-12), discarded.** Halving `down_m.comp`'s `BLOCK_Y`
+(64 -> 32, with the matching dispatch grid) is byte-identical (8-frame outputs match) but measures 2441.7 against
+2436.0 us whole-frame median over eight GPU-locked alternating runs - the smaller tile halves the LDS per workgroup
+but doubles the workgroup count and the tile-fill redundancy. Padding the expansion's `EO` row stride (22 -> 24 in
+`dec0_m.comp`) to cut LDS bank conflicts in the K32 rounding round-trip is byte-identical (8-frame outputs match)
+at 2448.8 against 2438.9 us - noise. Both reverted.
+
+**Rounding-free ceiling (2026-10-12).** Six GPU-locked alternating runs of the NO_ROUND model (per-K32 binary16
+rounding removed - the most aggressive engine-only change, and one that *breaks* byte-identity) measure network
+1629-1654 us and whole-frame 2267-2290 us against the banked build's 2437-2470 us: a 7.0% whole-frame gain. Even
+abandoning the captured-launch accuracy reference entirely, no engine-only path reaches 30%; the frame is bounded
+by the matmul itself.
+
+**Cross-frame pipelining (2026-10-12), not implemented.** The frame dependency chain is `enc0 -> network ->
+expansion -> post -> downsample`, and the next frame's `enc0` reads the `half`/`feat`/`mvA` surfaces the current
+frame's `post`/`expansion` write, so only the downsample tail (93 us at Balanced) could hide behind the next
+frame's front and network - 3.8% at best, and unsafe as recorded: `down_m.comp` reads the current frame's colour
+texture alpha, which the next frame's input upload overwrites before the pipelined dispatch would run. Hiding
+every non-network stage behind the network (the 652 us stage budget, 26.8%) is arithmetically blocked by the same
+chain and would in any case compete with the compute-bound network for the same CUs.
+
 ## Dynamic input resolution (K, L and M)
 
 The engine accepts changing render subrect dimensions with a fixed output size. K keeps its output-sized

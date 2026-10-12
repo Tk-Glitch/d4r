@@ -434,6 +434,7 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
 }
 namespace {
 const auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+void emptyStage(VkCommandBuffer cb) { vkCmdPipelineBarrier(cb, compute, compute, 0, 0, nullptr, 0, nullptr, 0, nullptr); }
 void nextStage(VkCommandBuffer cb) { memoryBarrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
 void openStages(VkCommandBuffer cb) {
     memoryBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, compute | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -508,7 +509,7 @@ void MEngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
     recordFront(cb, stamps, first);
     for (unsigned l = 0; l < MLayers; ++l) {
         const uint32_t w = e.gw / 2 / MScale[l], h = e.gh / 2 / MScale[l];
-        dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); nextStage(cb);
+        dispatch(cb, m.network[l], e.layerSets[l], (w + (MShift[l] ^ ((e.frame & 1u) * 2u)) + 7) / 8, (h + MShift[l] + 7) / 8); emptyStage(cb);
     }
     recordBack(cb, stamps, stamps ? first + 3 : 0);
 }

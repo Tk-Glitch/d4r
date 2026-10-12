@@ -3,6 +3,8 @@
 // gfx1201, and so is the packHalf2x16 round-trip (which is round-toward-zero anyway): the rounding only happens
 // once the binary16 value lands in binary16 memory. Scalar f32 -> f16 -> f32 casts are folded the same way,
 // notably for filtered recurrent features, hence the integer helper below.
+#ifndef D4R_ROUND_HALF_GL
+#define D4R_ROUND_HALF_GL
 // Cooperative matrices are composites of implementation-dependent components: every invocation owns and may
 // subscript a fixed number of them (length(), 8 for a 16x16 subgroup-scope accumulator on a 32-lane wave).
 float roundHalfValue(float v) {
@@ -40,3 +42,5 @@ vec4 roundHalfValue(vec4 v) {
         (m)[rh_i_] = float(storage[gl_LocalInvocationID.x * 8u + uint(rh_i_)]); \
     subgroupMemoryBarrierShared(); \
 }
+
+#endif

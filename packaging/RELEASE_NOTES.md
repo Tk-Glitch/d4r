@@ -88,6 +88,7 @@ This release adds an optional accuracy mode and fixes the GLIBC compatibility fa
 - **More useful failure logs.** Rejected input/output formats and dimensions are now recorded even after startup, with repeated errors rate-limited. Output-wait CPU and wall time are reported separately, and GPU timing queries are deferred until asynchronous work finishes.
 - **More conservative accuracy texture builds.** Strict surface conversions use separate helper functions, avoiding a compiler failure when the original denormal handling is retained.
 - **Accuracy build safeguards.** The builder refuses to label a directory containing older fast binaries as an accuracy set. Configuration tests cover every release target, missing-set fallback, invalid markers, environment precedence, and the default-off behavior.
+- **Preset M network dispatch barriers.** The ten layer dispatches no longer flush global memory between layers; an empty pipeline barrier keeps the serialization the layers actually need. Captured-frame replays stayed byte-identical at every stage. On an RX 9070 XT at Balanced (1488×837 → 2560×1440) the network median dropped 1863.0 → 1765.6 µs and the whole frame 2515.0 → 2404.6 µs; Quality and Performance improved 36.6 and 62.8 µs with byte-identical outputs.
 
 ## Also included from 0.1.2
 
