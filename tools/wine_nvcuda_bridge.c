@@ -1466,7 +1466,6 @@ static const char* find_function_name(CUfunction function)
     pthread_mutex_unlock(&instrumentation_lock);
     return name;
 }
-
 /* Opt-in per-kernel GPU elapsed time. Event pairs are recorded on the same
    stream as each launch, then read only after an existing context sync. This
    adds profiling overhead and must never be used as the FPS baseline. */
@@ -1756,12 +1755,25 @@ static void summarize_launch(unsigned int sequence, CUfunction function_handle, 
     if (extra == NULL || (uintptr_t)extra[0] != 1 || extra[1] == NULL ||
         (uintptr_t)extra[2] != 2 || extra[3] == NULL)
         return;
+    /* D4R_CUDA_LAUNCH_STATS_FILTER restricts the summarise/dump to kernels whose
+       name contains it, before the synchronize, so iterating on one kernel does
+       not pay for, or write, the rest of the frame. */
+    static char stats_filter[128];
+    static int stats_filter_ready;
+    if (!stats_filter_ready)
+    {
+        const char* value = getenv("D4R_CUDA_LAUNCH_STATS_FILTER");
+        snprintf(stats_filter, sizeof(stats_filter), "%s", value != NULL ? value : "");
+        stats_filter_ready = 1;
+    }
+    const char* kernel = find_function_name(function_handle);
+    if (stats_filter[0] != '\0' && strstr(kernel, stats_filter) == NULL)
+        return;
     CUCTX_SYNCHRONIZE_FN synchronize = (CUCTX_SYNCHRONIZE_FN)find_zluda_symbol("cuCtxSynchronize");
     CUMEMCPYDTOH_FN copy_to_host = (CUMEMCPYDTOH_FN)find_zluda_symbol("cuMemcpyDtoH_v2");
     if (synchronize == NULL || copy_to_host == NULL)
         return;
     const CUresult sync_result = synchronize();
-    const char* kernel = find_function_name(function_handle);
     tracef("launch[%u] %s synchronize result=%d", sequence, kernel, sync_result);
     const unsigned char* arguments = (const unsigned char*)extra[1];
     const size_t argument_bytes = *(const size_t*)extra[3];
@@ -2261,11 +2273,18 @@ CUresult WINAPI cuDeviceGetLuid(char* luid, unsigned int* device_node_mask, CUde
     if (function == NULL)
         return missing("cuDeviceGetLuid");
     CUresult result = function(luid, device_node_mask, device);
-    if (result == CUDA_SUCCESS && luid != NULL && device_node_mask != NULL)
+    if ((result == CUDA_SUCCESS || result == CUDA_ERROR_NOT_SUPPORTED) &&
+        luid != NULL && device_node_mask != NULL)
     {
         unsigned int low = get_process_u32("D4R_CUDA_LUID_LOW", 0xffffffffu);
         unsigned int high = get_process_u32("D4R_CUDA_LUID_HIGH", 0xffffffffu);
         unsigned int node_mask = get_process_u32("D4R_CUDA_NODE_MASK", 0xffffffffu);
+        // Linux NVIDIA cannot report a Windows LUID. The shim supplies the actual
+        // D3D12 adapter mapping; only a complete mapping can replace NOT_SUPPORTED.
+        if (result == CUDA_ERROR_NOT_SUPPORTED &&
+            (low == 0xffffffffu || high == 0xffffffffu || node_mask == 0xffffffffu))
+            return result;
+        result = CUDA_SUCCESS;
         if (low != 0xffffffffu)
             memcpy(luid, &low, sizeof(low));
         if (high != 0xffffffffu)
@@ -2776,8 +2795,9 @@ CUresult WINAPI cuSurfObjectCreate(CUsurfObject* object, const void* descriptor)
         if (redirected && (result = write_redirect_tail(*object, pointer, pitch, 0)) != CUDA_SUCCESS)
             cuSurfObjectDestroy(*object);
     }
-    TRACE_CALL(result, "cuSurfObjectCreate descriptor=%p result=%d object=0x%llx", descriptor, result,
-           (unsigned long long)(object != NULL ? *object : 0));
+    TRACE_CALL(result, "cuSurfObjectCreate descriptor=%p array=%p result=%d object=0x%llx", descriptor,
+               result == CUDA_SUCCESS && object != NULL ? (void*)find_surface_array(*object) : NULL, result,
+               (unsigned long long)(object != NULL ? *object : 0));
     return result;
 }
 
