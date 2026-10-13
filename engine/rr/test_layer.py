@@ -34,11 +34,11 @@ from rr_capture import Capture  # noqa: E402
 SURFACE_FORMATS = {'rgba16f': (4, 16), 'rg16f': (2, 16), 'r16f': (1, 16), 'rgba8_snorm': (4, 9), 'rgba8': (4, 8)}
 
 
-def stage_params(launch):
+def stage_params(launch, weights_arg=40):
     args = bytearray(launch.args)
     arena = launch.arena_alloc
     for p in launch.pointers:
-        value = p.delta if p.alloc == arena and p.offset != 40 else 0
+        value = p.delta if p.alloc == arena and p.offset != weights_arg else 0
         struct.pack_into('<Q', args, p.offset, value)
     # texture and surface handles: 1 where NGX bound one (the kernels test optional inputs' handles for null, e.g.
     # enc0's specular hit distance at argument 248), 0 elsewhere
@@ -117,6 +117,7 @@ def main():
     ap.add_argument('--time', type=int, default=1)
     ap.add_argument('--subgroup', type=int, default=32)
     ap.add_argument('--weights', help='bind this file at binding 1 instead of NGX\'s weight image (native stages)')
+    ap.add_argument('--weights-arg', type=int, default=40, help='argument offset of the weight pointer (rr2_*: 24)')
     ap.add_argument('--grid', help='X,Y workgroups (default: the launch grid)')
     ap.add_argument('--ignore', action='append', default=[], metavar='SURFACE:CHANNEL',
                     help='leave a channel out of the comparison, e.g. 112:3 for a value NVIDIA stores from an '
@@ -130,10 +131,10 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     print(f'{launch.kernel} (launch {launch.sequence}, grid {launch.grid}, block {launch.block})')
 
-    (work / 'params.bin').write_bytes(stage_params(launch))
-    (work / 'weights.bin').write_bytes(Path(o.weights).read_bytes() if o.weights else launch.weights)
+    (work / 'params.bin').write_bytes(stage_params(launch, o.weights_arg))
+    (work / 'weights.bin').write_bytes(Path(o.weights).read_bytes() if o.weights else launch.weights_at(o.weights_arg))
     arena = launch.arena_alloc
-    arena_before = launch.pre(arena)
+    arena_before = launch.pre(arena) if arena is not None else bytes(16)
     (work / 'arena.bin').write_bytes(arena_before)
     gx, gy = (int(v) for v in o.grid.split(',')) if o.grid else launch.grid[:2]
     lines = [f'param {work}/params.bin', f'grid {gx} {gy}']
@@ -162,16 +163,24 @@ def main():
     n_images = len(order)
     lines.append(f'lut {work}/weights.bin')
     lines.append(f'inout {work}/arena.bin {work}/arena.out.bin')
+    # further buffers of the stage (ptx2rr.py --buffer), bound after the surfaces
+    extra = info.get('buffers', []) if sidecar.exists() else []
+    for off in extra:
+        present = any(p.offset == off for p in launch.pointers)   # NGX may leave the pointer null
+        (work / f'buf{off}.bin').write_bytes(launch.pre(launch.pointer(off).alloc) if present else bytes(16))
+        lines.append(f'inout {work}/buf{off}.bin {work}/buf{off}.out.bin')
     probes = info.get('probes', []) if sidecar.exists() else []
     oob = info.get('oob', False) if sidecar.exists() else False
     if probes:   # ptx2rr.py --probe: the debug buffer after the surfaces
-        threads = launch.block[0] * launch.block[1] * launch.block[2]
+        # D4R_PROBE_THREADS: the shader's workgroup size when it is not the launch's block (the hybrid stages)
+        threads = int(os.environ.get('D4R_PROBE_THREADS', launch.block[0] * launch.block[1] * launch.block[2]))
         lines.append(f'outbuf {work}/debug.bin {4 * threads * len(probes)}')
     elif oob:    # ptx2rr.py --oob-report: count, lowest and highest address per buffer
         (work / 'oob.init').write_bytes(struct.pack('<9I', *([0, 0xffffffff, 0] * 3)))
         lines.append(f'inout {work}/oob.init {work}/oob.bin')
     lines.append('bindings 0 ' + ' '.join(str(3 + i) for i in range(n_images)) + ' 1 2' +
-                 (f' {3 + n_images}' if probes or oob else ''))
+                 ''.join(f' {3 + n_images + i}' for i in range(len(extra))) +
+                 (f' {3 + n_images + len(extra)}' if probes or oob else ''))
     (work / 'manifest').write_text('\n'.join(lines) + '\n')
     r = subprocess.run([o.kvk, o.shader, str(work / 'manifest'), str(o.time), str(o.subgroup)],
                        capture_output=True, text=True)
@@ -194,6 +203,13 @@ def main():
     if arena is not None:
         identical &= compare_arena((work / 'arena.out.bin').read_bytes(), arena_before,
                                    launch.post_buffer(cap, arena))
+    for off in extra:
+        if not any(p.offset == off for p in launch.pointers):
+            continue
+        got, ref = (work / f'buf{off}.out.bin').read_bytes(), launch.post_buffer(cap, launch.pointer(off).alloc)
+        same = got[:len(ref)] == ref
+        print(f'  buffer {off}: {len(ref)} bytes, ' + ('identical' if same else f'{sum(x != y for x, y in zip(got, ref))} differ'))
+        identical &= same
     if oob:
         r = struct.unpack('<9I', (work / 'oob.bin').read_bytes()[:36])
         for k, name in enumerate(('weight reads', 'arena reads', 'arena writes')):

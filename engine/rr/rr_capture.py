@@ -70,16 +70,20 @@ class Launch:
     def image(self, offset):
         return next(i for i in self.images if i.offset == offset)
 
+    def weights_at(self, offset):
+        """the weight image (the pointer at argument OFFSET) as NGX uploaded it; 16 zero bytes for a stage without one"""
+        pointer = next((p for p in self.pointers if p.offset == offset), None)
+        return self.pre(pointer.alloc) if pointer is not None else bytes(16)
+
     @property
     def weights(self):
-        """the weight image (argument 40) as NGX uploaded it; 16 zero bytes for a stage without one (the output stage)"""
-        pointer = next((p for p in self.pointers if p.offset == 40), None)
-        return self.pre(pointer.alloc) if pointer is not None else bytes(16)
+        """the DLSS-D kernels' weight image (argument 40)"""
+        return self.weights_at(40)
 
     @property
     def arena_alloc(self):
         """the plane arena: the allocation every arena pointer of the layer points into"""
-        candidates = [p.alloc for p in self.pointers if p.offset != 40]
+        candidates = [p.alloc for p in self.pointers]
         return max(set(candidates), key=lambda a: self.allocs[a][1]) if candidates else None
 
     def post_buffer(self, capture, alloc):

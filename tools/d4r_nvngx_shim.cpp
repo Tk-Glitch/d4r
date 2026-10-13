@@ -612,10 +612,12 @@ static void load_portable_config()
             portable_set("D4R_RR_PRESET", "4");
         else if (upper == "E")
             portable_set("D4R_RR_PRESET", "5");
-        else if (upper == "0" || upper == "4" || upper == "5")
+        else if (upper == "F")   // DLSS 4.5 Ray Reconstruction: nvngx_dlssd.dll 310.9 or later
+            portable_set("D4R_RR_PRESET", "6");
+        else if (upper == "0" || upper == "4" || upper == "5" || upper == "6")
             portable_set("D4R_RR_PRESET", upper);
         else
-            g_portable.notes.push_back("d4r.ini: [RayReconstruction] Model must be auto, default, D or E, not '" +
+            g_portable.notes.push_back("d4r.ini: [RayReconstruction] Model must be auto, default, D, E or F, not '" +
                                        rrModel + "'; leaving the model to the game");
     }
 
@@ -1344,9 +1346,17 @@ struct Global
     DenoiserProbe denoiser;
     bool denoiserAttempted = false;
     std::wstring denoiserPath;
+    // nvngx_dlssd.dll's file version (major, minor, build, revision); all zero when it has no version resource
+    unsigned denoiserVersion[4] = {};
 };
 
 static Global g;
+
+// nvngx_dlssd.dll 310.9 and newer hold preset F (DLSS 4.5 Ray Reconstruction); unknown versions count as without.
+static bool denoiser_has_preset_f()
+{
+    return g.denoiserVersion[0] > 310 || (g.denoiserVersion[0] == 310 && g.denoiserVersion[1] >= 9);
+}
 static std::mutex g_featureApiMutex;
 
 template <typename Function> static bool load_export(HMODULE module, const char* name, Function& function)
@@ -1608,6 +1618,35 @@ static bool load_denoiser_library()
     logf("found the DLSS-Denoiser library %ls (mapped as %ls): %s", g.denoiserPath.c_str(), mapped,
          g.denoiser.cudaCapable ? "CUDA entry points present"
                                 : "no CUDA entry points - not a CUDA-capable denoiser build");
+    // The file version, from the module's version resource (VS_FIXEDFILEINFO follows its signature 0xFEEF04BD).
+    // Preset F (DLSS 4.5, the rr2_* kernels) exists from 310.9 on: an older library runs preset D for that hint.
+    if (HRSRC found = FindResourceW(g.denoiserModule, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16)))
+    {
+        const DWORD size = SizeofResource(g.denoiserModule, found);
+        HGLOBAL loaded = LoadResource(g.denoiserModule, found);
+        const unsigned char* bytes = loaded != nullptr ? static_cast<const unsigned char*>(LockResource(loaded)) : nullptr;
+        for (DWORD at = 0; bytes != nullptr && at + 16 <= size; at += 4)
+        {
+            uint32_t words[4];
+            std::memcpy(words, bytes + at, sizeof(words));
+            if (words[0] != 0xFEEF04BDu)
+                continue;
+            g.denoiserVersion[0] = words[2] >> 16;
+            g.denoiserVersion[1] = words[2] & 0xffffu;
+            g.denoiserVersion[2] = words[3] >> 16;
+            g.denoiserVersion[3] = words[3] & 0xffffu;
+            break;
+        }
+    }
+    if (g.denoiserVersion[0] == 0)
+        logf("Ray Reconstruction: the DLSS-Denoiser library has no file version; whether its CUDA path has preset F "
+             "(DLSS 4.5, 310.9 or newer) is unknown");
+    else
+        logf("Ray Reconstruction: DLSS-Denoiser library version %u.%u.%u.%u: its CUDA path %s", g.denoiserVersion[0],
+             g.denoiserVersion[1], g.denoiserVersion[2], g.denoiserVersion[3],
+             denoiser_has_preset_f() ? "has preset F (DLSS 4.5)"
+                                     : "has NO preset F (DLSS 4.5 needs 310.9 or newer) - preset F is shown only by "
+                                       "frames the engine serves; frames the CUDA backend serves show preset D");
     return g.denoiser.cudaCapable;
 }
 
@@ -2561,6 +2600,7 @@ struct Feature
     double engineNetWaitEmaUs = 0.0; // worker only: smoothed launch-to-completion wait, for adaptive polling
     void* engineNet = nullptr;
     bool engineRefused = false;
+    bool rrCompileWarned = false; // the "CUDA backend has no preset F" warning was logged for the compile frames
     float engineJitter[2] = {0, 0}; // of the previous engine frame
     // Serializes picking the slot to present (game thread) against picking
     // the slot to overwrite (worker).
@@ -8248,54 +8288,62 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     return true;
 }
 
-// Ray Reconstruction models (engine/compile_rr.py): one per preset, engine\rr-d and engine\rr-e next to this DLL, or
-// D4R_ENGINE_MODEL_RR_D_DIR / D4R_ENGINE_MODEL_RR_E_DIR.
+// Ray Reconstruction models (engine/compile_rr.py; preset F: engine/compile_rr2.py): one per preset, engine\rr-d,
+// engine\rr-e and engine\rr-f next to this DLL, or D4R_ENGINE_MODEL_RR_D_DIR / _E_DIR / _F_DIR. Slots: 0 D, 1 E, 2 F.
 struct EngineBackendR
 {
     // The model's pipelines take minutes to compile on a cold shader cache, so each preset's model loads on a thread
     // of its own; until it is ready the CUDA backend serves the frames. state: 0 not started, 1 loading, 2 ready,
     // 3 failed.
-    std::once_flag once[2];                          // [preset E]
-    std::atomic<int> state[2] = {};
-    std::unique_ptr<d4r::RModel> models[2];
+    std::once_flag once[3];
+    std::atomic<int> state[3] = {};
+    std::unique_ptr<d4r::RModel> models[3];
 };
 static EngineBackendR g_engineR;
 
-static void init_engine_backend_rr(bool presetE)
+static const char g_rrLetter[3] = {'D', 'E', 'F'};
+static const uint32_t g_rrPreset[3] = {4, 5, 6};
+static std::string rr_model_directory(int slot)
 {
-    std::string directory = env_string(presetE ? "D4R_ENGINE_MODEL_RR_E_DIR" : "D4R_ENGINE_MODEL_RR_D_DIR");
+    static const char* const variables[3] = {"D4R_ENGINE_MODEL_RR_D_DIR", "D4R_ENGINE_MODEL_RR_E_DIR", "D4R_ENGINE_MODEL_RR_F_DIR"};
+    static const wchar_t* const folders[3] = {L"\\engine\\rr-d", L"\\engine\\rr-e", L"\\engine\\rr-f"};
+    std::string directory = env_string(variables[slot]);
     if (directory.empty())
     {
         char folder[MAX_PATH * 3] = {};
-        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + (presetE ? L"\\engine\\rr-e" : L"\\engine\\rr-d")).c_str(), -1,
-                            folder, sizeof(folder), nullptr, nullptr);
+        WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + folders[slot]).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
     }
+    return directory[0] == '/' ? "Z:" + directory : directory;
+}
+
+static void init_engine_backend_rr(int slot)
+{
+    const std::string path = rr_model_directory(slot);
     if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
     {
         logf("engine backend (Ray Reconstruction): Vulkan interop is unavailable");
-        g_engineR.state[presetE] = 3;
+        g_engineR.state[slot] = 3;
         return;
     }
-    const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
     logf("engine backend (Ray Reconstruction %c): loading the model from %s and compiling its pipelines; the CUDA "
-         "backend serves frames until it is ready", presetE ? 'E' : 'D', path.c_str());
+         "backend serves frames until it is ready", g_rrLetter[slot], path.c_str());
     const auto start = std::chrono::steady_clock::now();
     try
     {
         auto model = std::make_unique<d4r::RModel>(g_vk.physical, g_vk.device, path);
-        if (model->preset() != (presetE ? 5u : 4u))
-            throw std::runtime_error(presetE ? "the directory holds a preset D model" : "the directory holds a preset E model");
-        g_engineR.models[presetE] = std::move(model);
+        if (model->preset() != g_rrPreset[slot])
+            throw std::runtime_error("the directory holds a model of another preset");
+        g_engineR.models[slot] = std::move(model);
     }
     catch (const std::exception& error)
     {
         logf("engine backend (Ray Reconstruction): cannot load the model from %s: %s", path.c_str(), error.what());
-        g_engineR.state[presetE] = 3;
+        g_engineR.state[slot] = 3;
         return;
     }
-    g_engineR.state[presetE] = 2;
-    logf("engine backend (Ray Reconstruction %c): model %s loaded and pipelines compiled in %.0f ms", presetE ? 'E' : 'D',
+    g_engineR.state[slot] = 2;
+    logf("engine backend (Ray Reconstruction %c): model %s loaded and pipelines compiled in %.0f ms", g_rrLetter[slot],
          path.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 }
 
@@ -8305,30 +8353,55 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
                                ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output, void* parameters,
                                const FrameParams& p, uint32_t frame)
 {
+    // set below once the preset is known: preset F was asked for but nvngx_dlssd.dll (the CUDA backend) has none
+    bool cudaLacksF = false;
+    auto warn_not_f = [&](const char* when) {
+        if (!cudaLacksF)
+            return;
+        logf("WARNING: Ray Reconstruction preset F (DLSS 4.5) was selected, but %s feature %u is served by the CUDA "
+             "backend, whose nvngx_dlssd.dll %u.%u.%u.%u has no preset F: those frames show preset D, NOT F",
+             when, feature.handle.Id, g.denoiserVersion[0], g.denoiserVersion[1], g.denoiserVersion[2],
+             g.denoiserVersion[3]);
+    };
     auto refuse = [&](const char* reason) {
         feature.engineRefused = true;
         logf("engine backend (Ray Reconstruction): %s; feature %u uses the CUDA backend from frame %u", reason,
              feature.handle.Id, frame);
+        warn_not_f("from this frame on");
         return false;
     };
     // NGX 310.7 runs preset E's kernels for the hint 5 only and preset D's (diamond_wallaby) for every other value:
     // none, the retired A / B / C (1-3), 6, and values with the top bit set such as Cyberpunk 2077's 0x80000002 or
     // 0x80000005 (harness captures with D4R_RR_PRESET, 2026-10-12).
-    const bool presetE = feature.preset == 5;
-    std::call_once(g_engineR.once[presetE], [presetE] {
-        g_engineR.state[presetE] = 1;
+    // NGX 310.9 has preset F (DLSS 4.5, the rr2_* kernels) and runs it for every hint but 4 (D) and 5 (E): none,
+    // 6, Cyberpunk 2077's 0x80000002 (harness runs with D4R_RR_PRESET, 2026-10-13). The shim cannot see which DLL
+    // version the CUDA backend loaded, so that mapping applies when the user built a preset F model (engine\rr-f),
+    // which only a 310.9 DLL yields.
+    static const bool haveF = GetFileAttributesA((rr_model_directory(2) + "\\rr.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const int slot = feature.preset == 5 ? 1 : (haveF && feature.preset != 4) ? 2 : 0;
+    std::call_once(g_engineR.once[slot], [slot] {
+        g_engineR.state[slot] = 1;
         // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
         if (env_uint("D4R_ENGINE_RR_SYNC", 0) != 0)
-            init_engine_backend_rr(presetE);
+            init_engine_backend_rr(slot);
         else
-            std::thread([presetE] { init_engine_backend_rr(presetE); }).detach();
+            std::thread([slot] { init_engine_backend_rr(slot); }).detach();
     });
-    const int state = g_engineR.state[presetE].load();
+    cudaLacksF = slot == 2 && !denoiser_has_preset_f();
+    const int state = g_engineR.state[slot].load();
     if (state == 1)
-        return false; // still compiling: the CUDA backend serves this frame, the engine is tried again next frame
-    d4r::RModel* const model = g_engineR.models[presetE].get();
+    {
+        // still compiling: the CUDA backend serves this frame, the engine is tried again next frame
+        if (!feature.rrCompileWarned)
+        {
+            feature.rrCompileWarned = true;
+            warn_not_f("while the preset F model compiles,");
+        }
+        return false;
+    }
+    d4r::RModel* const model = g_engineR.models[slot].get();
     if (state != 2 || model == nullptr)
-        return refuse(presetE ? "no preset E model (engine\\rr-e)" : "no preset D model (engine\\rr-d)");
+        return refuse(slot == 1 ? "no preset E model (engine\\rr-e)" : slot == 2 ? "no preset F model (engine\\rr-f)" : "no preset D model (engine\\rr-d)");
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8.
     if ((feature.flags & 0x3) != 0x3)
         return refuse("needs the HDR flag and render-resolution motion vectors");
@@ -8336,6 +8409,11 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         return refuse("jittered motion vectors are not implemented");
     if (!p.auxMatrixSet[0] || !p.auxMatrixSet[1])
         return refuse("the camera matrices are missing");
+    // Preset F below 4/3 scaling (DLAA and the like): NGX runs another output filter there, rr2_post_kernel_3_2,
+    // which the model does not have (harness runs at 1920x1080 output, 2026-10-13: 1440x810 and smaller render sizes
+    // use rr2_post_kernel, 1456x820 and larger rr2_post_kernel_3_2)
+    if (slot == 2 && (3ull * feature.outWidth < 4ull * p.renderWidth || 3ull * feature.outHeight < 4ull * p.renderHeight))
+        return refuse("preset F below 4/3 scaling uses an output filter the engine does not have (rr2_post_kernel_3_2)");
     if (feature.engineR != nullptr &&
         (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight))
         return refuse("changing the effective render resolution after initialization is not implemented");
@@ -8343,15 +8421,16 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
                                           {"DLSS.Input.DiffuseAlbedo", "GBuffer.DiffuseAlbedo"},
                                           {"DLSS.Input.SpecularAlbedo", "GBuffer.SpecularAlbedo"}};
     ID3D12Resource* guides[4] = {};
-    // DLSS.Roughness.Mode 1 (packed): no roughness texture, the roughness is the normals' w
-    const bool roughnessPacked = get_resource(parameters, "GBuffer.Roughness") == nullptr &&
-        get_uint_or(parameters, "DLSS.Roughness.Mode", 0) == 1;
+    // DLSS.Roughness.Mode 1 (packed): the roughness is the normals' w. Preset F follows the mode also when a roughness
+    // texture is bound (harness run against the CUDA path, 2026-10-13); D and E are only known without one (RE Requiem)
+    const bool roughnessPacked = get_uint_or(parameters, "DLSS.Roughness.Mode", 0) == 1 &&
+        (slot == 2 || get_resource(parameters, "GBuffer.Roughness") == nullptr);
     for (int i = 0; i < 4; ++i)
     {
         guides[i] = get_resource(parameters, guideNames[i][0]);
         if (guides[i] == nullptr && guideNames[i][1] != nullptr)
             guides[i] = get_resource(parameters, guideNames[i][1]);
-        if (guides[i] == nullptr && i == 1 && roughnessPacked)
+        if (i == 1 && roughnessPacked)
             guides[i] = guides[0];
         if (guides[i] == nullptr)
             return refuse("a guide the engine needs (normals, roughness, diffuse or specular albedo) is missing");
@@ -8474,7 +8553,7 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
             feature.engineMRenderWidth = rw;
             feature.engineMRenderHeight = rh;
             logf("engine backend (Ray Reconstruction %c): feature %u runs in the game's command list (%ux%u -> %ux%u)",
-                 presetE ? 'E' : 'D', feature.handle.Id, rw, rh, feature.outWidth, feature.outHeight);
+                 g_rrLetter[slot], feature.handle.Id, rw, rh, feature.outWidth, feature.outHeight);
         }
     }
     catch (const std::exception& error)
@@ -8515,7 +8594,7 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         return refuse(failure);
     if (frame <= 3 || frame % 600 == 0)
         logf("engine frame %u recorded, Ray Reconstruction %c (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame,
-             presetE ? 'E' : 'D', p.jitterX, p.jitterY, s.reset, p.mvScaleX, p.mvScaleY);
+             g_rrLetter[slot], p.jitterX, p.jitterY, s.reset, p.mvScaleX, p.mvScaleY);
     return true;
 }
 

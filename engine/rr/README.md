@@ -172,6 +172,25 @@ single-use multiply-subtract pairs into fma, merging the two constant multiplica
 `precise` on the inlined exp2, NoContraction on its conversions. The differing values come in spatial clusters, one
 colour channel at a time, always one ulp, mostly just above 0.5 in surface 224.
 
+## HIP against Vulkan, and the fused rounding (2026-10-12)
+
+Encoder 1 ported line for line to a standalone HIP kernel (`kernels/rr/swin_native.h`, runner
+`kernels/tools/rr_swin_native_test.cpp`; capD1080 frame 2, 5 launches per round): 835 us against the Vulkan stage's
+770-788 us, the arena byte-identical. A HIP port of the network is not worth making. What the port did show:
+
+- The FP8 product alone costs 0.61 us per product per wave on this grid, 2.07 us when each is followed by the
+  f32 -> binary16 -> f32 rounding of its eight accumulator registers. Products and that rounding are about half of
+  a stage on either backend.
+- Keeping the accumulator as binary16 and taking f16(P + acc) with `v_fma_mix` (as `kernels/m` does) halves the
+  rounding's instructions: HIP 780 us. RADV emits the same instruction for `float16_t(p + float(acc))`, so the
+  Vulkan stages have it as a build option: `D4R_RR_MIX=1 build_native_model.sh ...` (`RR_MIX`, the shaders' K32).
+
+`RR_MIX` is one rounding of the exact sum where the reference has two, so it is not bit-exact by construction.
+Preset D: every network stage still identical to the capture on all 21 frames of capDT12 / capD4K / capD1080 / capDX
+/ capDXcp / capDXhw (the same figures as the default build), 4.22 ms at 1280x720 -> 4K and 8.3 ms at 1920x1080 -> 4K
+(default 4.45 / 8.7). Preset E (capE3): frames 1 and 3 have a value of encoder 0 one step off (127 dB), which the
+later stages amplify to 41 dB at the output; frame 2 is identical. The default build stays the exact one.
+
 ## Cyberpunk 2077: more inputs and settings (2026-10-12)
 
 Found on harness captures (`D4R_HARNESS_RR_EXTRA=particles,sss`, `D4R_HARNESS_RR_HW_DEPTH=1`, `D4R_RR_PRESET=N`):
@@ -189,3 +208,148 @@ byte-identical to the CUDA path through the shim on the frames the harness can c
 with RE Requiem's set the network is identical on every frame (output 107-109 dB). At 1280x720 and 1920x1080 -> 4K
 without these inputs the output still falls to 43-53 dB after the first frame (the output stage's one-ulp values);
 a correctly rounded log2 there matches the capture worse than the GPU instruction does.
+
+## The output stage's one-step differences: fused multiply-convert (2026-10-13)
+
+The rare one-binary16-step values of the translated output stage (above: ~0.004% of surfaces 224 / 240, "cause not
+found") were the driver fusing an f32 product (or sum) with the conversion that follows it into `v_fma_mix`, which
+rounds the exact result once. The kernel rounds twice, to f32 and then to binary16, and the two differ when the f32
+result is exactly a binary16 midpoint, as `log2(x) * c1 * c2` of the output stage's tone curve sometimes is.
+`ptx2rr.py` now ORs an opaque zero into the f32 bits before every `cvt.rn.f16.f32` (and into the binary16 bits
+after, against the fold of `float(float16_t(x))`). With it presets D and E are byte-identical to the CUDA path on
+every frame of every capture (capDT12, capD4K, capD1080, capDX, capDXcp, capDXhw, capE3; history and output), at
++0.05 ms: 4.27 / 4.45 ms at 1280x720 -> 4K. Found with `build/rr`-style bisection: probe every register of a block
+through ZLUDA (debug stores added to the PTX, `zluda_replay.py`) and through the translated shader
+(`ptx2rr.py --probe`) and list the first that differ.
+
+Other reference behaviours the translation now follows, all found the same way on preset F's kernels:
+
+- formatted stores to normalized surfaces round half away from zero in f32 (ZLUDA's `surface_formatted_store_bits`);
+  UNORM 10:10:10:2 arrays are RGBA32F images holding the quantised values `q / 1023` (the correctly rounded quotient,
+  from a table: the driver divides by multiplying with a reciprocal);
+- `tanh.approx.f32` is OCML's `tanhF` with LLVM's AMDGPU lowering of `exp` (`lowerFEXP`, fast-FMA path): the same
+  operations, the fused ones through f64 (the driver's f32 `fma` is a product and a sum whenever the product also
+  exists on its own); `tanh.approx.f16` is the correctly rounded value (a table);
+- the driver's GLSL `fma` on binary16 is a true fused operation, as the reference's is: no emulation there;
+- texture fetches with a binary16 result keep that rounding.
+
+## Preset F: DLSS 4.5 Ray Reconstruction (2026-10-13)
+
+`nvngx_dlssd.dll` 310.9 has a third model with its own kernels, `rr2_*`, and runs it for every preset hint but 4 (D)
+and 5 (E): none, 6, Cyberpunk 2077's 0x80000002. The engine runs it from a `D4RR0002` model:
+
+```sh
+python3 kernels/tools/extract_dlss_ptx.py NVNGX_DLSSD_DLL ~/.cache/d4r-rr-corpus-f       # its PTX (zstd in 310.9)
+python3 engine/compile_rr2.py CAPTURE OUT_DIR --native NVNGX_DLSSD_DLL [--particles CAPTURE_WITH_PARTICLES]
+```
+
+The runtime is `engine/runtime_rr2.inc` (behind `RModel` / `REngine`); the shim uses `engine\rr-f` (or
+`D4R_ENGINE_MODEL_RR_F_DIR`) and, when that model exists, NGX 310.9's hint mapping.
+
+A frame, as NGX launches it:
+
+| pass | NVIDIA kernel | engine |
+|---|---|---|
+| exposure | `rr2_histogram_auto_exposure_basic_kernel` | `exposure_f.comp` (two passes) |
+| enc0 | `rr2_enc0_kernel` | translated feature gather and guide tail around the native block (`gen_rr2_enc0.py`) |
+| enc1 - enc5 | `rr2_enc1_kernel` ... | `rr2_m.comp` |
+| dec4 - dec1 | `rr2_decN_kernel_0`, `rr2_decN_kernel_1` | `rr2_m.comp` |
+| dec0 | `rr2_dec0_kernel_0`, `rr2_dec0_kernel_1` | `rr2_m.comp`; the second: native block, translated output tail |
+| output | `rr2_post_kernel`, `rr2_downsample_kernel_static_hdr[_no_transparency]` per tile, `rr2_pooled_history2_kernel` | translated (`ptx2rr.py`) |
+
+The network (`rr2_ref.py` is its exact numpy reference and documents the block): D/E's levels, window grids and
+arithmetic (FP8 operands, binary16 sums rounded per 32-deep step, the cubic softmax, the MLP activation), with a
+different block. Each kernel is one block on 8x8-token windows that alternate their shift per frame: heads that
+share one projection for queries and keys (so the scores are symmetric; bias `(T + T^T) sqrt(2)` of a 64 x 64
+relative position table), all reading the block's input and summing their out-projections; MLP branches likewise;
+both sums enter the residual times a binary16 scalar from the argument block. Encoders merge 2x2 for the next level,
+a decoder's first kernel expands the level below and adds the skip times a third scalar. Next to the tokens every
+level carries a three-channel guide image: encoders gate it (`sigmoid(head) * s0`) and average it 2x2 for the next
+level, decoders upsample it bilinearly, gate it and blend it with the encoder's. All stages exchange data through
+the arena (3152 units of W0 * H0 / 32 bytes; NGX's region offsets, which scale with the render size), tokens as FP8
+planes of 32 channels, guides as four binary16 per token.
+
+Weights: the DLL holds the model as plain binary16 tensors in natural `[out][in]` order, kernel after kernel
+(`rr2_ref.dll_weights`; found by the sixteen kernels' relative position tables, 2 2 4 4 8 8 8 8 4 4 4 4 2 2 2 2
+heads). `rr2_pack.py` packs them for `rr2_m.comp`; nothing of the network comes from the capture. The capture still
+supplies every kernel's argument block (the runtime keeps their constants and fills the geometry, the frame's
+values and the pointers) and encoder 0's second table.
+
+The output stage filters an intermediate image of 1.5 times the output size in tiles (columns of at most 720, rows
+of at most 1620 intermediate pixels, 4 pixels of overlap inside), reduces each tile to the output, and keeps two
+histories for the next frame: the intermediate image, and a half-size copy whose quarter-size reduction
+(`rr2_pooled_history2_kernel`) encoder 0 also reads (UNORM 10:10:10:2 arrays, see above). NGX runs filter and
+reduction concurrently with progress counters; the kernels skip that when the counter pointers are null, which is how
+the engine runs them, in order. They have no matrix products and run with 64-wide waves (their warp-level shuffles
+address the lane's own half).
+
+Options (harness captures capFX*): encoder 0 byte 466 packed roughness, 568 inverted depth, 569 / texture 272
+`DLSSD.SpecularHitDistance`, 571 / texture 336 `DLSS.DisocclusionMask`, texture 288 the subsurface guide, 1028
+`DLSS.Use.HW.Depth`; `DLSSD.ColorBeforeParticles` selects the other reduction kernel (model stage `downp`, texture
+208, an output-size history 256 <-> 264, flag bytes 196-198). Encoder 0's surfaces 376 / 384 are the output filter's
+textures 64 / 72. Pre-exposure does not reach these kernels.
+
+Checked (`d4r-rr` on `rr_inputs.py` inputs; every stage surface and the presented image against the CUDA path):
+byte-identical on every frame of capF (640x360 -> 1080p, 3 frames), capF900 (800x450 -> 1600x900), capF4K
+(1280x720 -> 4K, 16 tiles) and of the option captures (motion, a real camera, inverted and hardware depth, packed
+roughness, hit distance, disocclusion mask, subsurface guide, particles); through the shim (D3D12 harness under
+Proton) the engine's frames are byte-identical to the CUDA backend's too (`D4R_RR_PRESET=6 D4R_RR_DLL=<310.9 DLL>
+scripts/run_rr_engine_compare.sh`; that script still compares frame N with frame N, and the harness presents the
+CUDA result one frame late in the jitter scene).
+
+Speed, RX 9070 XT, 1280x720 -> 3840x2160: 6.2 / 6.6 ms per frame (exposure 0.03, network 4.1 - 4.2, output 2.1 -
+2.4), from 14.5 ms with every kernel translated; preset D is 4.3 / 4.5. Per stage (us): enc0 1076 (its block 521),
+dec0_1 775, dec0_0 630, enc1 340, dec1_0 316, dec1_1 269, the rest under 180; filter and reduction about 130 per
+tile, 16 tiles. Not done: native output passes and feature gather.
+
+### Where the translated parts' time went (2026-10-13, later)
+
+Now about 5.8 / 6.2 ms (5.7 / 6.1 with the 10-bit histories that were later withdrawn), still byte-identical on every capture and through the
+shim. Profiling the translated code (cutting it at points behind an opaque condition, `D4R_ENGINE_RR_SKIP=post,down,
+pooled`) showed its arithmetic is spread evenly - no hot spot a rewrite would remove - and that the losses were in
+how the passes were arranged:
+
+- **Encoder 0 in two passes** (-0.2 ms). One shader ran NVIDIA's 32-lane gather on one of the block's four waves
+  while the other three waited: 0.40 ms for the gather, 0.24 ms as a pass of its own in 32-thread groups.
+  `gen_rr2_enc0.py --split gather | block` writes both; the gather pass (`stage enc0g`, the same bindings and
+  parameter block as enc0) stores each window's record in the arena after the tile slots: the first product's A
+  fragments (1024 words) and, per lane, the values the tail reads from the gather (six binary16 on the reference
+  build; the generator finds them and recomputes the tail's index arithmetic). The record's address is a word
+  compile_rr2.py appends to enc0's argument block. Cost: 76 bytes per render pixel of arena.
+  `D4R_RR2_SPLIT=0` builds the single shader.
+- **Tile passes in overlapping groups** (-0.15 ms). The 16 tiles' post and down passes ran one after another, each
+  behind a barrier, and the gaps between 32 short dispatches added up. Each tile now has a slot (its two regions;
+  eight slots, 58 MB at 4K) and a group's post passes run without barriers between them, as do its down passes
+  together with the next group's post passes on the other half of the slots - what NGX does with two slots and its
+  progress counters. `D4R_ENGINE_RR_SKIP=serial` restores the old order.
+- **Pooled histories as real 10:10:10:2 images: withdrawn.** 4 bytes a pixel instead of RGBA32F's 16 saved
+  0.1 ms and was identical at 3x and 2x scaling, but the hardware's bilinear filter rounds a UNORM image differently
+  from a float one: at 1.5x (capFQ) temporal frames came out at 44 - 51 dB. The default is RGBA32F again;
+  `D4R_RR2_POOLED=rgb10_a2` builds the other form.
+
+Tried without gain: 32-bit arena accesses for the translated code's paired 16-bit ones (0.01 ms), dropping the
+subgroup shuffles or the depth search (they cost nothing measurable). What is left is NVIDIA's arithmetic: gather
+0.24 - 0.33 ms, decoder 0's output tail 0.18, post 1.1 - 1.3, down 0.7.
+
+### Other scaling ratios, and what a game-like configuration showed (2026-10-13, later)
+
+Asked whether instability seen in RE Requiem came from this implementation, the engine was compared with the CUDA
+path through the shim in configurations the earlier captures did not cover (`D4R_RR_PRESET=6 D4R_RR_DLL=<310.9>
+scripts/run_rr_engine_compare.sh`, frames aligned by one):
+
+- **Render widths that are not a multiple of 32 were wrong** (1114x626 -> 1080p: 15 dB): the post pass's argument 8
+  is the row stride of the network's output, the padded width W0, not the render width. Fixed; identical now.
+- **Below 4/3 scaling NGX runs another output filter**, `rr2_post_kernel_3_2` (1456x820 -> 1080p and larger render
+  sizes, DLAA included; 1440x810 and smaller use `rr2_post_kernel`). The model has no such stage, so the shim hands
+  those features to the CUDA backend. `rr2_histogram_auto_exposure_histogram_kernel` was never launched in any run.
+- **DLSS.Roughness.Mode 1 with a roughness texture bound**: NGX follows the mode, the shim followed the texture.
+  Fixed for preset F (RE Requiem binds none, so it was not affected).
+- 1.5x, 1.72x, 2x and 4/3 scaling, and RE Requiem's inputs together (inverted and hardware depth, hit distance,
+  mask, packed roughness, scaled motion vectors, a moving scene): identical.
+- **Open: the camera matrices are not NGX's bit for bit.** NGX computes them in single precision: argument 644 is
+  the f32 product view x clip, 836 its inverse by cofactors times 1 / det (glm::inverse's operation order; both
+  reproduced bit for bit in build/rr/f/matfit.py), 900 is an inverse of the pixel matrix (it carries that inverse's
+  residues, and 0.9999999 for 1 at 1114x626) and 964 was not reproduced. The engine computes them in double and
+  rounds, a last-bit difference in a few elements. With a non-identity camera, hit distance and mask bound and a
+  moving scene that showed as 40 - 50 dB on later frames in a synthetic scene whose affected feature is rounding
+  noise around zero in both paths; no other configuration was affected.

@@ -42,6 +42,8 @@ PRESET="$(awk '$1 == "preset" { print $2 }' "$OUT/rr.txt")"
 DEFS=(-DRR_EXACT_CONVERT); [[ "$PRESET" == 4 ]] && DEFS+=(-DRR_PRESET_D)
 # D4R_RR_RELAXED=1: one rounding where NVIDIA has two (engine/rr/rr_exact.glsl): faster, not bit-exact
 [[ -n "${D4R_RR_RELAXED:-}" ]] && DEFS+=("-DRR_RELAXED=$D4R_RR_RELAXED")
+# D4R_RR_MIX=1: the 32-deep steps round once through v_fma_mix (the shaders' K32): ~5% faster, not provably bit-exact
+[[ "${D4R_RR_MIX:-0}" == 1 ]] && DEFS+=(-DRR_MIX)
 glsl() { # glsl OUT.spv SOURCE INCLUDE_DIR...
     local out="$1" src="$2"; shift 2
     local dir inc=(); for dir in "$@"; do inc+=("-I$dir"); done

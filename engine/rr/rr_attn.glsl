@@ -21,13 +21,12 @@
             [[unroll]] for (uint kt = 0u; kt < 6u; ++kt) {
                 HAC c;
                 coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
-                ACC s = ACC(c);
                 A8 k0, k1;
                 coopMatLoad(k0, RR_KS, RR_KS0 + kt * 128u, 8u, RM);
                 coopMatLoad(k1, RR_KS, RR_KS0 + kt * 128u + 4u, 8u, RM);
-                s = coopMatMulAdd(k1, Qb[1], coopMatMulAdd(k0, Qb[0], s));   // rounded once, by the conversion below
+                K32H(c, k0, Qb[0], k1, Qb[1])
                 // the cubic numerator from enc1_pack.cubic_table, indexed by the score's binary16 bits
-                [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(float16_t(s[i]))]));
+                [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(c[i])]));
             }
             // key slot 16kt + 8hl + i is NVIDIA's column 8j + 2tt + half with j = 4(kt >> 1) + (kt & 1) + 2((i >> 1) & 1),
             // tt = 2hl + (i >> 2), half = i & 1 (enc1_ref.softmax_cubic's tree)
@@ -60,7 +59,7 @@
         // O^T = V^T P^T, then the out-projection onto the residual
         B8 Ob[2];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
-            ACC o = ACC(0.0);
+            RAC o = RAC(RV(float16_t(0.0)));
             [[unroll]] for (uint ks = 0u; ks < 3u; ++ks) {
                 A8 v0, v1;
                 coopMatLoad(v0, RR_VS, RR_VS0 + c * 384u + 8u * ks, 24u, RM);

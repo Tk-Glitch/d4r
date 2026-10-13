@@ -20,23 +20,23 @@
     // the embedding x = W2 q8(relu(W1 f + b1)) + b2 for token tiles n = wv (this wave's queries: x is also their
     // residual) and n = wv + 4 (the border keys, waves 0 and 1), then each key's norm in registers (dec0_ref.norm_plane
     // on the accumulator layout, as dec0_m.comp's MLP norm) to XT
-    ACC R[2];
+    RAC R[2];
     for (uint n = wv; n < 6u; n += 4u) {
         B8 fb0, fb1, hb_[2];
         coopMatLoad(fb0, XF, n * 128u, 8u, CM);
         coopMatLoad(fb1, XF, n * 128u + 4u, 8u, CM);
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
-            ACC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_B1 / 2u + 16u * m + 8u * hl + uint(i)]);
+            RAC a;
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_B1 / 2u + 16u * m + 8u * hl + uint(i)]);
             A8 a0, a1;
             LDA(a0, W_W1, 32u, m, 0u); LDA(a1, W_W1, 32u, m, 1u);
             K32(a, a0, fb0, a1, fb1)
-            [[unroll]] for (int i = 0; i < 8; ++i) hb_[m][i] = q8s(max(a[i], 0.0));
+            [[unroll]] for (int i = 0; i < 8; ++i) hb_[m][i] = q8s(max(float(a[i]), 0.0));
         }
         float16_t xv[2][8];
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
-            ACC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_B2 / 2u + 16u * m + 8u * hl + uint(i)]);
+            RAC a;
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_B2 / 2u + 16u * m + 8u * hl + uint(i)]);
             A8 a0, a1;
             LDA(a0, W_W2, 32u, m, 0u); LDA(a1, W_W2, 32u, m, 1u);
             K32(a, a0, hb_[0], a1, hb_[1])
@@ -44,7 +44,7 @@
             if (n == wv) {   // the residual: x + table 0
                 [[unroll]] for (int i = 0; i < 8; ++i) {
                     precise float16_t c = xv[m][i] + w16.w[W_TABLE0 / 2u + 16u * m + 8u * hl + uint(i)];
-                    R[m][i] = float(c);
+                    R[m][i] = RV(c);
                 }
             }
         }
@@ -90,12 +90,12 @@
                 LDA(wk[kt], W_WK0 + HEAD * hd, 32u, c, kt);
                 LDB(wvb[kt], W_WV0 + HEAD * hd, 32u, kt, c);
             }
-            ACC a = ACC(0.0);
+            RAC a = RAC(RV(float16_t(0.0)));
             K32(a, wk[0], xb[0], wk[1], xb[1])
             A8 ka;
             Q8(ka, a)
             coopMatStore(ka, KVS, n * 128u + 4u * c, 8u, RM);
-            ACC vv = ACC(0.0);
+            RAC vv = RAC(RV(float16_t(0.0)));
             K32(vv, xa[0], wvb[0], xa[1], wvb[1])
             A8 va;
             Q8(va, vv)
@@ -139,15 +139,15 @@
                 precise float16_t nn = rv[m][i] * g;
                 Nb[m][i] = q8h(nn);
                 precise float16_t a = rv[m][i] + w16.w[W_TABLE1 / 2u + k];
-                R[m][i] = float(a);
+                R[m][i] = RV(a);
             }
     }
     for (uint br = 0u; br < 4u; ++br) {
         const uint w1 = W_W1_0 + BRANCH * br, b1 = W_B1_0 + BRANCH * br, w2 = W_W2_0 + BRANCH * br;
         B8 Hb[2];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
-            ACC h;
-            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+            RAC h;
+            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = RV(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
             A8 a0, a1;
             LDA(a0, w1, 32u, c, 0u); LDA(a1, w1, 32u, c, 1u);
             K32(h, a0, Nb[0], a1, Nb[1])
@@ -180,8 +180,8 @@
         }
     }
     {   // the 32 -> 16 head and encoder 0's filter of the noise grid (two f16 fma chains, taps even / odd)
-        ACC hv;
-        [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = float(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
+        RAC hv;
+        [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = RV(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
         A8 a0, a1;
         LDA(a0, W_WH, 32u, 0u, 0u); LDA(a1, W_WH, 32u, 0u, 1u);
         K32(hv, a0, Tb[0], a1, Tb[1])
@@ -228,8 +228,8 @@
         const uvec2 mxy = mergeXY(col);
         const int X = x0 / 2 + int(mxy.x), Y = y0 / 2 + int(mxy.y), hx = ex / 2, hy = ey / 2;
         const uint m = wv;
-        ACC a;
-        [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BM / 2u + 16u * m + 8u * hl + uint(i)]);
+        RAC a;
+        [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BM / 2u + 16u * m + 8u * hl + uint(i)]);
         [[unroll]] for (uint ks = 0u; ks < 4u; ++ks) {
             B8 g0, g1; A8 w0, w1;
             coopMatLoad(g0, MG, 8u * ks, 32u, CM);

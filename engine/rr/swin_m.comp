@@ -54,7 +54,23 @@ layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D S128;
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define RND(m) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (m)[i_] = rnd16((m)[i_]);
 #define Q8(dst, src) Q8PAIRS(dst, src)
+// One 32-deep step onto an accumulator that holds binary16 values. The reference (and the default here) adds the
+// accumulator inside the f32 products and rounds the result to binary16. RR_MIX (build_native_model.sh with
+// D4R_RR_MIX=1) keeps the accumulator as binary16, sums the products from zero and takes f16(P + acc), which the
+// driver compiles to one v_fma_mix per element in place of two conversions: about 5% faster, but a single rounding
+// where the reference has two, so a value can come out one binary16 step away (engine/rr/README.md).
+// RAC is the accumulator type, RV(x) a binary16 value as its element; K32H is the step on a binary16 matrix.
+#ifdef RR_MIX
+#define RAC HAC
+#define RV(x) (x)
+#define K32(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(0.0))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_] + float((acc)[i_])); }
+#define K32H(acc, a0, b0, a1, b1) K32(acc, a0, b0, a1, b1)
+#else
+#define RAC ACC
+#define RV(x) float(x)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); RND(acc) }
+#define K32H(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(acc))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_]); }
+#endif
 const uint HEAD = W_WK1 - W_WK0, BRANCH = W_W1_1 - W_W1_0;
 
 // NVIDIA's reduction over a short list (swin_ref.pairs_tree)
@@ -143,8 +159,8 @@ void main()
         [[unroll]] for (uint kt = 0u; kt < CX / 16; ++kt) coopMatLoad(lb[kt], POOL, LOW_AT + n * 4u * CX + 4u * kt, CX / 4u, CM);
         for (uint mm = 0u; mm < MT; ++mm) {
             const uint m = MT * wv + mm;
-            ACC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+            RAC a;
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
             [[unroll]] for (uint kt = 0u; kt < CX / 16; kt += 2u) {
                 A8 w0, w1;
                 LDA(w0, W_WE, CX, m, kt); LDA(w1, W_WE, CX, m, kt + 1u);
@@ -213,7 +229,7 @@ void main()
     barrier();
 
     // ---------------------------------------------------------------- the residual: the window token + table 7
-    ACC R[MT];
+    RAC R[MT];
     {
         const uint tq = inter(16u * wv + col);
         const int qx = x0 + int(tq & 7u), qy = y0 + int(tq >> 3u);
@@ -235,7 +251,7 @@ void main()
                 const float16_t x = e4(t[i >> 2], uint(i) & 3u);
 #endif
                 precise float16_t c = x + w16.w[W_TABLE7 / 2u + 16u * m + 8u * hl + uint(i)];
-                R[m][i] = float(c);
+                R[m][i] = RV(c);
             }
         }
     }
@@ -245,7 +261,7 @@ void main()
         barrier();   // every wave is done with the previous head's K / V (and, for the first, the expand's LOW)
         for (uint j = 0u; j < 3u; ++j) {   // 12 jobs (token tile n, channel tile c)
             const uint job = wv + 4u * j, n = job >> 1u, c = job & 1u;
-            ACC a = ACC(0.0), v = ACC(0.0);
+            RAC a = RAC(RV(float16_t(0.0))), v = RAC(RV(float16_t(0.0)));
             [[unroll]] for (uint kt = 0u; kt < 2u * KC; kt += 2u) {
                 B8 xb0, xb1, wv0, wv1;
                 A8 xa0, xa1, wk0, wk1;
@@ -312,15 +328,15 @@ void main()
                 precise float16_t n = rv[m][i] * g;
                 Nb[m][i] = q8h(n);
                 precise float16_t a = rv[m][i] + w16.w[W_TABLE16 / 2u + k];
-                R[m][i] = float(a);
+                R[m][i] = RV(a);
             }
     }
     [[dont_unroll]] for (uint br = 0u; br < NB; ++br) {
         const uint w1 = W_W1_0 + BRANCH * br, b1 = W_B1_0 + BRANCH * br, w2 = W_W2_0 + BRANCH * br;
         B8 Hb[2];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
-            ACC h;
-            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+            RAC h;
+            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = RV(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
             [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
                 A8 a0, a1;
                 LDA(a0, w1, C, c, kt); LDA(a1, w1, C, c, kt + 1u);
@@ -360,8 +376,8 @@ void main()
         }
     }
     // the C -> 16 head
-    ACC hv;
-    [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = float(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
+    RAC hv;
+    [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = RV(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
     [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
         A8 a0, a1;
         LDA(a0, W_WH, C, 0u, kt); LDA(a1, W_WH, C, 0u, kt + 1u);
@@ -427,8 +443,8 @@ void main()
         const int X = x0 / 2 + int(mxy.x), Y = y0 / 2 + int(mxy.y);
         const uint o = (mrgOff + uint(Y * hx + X) * 32u) >> 2u;
         for (uint m = wv; m < CX / 16u; m += 4u) {
-            ACC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BM / 2u + 16u * m + 8u * hl + uint(i)]);
+            RAC a;
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BM / 2u + 16u * m + 8u * hl + uint(i)]);
             for (uint ks = 0u; ks < C / 8u; ++ks) {
                 B8 g0, g1; A8 w0, w1;
                 coopMatLoad(g0, MG, 8u * ks, C, CM);

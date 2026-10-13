@@ -29,7 +29,8 @@ REG = r'%r\d+'
 
 
 def kernel_module(kernel):
-    for p in sorted(Path('~/.cache/d4r-rr-corpus').expanduser().glob('*.ptx')):
+    corpus = '~/.cache/d4r-rr-corpus-f' if kernel.startswith('rr2_') else '~/.cache/d4r-rr-corpus'
+    for p in sorted(Path(corpus).expanduser().glob('*.ptx')):
         if f'.entry {kernel}(' in p.read_text(errors='replace'):
             return p
     raise SystemExit(f'no corpus module for {kernel}')
@@ -80,7 +81,9 @@ def main():
     o = ap.parse_args()
     # the capture decides the kernel: a preset D capture runs cuda_dldn_engine_swin_{enc0,dec0}_diamond_wallaby_kernel
     cap = Capture(os.path.expanduser(o.capture))
-    launch = [l for l in cap.launches if f'swin_{o.stage}' in l.kernel][o.frame - 1]
+    # preset F: STAGE is the kernel's full name (rr2_enc1_kernel, rr2_dec1_kernel_0)
+    rr2 = o.stage.startswith('rr2_')
+    launch = [l for l in cap.launches if (l.kernel == o.stage if rr2 else f'swin_{o.stage}' in l.kernel)][o.frame - 1]
     kernel = launch.kernel
     module = kernel_module(kernel)
     lines = module.read_text().replace('\r', '').split('\n')
@@ -126,7 +129,7 @@ def main():
     cmd = ['systemd-run', '--user', '--scope', '-q', '-p', 'MemoryMax=24G', '-p', 'MemorySwapMax=0']
     cmd += [f'--setenv={k_}={v_}' for k_, v_ in env.items() if k_.startswith('D4R_ZLUDA')]
     r = subprocess.run(cmd + [sys.executable, str(HERE / 'zluda_replay.py'), os.path.expanduser(o.capture),
-                              f'swin_{o.stage}' + ('_diamond' if 'diamond' in kernel else ''), str(o.frame), str(work),
+                              kernel if rr2 else f'swin_{o.stage}' + ('_diamond' if 'diamond' in kernel else ''), str(o.frame), str(work),
                               '--ptx', str(work / 'probe.ptx'),
                               '--pad', str(pad)], capture_output=True, text=True)
     if 'failed' in r.stdout + r.stderr:

@@ -48,7 +48,23 @@ layout(set = 0, binding = 7, rgba8_snorm) uniform writeonly image2D S144;
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define RND(m) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (m)[i_] = rnd16((m)[i_]);
 #define Q8(dst, src) Q8PAIRS(dst, src)
+// One 32-deep step onto an accumulator that holds binary16 values. The reference (and the default here) adds the
+// accumulator inside the f32 products and rounds the result to binary16. RR_MIX (build_native_model.sh with
+// D4R_RR_MIX=1) keeps the accumulator as binary16, sums the products from zero and takes f16(P + acc), which the
+// driver compiles to one v_fma_mix per element in place of two conversions: about 5% faster, but a single rounding
+// where the reference has two, so a value can come out one binary16 step away (engine/rr/README.md).
+// RAC is the accumulator type, RV(x) a binary16 value as its element; K32H is the step on a binary16 matrix.
+#ifdef RR_MIX
+#define RAC HAC
+#define RV(x) (x)
+#define K32(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(0.0))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_] + float((acc)[i_])); }
+#define K32H(acc, a0, b0, a1, b1) K32(acc, a0, b0, a1, b1)
+#else
+#define RAC ACC
+#define RV(x) float(x)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); RND(acc) }
+#define K32H(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(acc))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_]); }
+#endif
 const uint HEAD = W_WK1 - W_WK0, BRANCH = W_W1_1 - W_W1_0;
 
 // shared memory, aliased by phase: expand and prologue [LOW | EX], then the attention [K | V^T]
@@ -111,8 +127,8 @@ void main()
             [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(lb[kt], LOW, n * 256u + 4u * kt, 16u, CM);
             [[unroll]] for (uint mm = 0u; mm < 2u; ++mm) {
                 const uint m = 2u * wv + mm;
-                ACC a;
-                [[unroll]] for (int i = 0; i < 8; ++i) a[i] = float(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+                RAC a;
+                [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
                 K32(a, we[mm][0], lb[0], we[mm][1], lb[1])
                 K32(a, we[mm][2], lb[2], we[mm][3], lb[3])
                 B8 q;
@@ -167,13 +183,13 @@ void main()
     barrier();
 
     // ---------------------------------------------------------------- the residual: window tokens + table 0
-    ACC R[2];
+    RAC R[2];
     [[unroll]] for (uint m = 0u; m < 2u; ++m) {
         HAC x;
         coopMatLoad(x, XR, wv * 512u + 16u * m, 32u, CM);
         [[unroll]] for (int i = 0; i < 8; ++i) {
             precise float16_t c = float16_t(x[i]) + w16.w[W_TABLE0 / 2u + 16u * m + 8u * hl + uint(i)];
-            R[m][i] = float(c);
+            R[m][i] = RV(c);
         }
     }
 
@@ -190,12 +206,12 @@ void main()
                 LDA(wk[kt], W_WK0 + HEAD * hd, 32u, c, kt);
                 LDB(wvb[kt], W_WV0 + HEAD * hd, 32u, kt, c);
             }
-            ACC a = ACC(0.0);
+            RAC a = RAC(RV(float16_t(0.0)));
             K32(a, wk[0], xb[0], wk[1], xb[1])
             A8 ka;
             Q8(ka, a)
             coopMatStore(ka, POOL, n * 128u + 4u * c, 8u, RM);
-            ACC v = ACC(0.0);
+            RAC v = RAC(RV(float16_t(0.0)));
             K32(v, xa[0], wvb[0], xa[1], wvb[1])
             A8 va;
             Q8(va, v)
@@ -241,15 +257,15 @@ void main()
                 precise float16_t n = rv[m][i] * g;
                 Nb[m][i] = q8h(n);
                 precise float16_t a = rv[m][i] + w16.w[W_TABLE1 / 2u + k];
-                R[m][i] = float(a);
+                R[m][i] = RV(a);
             }
     }
     for (uint br = 0u; br < 4u; ++br) {
         const uint w1 = W_W1_0 + BRANCH * br, b1 = W_B1_0 + BRANCH * br, w2 = W_W2_0 + BRANCH * br;
         B8 Hb[2];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
-            ACC h;
-            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = float(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+            RAC h;
+            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = RV(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
             A8 a0, a1;
             LDA(a0, w1, 32u, c, 0u); LDA(a1, w1, 32u, c, 1u);
             K32(h, a0, Nb[0], a1, Nb[1])

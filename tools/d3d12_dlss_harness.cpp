@@ -1546,7 +1546,9 @@ int main(int argc, char** argv)
     if (reconstruction)
     {
         d4r_ngx_set_int(parameters, "DLSS.Denoise.Mode", 1);
-        d4r_ngx_set_int(parameters, "DLSS.Roughness.Mode", 0);
+        // D4R_HARNESS_RR_ROUGHNESS_MODE=1: the roughness is packed in the normals' w (RE Requiem)
+        d4r_ngx_set_int(parameters, "DLSS.Roughness.Mode",
+                        std::getenv("D4R_HARNESS_RR_ROUGHNESS_MODE") != nullptr ? std::atoi(std::getenv("D4R_HARNESS_RR_ROUGHNESS_MODE")) : 0);
         // D4R_HARNESS_RR_HW_DEPTH=1: the depth is the hardware (nonlinear) depth buffer, as Cyberpunk 2077 declares it
         d4r_ngx_set_int(parameters, "DLSS.Use.HW.Depth",
                         std::getenv("D4R_HARNESS_RR_HW_DEPTH") != nullptr ? std::atoi(std::getenv("D4R_HARNESS_RR_HW_DEPTH")) : 0);

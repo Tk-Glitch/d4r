@@ -22,7 +22,23 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define RND(m) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (m)[i_] = rnd16((m)[i_]);
 #define Q8(dst, src) Q8PAIRS(dst, src)
+// One 32-deep step onto an accumulator that holds binary16 values. The reference (and the default here) adds the
+// accumulator inside the f32 products and rounds the result to binary16. RR_MIX (build_native_model.sh with
+// D4R_RR_MIX=1) keeps the accumulator as binary16, sums the products from zero and takes f16(P + acc), which the
+// driver compiles to one v_fma_mix per element in place of two conversions: about 5% faster, but a single rounding
+// where the reference has two, so a value can come out one binary16 step away (engine/rr/README.md).
+// RAC is the accumulator type, RV(x) a binary16 value as its element; K32H is the step on a binary16 matrix.
+#ifdef RR_MIX
+#define RAC HAC
+#define RV(x) (x)
+#define K32(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(0.0))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_] + float((acc)[i_])); }
+#define K32H(acc, a0, b0, a1, b1) K32(acc, a0, b0, a1, b1)
+#else
+#define RAC ACC
+#define RV(x) float(x)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); RND(acc) }
+#define K32H(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(acc))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_]); }
+#endif
 const uint HEAD = W_WK1 - W_WK0, BRANCH = W_W1_1 - W_W1_0;
 shared uint KVS[2 * 768];        // the current head's K, then V^T; before the attention the key pixels' features
 #define XF KVS                   // the key pixels' 32 FP8 features (plane 0 | plane 1), slot-major

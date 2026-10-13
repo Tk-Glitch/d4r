@@ -31,14 +31,18 @@ def main():
     ap.add_argument('--ptx')
     ap.add_argument('--zluda', default=os.path.expanduser('~/.cache/d4r-zluda-rr'))
     ap.add_argument('--rocm', default='/opt/rocm/lib')
+    ap.add_argument('--tex', action='append', default=[], metavar='OFFSET=FILE:W:H',
+                    help='an RGBA32F texture for a handle the capture has no dump of (preset F pooled histories)')
     ap.add_argument('--pad', type=int, default=0, help='bytes of zeros appended to the arena (debug stores)')
     o = ap.parse_args()
     cap = Capture(o.capture)
-    launch = [l for l in cap.launches if o.kernel in l.kernel and 'diamond' not in l.kernel or
-              ('diamond' in o.kernel and o.kernel in l.kernel)][o.frame - 1]
+    exact = [l for l in cap.launches if l.kernel == o.kernel]
+    launch = (exact or [l for l in cap.launches if o.kernel in l.kernel and 'diamond' not in l.kernel or
+                        ('diamond' in o.kernel and o.kernel in l.kernel)])[o.frame - 1]
     work = Path(o.work)
     work.mkdir(parents=True, exist_ok=True)
-    module = o.ptx or next(str(p) for p in sorted(Path('~/.cache/d4r-rr-corpus').expanduser().glob('*.ptx'))
+    corpus = '~/.cache/d4r-rr-corpus-f' if launch.kernel.startswith('rr2_') else '~/.cache/d4r-rr-corpus'
+    module = o.ptx or next(str(p) for p in sorted(Path(corpus).expanduser().glob('*.ptx'))
                            if f'.entry {launch.kernel}(' in p.read_text(errors='replace'))
     (work / 'args.bin').write_bytes(launch.args)
     arena = launch.arena_alloc
@@ -50,15 +54,31 @@ def main():
         out = f' {work}/arena.out.bin' if p.alloc == arena else ''
         source = f'{work}/arena-pad.bin' if o.pad and p.alloc == arena else f'{launch.directory}/alloc-{p.alloc}.bin'
         lines.append(f'buf {p.offset} {source} {p.delta}{out}')
+    # textures the launch names but the bridge could not read back (preset F's 10:10:10:2 pooled histories, which
+    # ZLUDA backs with RGBA32F): zeros, which is what they hold on a first frame
+    have = {i.offset for i in launch.images}
+    for line in (launch.directory / 'manifest.txt').read_text().split('\n'):
+        f = line.split()
+        given = {int(t.split('=')[0]): t.split('=')[1].split(':') for t in o.tex}
+        if len(f) == 2 and f[0] == 'texture' and int(f[1]) in given:
+            path, w_, h_ = given[int(f[1])]
+            lines.append(f'tex {f[1]} {path} {w_} {h_} 4 32 linear')
+        elif len(f) == 2 and f[0] == 'texture' and int(f[1]) not in have:
+            (work / 'zero16.bin').write_bytes(bytes(16 * 16 * 16))
+            lines.append(f'tex {f[1]} {work}/zero16.bin 16 16 4 32 linear')
+        if len(f) == 2 and f[0] == 'surface' and int(f[1]) not in have:   # half the largest surface: the pooled history
+            big = max((i for i in launch.images if i.kind == 'surface'), key=lambda i: i.width, default=None)
+            if big is not None:
+                lines.append(f'surf {f[1]} {big.width // 2} {big.height // 2} 4 32 {work}/surf{f[1]}.bin')
     for image in launch.images:
         if image.kind == 'texture':
             # SNORM_INT8X4 (200): a SIGNED_INT8 array read as normalized floats gives the same values
-            fmt = 8 if image.format == 200 else image.format
+            fmt = 8 if image.format == 200 else 1 if image.format == 194 else image.format
             lines.append(f'tex {image.offset} {image.path} {image.width} {image.height} {image.channels} '
                          f'{fmt} {"linear" if image.linear else "nearest"}')
         else:
             # ZLUDA has no SNORM_INT8X4 arrays (format 200); surface stores write the same bytes to a SIGNED_INT8 one
-            fmt = 8 if image.format == 200 else image.format
+            fmt = 8 if image.format == 200 else 1 if image.format == 194 else image.format   # 194: UNORM_INT8X4
             lines.append(f'surf {image.offset} {image.width} {image.height} {image.channels} {fmt} '
                          f'{work}/surf{image.offset}.bin')
     (work / 'manifest').write_text('\n'.join(lines) + '\n')

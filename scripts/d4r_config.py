@@ -92,14 +92,14 @@ def main(argv):
         env["D4R_RR_ENABLE"] = "1" if rr_enabled else "0"
     rr_model = get("RayReconstruction", "Model")
     if rr_model is not None:
-        rr_presets = {"DEFAULT": 0, "D": 4, "E": 5}
+        rr_presets = {"DEFAULT": 0, "D": 4, "E": 5, "F": 6}   # F: DLSS 4.5, nvngx_dlssd.dll 310.9 or later
         rr_model = rr_model.upper()
         if rr_model in rr_presets:
             env["D4R_RR_PRESET"] = str(rr_presets[rr_model])
-        elif rr_model in ("0", "4", "5"):
+        elif rr_model in ("0", "4", "5", "6"):
             env["D4R_RR_PRESET"] = rr_model
         else:
-            fail(f"[RayReconstruction] Model {rr_model!r}: use auto, default, D or E")
+            fail(f"[RayReconstruction] Model {rr_model!r}: use auto, default, D, E or F")
 
     age = get("Latency", "FrameAge")
     if age is not None:

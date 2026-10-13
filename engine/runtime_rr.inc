@@ -71,10 +71,12 @@ void putMat(std::vector<uint8_t>& p, uint32_t offset, const Mat4& m) {
     for (int i = 0; i < 16; ++i) putF(p, offset + 4 * i, static_cast<float>(m[i]));
 }
 } // namespace
+#include "runtime_rr2.inc"
 
 struct RModel::Impl {
     Device device;
     uint32_t preset = 0;
+    std::unique_ptr<R2Model> v2;   // preset F ("D4RR0002"): engine/runtime_rr2.inc
     // per stage, the shader's bindings after the three buffers (engine/rr/README.md): texture argument offsets, then
     // surface argument offsets with their GLSL image format, both ascending
     std::array<std::vector<uint32_t>, RStages> textures;
@@ -95,7 +97,14 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     auto text = read(directory + "/rr.txt");
     std::istringstream lines(std::string(text.begin(), text.end()));
     std::string line;
-    if (!std::getline(lines, line) || line.rfind("D4RR0001", 0) != 0) throw std::runtime_error("not a Ray Reconstruction model (rr.txt D4RR0001)");
+    if (!std::getline(lines, line)) throw std::runtime_error("not a Ray Reconstruction model (rr.txt)");
+    if (line.rfind("D4RR0002", 0) == 0) {
+        m.preset = 6;
+        m.v2 = std::make_unique<R2Model>();
+        m.v2->load(m.device, directory, lines, cache);
+        return;
+    }
+    if (line.rfind("D4RR0001", 0) != 0) throw std::runtime_error("not a Ray Reconstruction model (rr.txt D4RR0001)");
     unsigned stage = 0;
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     auto split = [](const std::string& list) {
@@ -153,6 +162,12 @@ uint32_t RModel::preset() const { return impl->preset; }
 void RModel::recordUpload(VkCommandBuffer cb) {
     auto& m = *impl;
     if (m.uploaded) throw std::runtime_error("model upload already recorded");
+    if (m.v2) {
+        m.v2->recordUpload(cb);
+        memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        m.uploaded = true;
+        return;
+    }
     for (unsigned i = 0; i < RStages; ++i) {
         VkBufferCopy copy{0, 0, m.uploads[i].size};
         vkCmdCopyBuffer(cb, m.uploads[i].handle, m.weights[i].handle, 1, &copy);
@@ -163,6 +178,7 @@ void RModel::recordUpload(VkCommandBuffer cb) {
 
 struct REngine::Impl {
     RModel::Impl& model;
+    std::unique_ptr<R2Engine> v2;   // preset F
     uint32_t rw, rh, ow, oh, w0, h0;
     Buffer arena, expP, expSums, expState;
     std::array<Buffer, RStages> params;
@@ -266,6 +282,12 @@ REngine::REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     : impl(std::make_unique<Impl>(*model.impl)) {
     auto& e = *impl;
     const Device& d = e.model.device;
+    if (e.model.v2) {
+        if (renderWidth < 64 || renderHeight < 64 || renderWidth > outputWidth || renderHeight > outputHeight || outputWidth > 16384 || outputHeight > 16384)
+            throw std::runtime_error("unsupported Ray Reconstruction dimensions");
+        e.v2 = std::make_unique<R2Engine>(d, *e.model.v2, renderWidth, renderHeight, outputWidth, outputHeight);
+        return;
+    }
     if (renderWidth < 64 || renderHeight < 64 || renderWidth > outputWidth || renderHeight > outputHeight || outputWidth > 16384 || outputHeight > 16384)
         throw std::runtime_error("unsupported Ray Reconstruction dimensions");
     e.rw = renderWidth; e.rh = renderHeight; e.ow = outputWidth; e.oh = outputHeight;
@@ -326,9 +348,10 @@ REngine::REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     }
 }
 REngine::~REngine() = default;
-VkImage REngine::outputImage() const { return impl->out.handle; }
+VkImage REngine::outputImage() const { return impl->v2 ? impl->v2->out.handle : impl->out.handle; }
 std::vector<REngine::DebugImage> REngine::debugImages() const {
     const auto& e = *impl;
+    if (e.v2) return e.v2->debugImages();
     std::vector<DebugImage> list;
     const VkFormat half4 = VK_FORMAT_R16G16B16A16_SFLOAT;
     for (int l = 0; l < 6; ++l) {
@@ -350,6 +373,7 @@ std::vector<REngine::DebugImage> REngine::debugImages() const {
 
 void REngine::recordInitialize(VkCommandBuffer cb) {
     auto& e = *impl;
+    if (e.v2) { e.v2->recordInitialize(cb); return; }
     std::vector<VkImage> images;
     for (auto* group : {&e.s112, &e.s120}) for (auto& t : *group) images.push_back(t.handle);
     for (auto* group : {&e.s128, &e.d112, &e.d120}) for (auto& t : *group) images.push_back(t.handle);
@@ -373,6 +397,7 @@ void REngine::recordInitialize(VkCommandBuffer cb) {
 
 void REngine::setFrame(const RFrameImages& images, const RFrameSettings& settings, FrameOutput finalOutput) {
     auto& e = *impl;
+    if (e.v2) { e.v2->setFrame(images, settings, finalOutput); return; }
     const Device& d = e.model.device;
     if (!images.color || !images.motion || !images.depth || !images.normals || !images.roughness || !images.diffuseAlbedo || !images.specularAlbedo)
         throw std::runtime_error("Ray Reconstruction needs colour, motion, depth and the four guides");
@@ -524,6 +549,7 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
 
 void REngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) {
     auto& e = *impl;
+    if (e.v2) { e.v2->recordFrame(cb, stamps, first); return; }
     if (!e.bound) throw std::runtime_error("REngine::setFrame was not called");
     const auto& b = *e.bound;
     const uint32_t f = e.frame, cur = f & 1u;

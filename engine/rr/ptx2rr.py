@@ -14,6 +14,7 @@ model/build directory only; do not commit or redistribute it.
 import argparse
 import importlib.util
 import json
+import os
 import re
 import struct
 import sys
@@ -110,6 +111,78 @@ void sust_p4(writeonly image2D s, int x, int y, vec4 v)
     if (uint(x) < uint(n.x) && uint(y) < uint(n.y)) imageStore(s, ivec2(x, y), v);
 }
 void sust_p1(writeonly image2D s, int x, int y, float v) { sust_p4(s, x, y, vec4(v, 0.0, 0.0, 0.0)); }
+// Formatted stores to normalized surfaces, as the reference converts them (ZLUDA's surface_formatted_store_bits): NaN
+// to zero, clamp, round half away from zero in f32. The quotient is what the image store then converts back exactly.
+// UNORM 10:10:10:2 surfaces (the pooled histories) are RGBA32F images holding the quantised values, like ZLUDA's.
+// tanh.approx.f32 as the reference computes it: ROCm's OCML tanh (device-libs ocml/src/tanhF.cl) with LLVM's AMDGPU
+// lowering of exp (lowerFEXP, fast-FMA path): the same fused operations, hardware exp2, ldexp and reciprocal.
+// (a fused f32 a * b + c through f64: the product is exact there and the sum is rounded to 53 bits before the f32
+// rounding. The driver's own f32 fma is a product and a sum whenever its product also exists on its own, as in
+// exp's ph / fma(x, c, -ph) pair.)
+float fmad(float a, float b, float c) { precise double s = double(a) * double(b) + double(c); return float(s); }
+float tanh_ocml(float x)
+{
+    const float y = abs(x);
+    precise float z;
+    if (y < 0.625) {
+        precise float y2 = y * y;
+        precise float p = fmad(y2, fmad(y2, fmad(y2, fmad(y2, -0.005700020585209131, 0.02063407190144062), -0.053737930953502655), 0.13331416249275208), -0.3333328068256378);
+        precise float yp = y * p;
+        z = fmad(y2, yp, y);
+    } else {
+        const float w = 2.0 * y;
+        precise float ph = w * 1.4426950216293335;
+        precise float f0 = fmad(w, 1.4426950216293335, -ph);
+        precise float pl = fmad(w, 1.925962855864327e-08, f0);
+        const float e = roundEven(ph);
+        precise float d = ph - e;
+        precise float a = d + pl;
+        float t = ldexp(exp2(a), int(e));
+        if (w > 88.72283172607422) t = uintBitsToFloat(0x7f800000u);
+        precise float s1 = t + 1.0;
+        z = fmad(-2.0, rcp_a(s1), 1.0);
+    }
+    return x < 0.0 || floatBitsToUint(x) == 0x80000000u ? -z : z;
+}
+// tanh.approx.f16: from a table of the correctly rounded values indexed by the argument's bits (RR_TANH_TABLE: its
+// byte offset in the weight buffer; engine/rr/rr2_pack.py) where a stage has one, else through f32
+#ifdef RR_TANH_TABLE
+float16_t tanh16(float16_t x) { return uint16BitsToFloat16(wbuf.wh[RR_TANH_TABLE / 2u + uint(float16BitsToUint16(x))]); }
+#else
+float16_t tanh16(float16_t x) { return float16_t(tanh(float(x))); }
+#endif
+vec4 q_snorm8(vec4 v)
+{
+    v = clamp(mix(v, vec4(0.0), isnan(v)), vec4(-1.0), vec4(1.0));
+    precise vec4 s = v * 127.0;
+    precise vec4 a = abs(s) + 0.5;
+    return sign(s) * floor(a) / 127.0;
+}
+vec4 q_unorm8(vec4 v)
+{
+    v = clamp(mix(v, vec4(0.0), isnan(v)), vec4(0.0), vec4(1.0));
+    precise vec4 a = v * 255.0 + 0.5;
+    return floor(a) / 255.0;
+}
+// (the quotient q / 1023 must be the correctly rounded f32 the reference stores: the driver divides by multiplying
+// with a reciprocal, one step off for some q, so it comes from a table)
+const float Q1023[1024] = float[1024](Q1023_VALUES);
+vec4 q_unorm1010102(vec4 v)
+{
+    v = clamp(mix(v, vec4(0.0), isnan(v)), vec4(0.0), vec4(1.0));
+    precise vec4 a = v * vec4(1023.0, 1023.0, 1023.0, 3.0) + 0.5;
+    const ivec4 q = ivec4(floor(a));
+    const float third[4] = float[4](0.0, 0.3333333432674408, 0.6666666865348816, 1.0);
+    return vec4(Q1023[q.x], Q1023[q.y], Q1023[q.z], third[q.w]);
+}
+// for a real UNORM 10:10:10:2 image: the reference's rounding (half away from zero) here, and any value within half a
+// step of q / 1023 for the store, which the hardware quantises back to q
+vec4 q_unorm1010102_hw(vec4 v)
+{
+    v = clamp(mix(v, vec4(0.0), isnan(v)), vec4(0.0), vec4(1.0));
+    precise vec4 a = v * vec4(1023.0, 1023.0, 1023.0, 3.0) + 0.5;
+    return floor(a) * vec4(1.0 / 1023.0, 1.0 / 1023.0, 1.0 / 1023.0, 1.0 / 3.0);
+}
 // Binary stores write the halves' bits. RADV folds float(float16_t(x)) back to x when the half came from a
 // cvt.rn.f16.f32 in a register, and the image store then truncates x instead (the output stage's history surface
 // was one binary16 ulp low in half its values, which the next frame's encoder 0 amplifies): OR-ing in a zero the
@@ -135,7 +208,7 @@ uint shfl_dir(uint v, uint delta, uint opts, bool down, out bool in_bounds)
     bool oob = down ? idx > sub_end : idx < sub_end;
     if (oob) idx = self;
     in_bounds = !oob;
-    return subgroupShuffle(v, uint(idx) & 31u);
+    return subgroupShuffle(v, (gl_SubgroupInvocationID & 32u) | (uint(idx) & 31u));   // the warp is this half of a 64-wide wave
 }
 
 // shfl.sync.idx (PTX ISA): j = minLane | (b & ~segmask), in bounds while j <= maxLane, otherwise the lane's own value
@@ -144,7 +217,7 @@ uint shfl_idx(uint v, uint b, uint opts, out bool in_bounds)
     uint mask = (opts >> 8) & 31u, lane = gl_SubgroupInvocationID & 31u;
     uint maxLane = (lane & mask) | (opts & 31u & ~mask), j = (lane & mask) | (b & 31u & ~mask);
     in_bounds = j <= maxLane;
-    return subgroupShuffle(v, in_bounds ? j : lane);
+    return subgroupShuffle(v, (gl_SubgroupInvocationID & 32u) | (in_bounds ? j : lane));
 }
 // movmatrix.sync.trans.aligned.m8n8.b16 on one b32 fragment register per lane: lane (g = lane>>2, t = lane&3)
 // holds row g, columns 2t and 2t+1. The transpose gathers (row 2t, col g) and (row 2t+1, col g).
@@ -337,12 +410,16 @@ def base_helper(name):
     return '\n'.join(lines[start:end + 1]) + '\n'
 
 
+RR_RUNTIME = RR_RUNTIME.replace('Q1023_VALUES', ', '.join(repr(float(np.float32(q) / np.float32(1023))) for q in range(1024)))
 RR_RUNTIME += base_helper('prmt') + base_helper('shfl_bfly').replace(
-    'return subgroupShuffle(v, (gl_SubgroupInvocationID & 32u) | uint(idx));', 'return subgroupShuffle(v, uint(idx) & 31u);')
+    'return subgroupShuffle(v, (gl_SubgroupInvocationID & 32u) | uint(idx));',
+    'return subgroupShuffle(v, (gl_SubgroupInvocationID & 32u) | (uint(idx) & 31u));')
 
 
 class RRT(base.T):
-    def __init__(self, ptx, kernel, block):
+    def __init__(self, ptx, kernel, block, weights_arg=40, buffers=()):
+        self.weights_arg = weights_arg
+        self.buffers = sorted(buffers)   # argument offsets of further buffers, each its own binding
         bx, by, bz = block
         if bx * by * bz % 32:
             raise base.Err('block size must be a multiple of the 32-lane subgroup')
@@ -367,10 +444,18 @@ class RRT(base.T):
         # without it the compiler may contract a product and a sum across them depending on scheduling (results then
         # changed with unrelated code and with the device's robustness features)
         self.precise_all = True
+        # module globals with an initialiser (the output filter's bicubic phase table): constants, laid out one after
+        # another in a blob that is the stage's weight buffer (binding 1); `mov.u64 %rd, NAME` is its offset there
+        self.globals, self.globals_blob = {}, b''
+        for gm in re.finditer(r'\.global\s+\.align\s+\d+\s+\.b8\s+(\w+)\[(\d+)\]\s*=\s*\{([^}]*)\}', ptx):
+            self.globals[gm.group(1)] = len(self.globals_blob)
+            data = bytes(int(x) for x in gm.group(3).split(','))
+            self.globals_blob += data + bytes(-len(data) % 16)
         self.stmt_lines = statement_lines(ptx, kernel)
         self.stmt_index = 0
         super().__init__(ptx, kernel)
-        self.pair_mma()
+        if not os.environ.get('D4R_PTX2RR_NO_PAIR'):
+            self.pair_mma()
         self.origins()
 
     def stmt(self, s):
@@ -438,9 +523,12 @@ class RRT(base.T):
                 if not a or not re.fullmatch(r'%rd\d+', a[0]) or op.startswith(('ld.', 'st.', 'bra')):
                     if op != 'ld.param.u64':
                         continue
-                if op == 'ld.param.u64':
+                if op.startswith('mov') and len(a) > 1 and a[1].strip() in self.globals:
+                    new = {'w'}
+                elif op == 'ld.param.u64':
                     # the argument's true offset (the load may go through a register based inside the block)
-                    new = {'w' if self.param_off(a[1]) == 40 else 'a'}
+                    off_ = self.param_off(a[1])
+                    new = {'w' if off_ == self.weights_arg else f'x{off_}' if off_ in self.buffers else 'a'}
                 else:
                     new = set()
                     for x in a[1:]:
@@ -457,21 +545,29 @@ class RRT(base.T):
             raise base.Err(f'global pointer {reg} has origin {sorted(s)} (need exactly one of w/a)')
         return next(iter(s))
 
+    def gfn(self, reg, store=False):
+        o = self.gorigin(reg)
+        if o == 'w':
+            return 'GW'
+        if o == 'a':
+            return 'SA' if store else 'GA'
+        return ('SX' if store else 'GX') + o[1:] + '_'
+
     def gaddr(self, tok):
-        m = re.fullmatch(r'\[\s*(%rd\d+)\s*(?:\+\s*(\d+))?\s*\]', tok.strip())
+        m = re.fullmatch(r'\[\s*(%rd\d+)\s*(?:\+\s*(-?\d+))?\s*\]', tok.strip())
         if not m:
             raise base.Err(f'unsupported global address {tok}')
         return m.group(1), int(m.group(2) or 0)
 
     def gbyte(self, reg, off):
-        return f'uint({self.val(reg, "u64")}) + {off}u'
+        return f'uint({self.val(reg, "u64")}) + {off}u' if off >= 0 else f'uint({self.val(reg, "u64")}) - {-off}u'
 
     def ld(self, o, a):
         if 'global' not in o:
             return super().ld(o, a)
         size, count = mem_shape(o)
         reg, off = self.gaddr(a[1])
-        fn = 'GW' if self.gorigin(reg) == 'w' else 'GA'
+        fn = self.gfn(reg)
         dsts = braces(a[0]) if count > 1 else [a[0]]
         for i, d in enumerate(dsts):
             self.A(d, f'{fn}{size * 8}({self.gbyte(reg, off + i * size)})', 'u16' if size == 2 else 'u32')
@@ -481,14 +577,15 @@ class RRT(base.T):
             return super().st(o, a)
         size, count = mem_shape(o)
         reg, off = self.gaddr(a[0])
-        if self.gorigin(reg) != 'a':
-            raise base.Err('store through the read-only weight pointer')
+        if self.gorigin(reg) == 'w':
+            raise base.Err(f'store through the read-only weight pointer: {a}')
+        fn = self.gfn(reg, True)
         vals = braces(a[1]) if count > 1 else [a[1]]
         for i, v in enumerate(vals):
             if size == 2:
-                self.E(f'SA16({self.gbyte(reg, off + i * size)}, {self.val(v, "u16")});')
+                self.E(f'{fn}16({self.gbyte(reg, off + i * size)}, {self.val(v, "u16")});')
             else:
-                self.E(f'SA32({self.gbyte(reg, off + i * size)}, {self.val(v, "u32")});')
+                self.E(f'{fn}32({self.gbyte(reg, off + i * size)}, {self.val(v, "u32")});')
 
     # ------------------------------------------------ textures and surfaces
     def handle_off(self, h):
@@ -515,7 +612,7 @@ class RRT(base.T):
             # (zluda_ptx_impl.cpp fetch_2D). The output stage's specular reprojection reads such neighbours at the image
             # border: with clamp its surfaces were 99.92% identical to the capture, with zero 99.997% (capDX, 2026-10-12)
             fetch = f'fetch0(T{off}, ivec2({self.val(c[0], "s32")}, {self.val(c[1], "s32")}))'
-        elif 'base' in o and o[-1] == 'f32':
+        elif ('base' in o or o[0] == '2d') and o[-1] == 'f32':   # tex.2d: no derivatives in a kernel, level 0
             fetch = f'textureLod(T{off}, vec2({self.val(c[0], "f32")}, {self.val(c[1], "f32")}), 0.0)'
         elif 'level' in o and o[-1] == 'f32':
             fetch = (f'textureLod(T{off}, vec2({self.val(c[0], "f32")}, {self.val(c[1], "f32")}), '
@@ -525,7 +622,9 @@ class RRT(base.T):
         f16 = 'f16' in o
         self.E(f'{{ vec4 t_ = {fetch};')
         for i, d in enumerate(dst):
-            self.A(d, f'float16_t(t_[{i}])' if f16 else f't_[{i}]', 'f16' if f16 else 'float')
+            # a binary16 result is the texel rounded to binary16: through H(HU(...) | SUST_Z) so that the driver cannot
+            # fold the rounding away when the value is widened again (RR_RUNTIME's note on sust_b)
+            self.A(d, f'H(HU(float16_t(t_[{i}])) | SUST_Z)' if f16 else f't_[{i}]', 'f16' if f16 else 'float')
         self.E('}')
 
     def sust(self, op, a):
@@ -534,9 +633,10 @@ class RRT(base.T):
         v = braces(a[1])
         x, y = self.val(c[0], 's32'), self.val(c[1], 's32')
         S = f'S{off}'
+        op = op.replace('.cs.', '.')   # the streaming cache policy: a hint, the store is the same
         if op == 'sust.p.2d.v4.b32.zero':
             self.set_surface(off, 'rgba16f')
-            self.E(f'sust_p4({S}, {x}, {y}, vec4({", ".join(self.val(q, "f32") for q in v)}));')
+            self.E(f'sust_p4({S}, {x}, {y}, SUSTQ_{off}(vec4({", ".join(self.val(q, "f32") for q in v)})));')
         elif op == 'sust.p.2d.b32.zero':
             self.set_surface(off, 'r16f')
             self.E(f'sust_p1({S}, {x}, {y}, {self.val(v[0], "f32")});')
@@ -579,6 +679,13 @@ class RRT(base.T):
         types = [t for t in o if re.match(r'^(f|s|u|b)\d+(x2)?$', t)]
         if types[:2] in (['u32', 'u64'], ['s32', 's64'], ['u32', 's64'], ['s32', 'u64']):
             return self.A(a[0], f'uint({self.val(a[1], "u64")})', 'u32')
+        if types[:2] == ['f16', 'f32'] and 'rn' in o and 'satfinite' not in o:
+            # Two things the driver must not do. It folds float(float16_t(x)) to x when the result is widened again
+            # (RR_RUNTIME's note on sust_b): the OR on the binary16 bits. And it fuses a product or sum with this
+            # conversion into v_fma_mix, one rounding of the exact value, where the kernel rounds to f32 first: an f32
+            # result that is exactly a binary16 midpoint then rounds the other way (the output stages' rare one-step
+            # differences, e.g. log2(x) * c1 * c2; found 2026-10-13): the OR on the f32 bits keeps the f32 value.
+            return self.A(a[0], f'H(HU(float16_t(uintBitsToFloat(floatBitsToUint({self.val(a[1], "f32")}) | SUST_Z))) | SUST_Z)', 'f16')
         return super().cvt(op, o, a)
 
     def f64_op(self, op, a):
@@ -610,6 +717,22 @@ class RRT(base.T):
             return self.E('}')
         if op == 'mma.paired.noop':
             return
+        if parts[0] == 'mov' and len(a) > 1 and a[1].strip() in self.globals:
+            return self.A(a[0], f'uint64_t({self.globals[a[1].strip()]}u)', 'u64')
+        # cross-kernel progress counters (NGX runs the output passes concurrently and has each wait for the rows it
+        # needs): plain loads and adds here. The engine runs the passes one after another and leaves the counter
+        # pointers null, which the kernels test, so these never execute.
+        if parts[0] == 'ld' and ('relaxed' in parts or 'acquire' in parts) and 'global' in parts:
+            return self.ld([q for q in parts[1:] if q not in ('relaxed', 'acquire', 'gpu') and '::' not in q and not q.startswith('L1')], a)
+        if parts[0] == 'red' and parts[-2] == 'add':
+            reg, off = self.gaddr(a[0])
+            fn, sfn = self.gfn(reg), self.gfn(reg, True)
+            return self.E(f'{sfn}32({self.gbyte(reg, off)}, {fn}32({self.gbyte(reg, off)}) + {self.val(a[1], "u32")});')
+        if op == 'membar.gl':
+            return
+        if op == 'activemask.b32':
+            # the warp's lanes: this half of a 64-wide wave
+            return self.A(a[0], '((gl_SubgroupInvocationID & 32u) != 0u ? subgroupBallot(true).y : subgroupBallot(true).x)', 'u32')
         if op == 'movmatrix.sync.trans.aligned.m8n8.b16':
             return self.A(a[0], f'movm_trans({self.val(a[1], "u32")})', 'u32')
         # PTX clamps shift amounts at the register width (shl/shr.u give 0, shr.s the sign); GLSL leaves them undefined
@@ -635,6 +758,16 @@ class RRT(base.T):
             return self.tex(op, a)
         if parts[0] == 'cvt' and [t for t in parts[1:] if t in ('f16x2', 'e4m3x2')] == ['e4m3x2', 'f16x2']:
             return self.cvt_to_e4m3(op, a)
+        if op == 'copysign.f32':   # PTX: the sign of the first source on the value of the second
+            x, y = self.val(a[1], 'f32'), self.val(a[2], 'f32')
+            return self.A(a[0], f'uintBitsToFloat((floatBitsToUint({y}) & 0x7fffffffu) | (floatBitsToUint({x}) & 0x80000000u))', 'float')
+        if op == 'tanh.approx.f16':
+            return self.A(a[0], f'tanh16({self.val(a[1], "f16")})', 'f16')
+        if op == 'tanh.approx.f32':
+            return self.A(a[0], f'tanh_ocml({self.val(a[1], "f32")})', 'float')
+        if op == 'ex2.approx.f16':
+            # v_exp_f32 of the widened value, rounded to binary16; the ORs keep that rounding (see cvt)
+            return self.A(a[0], f'H(HU(float16_t(uintBitsToFloat(floatBitsToUint(exp2(float({self.val(a[1], "f16")}))) | SUST_Z))) | SUST_Z)', 'f16')
         if op == 'neg.f16':
             return self.A(a[0], f'-{self.val(a[1], "f16")}', 'f16')
         if parts[0] in ('min', 'max') and 'NaN' not in parts and any(t in parts for t in ('f16', 'f16x2', 'f32')):
@@ -659,6 +792,7 @@ class RRT(base.T):
         w('#extension GL_EXT_shader_16bit_storage : require')
         w('#extension GL_KHR_shader_subgroup_basic : require')
         w('#extension GL_KHR_shader_subgroup_shuffle : require')
+        w('#extension GL_KHR_shader_subgroup_ballot : require')
         w('#extension GL_KHR_cooperative_matrix : require')
         w('#extension GL_KHR_memory_scope_semantics : require')
         w('#extension GL_EXT_float_e4m3 : require')
@@ -673,6 +807,15 @@ class RRT(base.T):
             n += 1
         for off in sorted(self.surfaces):
             w(f'layout(set = 0, binding = {n}, {self.surfaces[off]}) uniform writeonly image2D S{off};')
+            q = {'rgba8_snorm': 'q_snorm8', 'rgba8': 'q_unorm8', 'rgba32f': 'q_unorm1010102', 'rgb10_a2': 'q_unorm1010102_hw'}.get(self.surfaces[off], '')
+            w(f'#define SUSTQ_{off}(v) {q}(v)')
+            n += 1
+        for off in self.buffers:
+            w(f'layout(set = 0, binding = {n}, std430) buffer XBuf{off} {{ uint16_t h[]; }} xb{off};')
+            w(f'uint GX{off}_16(uint a) {{ return uint(xb{off}.h[a >> 1]); }}')
+            w(f'uint GX{off}_32(uint a) {{ return uint(xb{off}.h[a >> 1]) | (uint(xb{off}.h[(a >> 1) + 1u]) << 16); }}')
+            w(f'void SX{off}_16(uint a, uint v) {{ xb{off}.h[a >> 1] = uint16_t(v & 0xffffu); }}')
+            w(f'void SX{off}_32(uint a, uint v) {{ xb{off}.h[a >> 1] = uint16_t(v & 0xffffu); xb{off}.h[(a >> 1) + 1u] = uint16_t(v >> 16); }}')
             n += 1
         w(f'shared uint sh[{max(1, (self.shared_bytes + 3) // 4)}];')
         if self.probe_slots or self.oob:
@@ -694,6 +837,11 @@ def main():
     ap.add_argument('--surface', action='append', default=[], metavar='OFFSET=FORMAT',
                     help="the GLSL image format of a surface whose stores are formatted (sust.p), when it is not the "
                          "store's own guess, e.g. 144=rgba8_snorm (repeatable)")
+    ap.add_argument('--weights-arg', type=int, default=40,
+                    help='argument offset of the weight pointer (40 for the DLSS-D kernels, 24 for rr2_*)')
+    ap.add_argument('--buffer', action='append', type=int, default=[], metavar='OFFSET',
+                    help='a pointer argument that is neither the weights nor the arena: its own storage buffer, bound '
+                         'after the surfaces in ascending argument offset (repeatable)')
     ap.add_argument('--probe', action='append', default=[], metavar='LINE:%REG,...',
                     help='debugging: store the registers after the statement at that module line executes (last '
                          'execution) for workgroup --probe-block, into a debug buffer bound after the surfaces')
@@ -709,7 +857,7 @@ def main():
         probes[int(line)] = [r.strip() for r in regs.split(',')]
 
     def make():
-        t = RRT(src, ns.kernel, block)
+        t = RRT(src, ns.kernel, block, ns.weights_arg, ns.buffer)
         t.probes = probes
         t.probe_block = tuple(int(x) for x in ns.probe_block.split(','))
         t.oob = ns.oob_report
@@ -719,10 +867,12 @@ def main():
         if off in t.surfaces:
             t.surfaces[off] = fmt
     open(ns.out, 'w').write(t.emit({}))
+    if t.globals_blob:
+        Path(ns.out).with_suffix('.globals.bin').write_bytes(t.globals_blob)
     # the binding order (stage contract): textures, then surfaces, in ascending argument offset
     Path(ns.out).with_suffix('.json').write_text(json.dumps(
         {'kernel': ns.kernel, 'block': block, 'textures': sorted(t.textures),
-         'surfaces': [[off, t.surfaces[off]] for off in sorted(t.surfaces)], 'shared': t.shared_bytes,
+         'surfaces': [[off, t.surfaces[off]] for off in sorted(t.surfaces)], 'buffers': t.buffers, 'shared': t.shared_bytes,
          'probes': [[line, reg] for line in sorted(probes) for reg in probes[line]], 'oob': ns.oob_report}) + '\n')
     sys.stderr.write(f'block={block} textures={sorted(t.textures)} surfaces={t.surfaces} shared={t.shared_bytes}\n')
 

@@ -32,8 +32,9 @@ std::vector<char> read(const std::string& file) {
 }
 uint32_t texelBytes(VkFormat f) {
     switch (f) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
-    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM: return 4;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM: return 4;
     case VK_FORMAT_R16_SFLOAT: return 2;
     default: throw std::runtime_error("texelBytes: format");
     }
@@ -163,7 +164,8 @@ int main(int argc, char** argv) try {
     const VkFormat optionalFormats[] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
     std::vector<Input> optional;
     for (VkFormat f : optionalFormats) optional.emplace_back(c, f, rw, rh);
-    HostBuffer staging(c, VkDeviceSize(ow) * oh * 8);
+    // large enough for every debug image: preset F's intermediate history is 1.5 times the output size on both axes
+    HostBuffer staging(c, VkDeviceSize(ow) * oh * 8 * 4);
     // GPU time of every frame: REngine's four stamps (start, after exposure, after the network, after the output)
     VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qp.queryType = VK_QUERY_TYPE_TIMESTAMP; qp.queryCount = 4;
@@ -179,6 +181,7 @@ int main(int argc, char** argv) try {
         for (float& v : s.worldToView) frames >> v;
         for (float& v : s.viewToClip) frames >> v;
         s.reset = reset != 0; s.depthInverted = (inverted & 1) != 0; s.hardwareDepth = (inverted & 2) != 0;   // bit 1: DLSS.Use.HW.Depth
+        s.roughnessPacked = (inverted & 4) != 0;   // bit 2: DLSS.Roughness.Mode (preset F inputs)
         for (size_t i = 0; i < inputs.size(); ++i) {
             auto data = read(inputDir + "/" + std::to_string(f) + "-" + names[i] + ".bin");
             if (data.size() != size_t(rw) * rh * texelBytes(formats[i])) throw std::runtime_error(std::string("input size: ") + names[i]);

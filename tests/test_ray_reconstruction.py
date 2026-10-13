@@ -44,8 +44,13 @@ class RayReconstructionConfigTests(unittest.TestCase):
         self.assertEqual(decided["D4R_RR_PRESET"], "5")     # Ray Reconstruction preset E
         self.assertEqual(decided["D4R_DLSS_PRESET"], "11")  # Super Sampling preset K
 
+    def test_dlss_45_ray_reconstruction_is_model_f(self):
+        code, decided = run_config("[RayReconstruction]\nEnable = true\nModel = F\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(decided["D4R_RR_PRESET"], "6")     # preset F: nvngx_dlssd.dll 310.9 or later
+
     def test_invalid_rr_settings_are_rejected_rather_than_guessed(self):
-        for text in ("[RayReconstruction]\nModel = F\n",
+        for text in ("[RayReconstruction]\nModel = G\n",
                      "[RayReconstruction]\nModel = K\n",
                      "[RayReconstruction]\nEnable = maybe\n"):
             with self.subTest(ini=text):
