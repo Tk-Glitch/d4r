@@ -69,6 +69,35 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define RND(m) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (m)[i_] = rnd16((m)[i_]);
 #define Q8(dst, src) Q8PAIRS(dst, src)
 // One 32-deep step onto an accumulator of binary16 values: the reference adds it inside the f32 products and rounds
+// RR_FUSE (D4R_RR_FUSE=1): out = in + branch * s and the guide's blend as one fused multiply-add each, which is what
+// NVIDIA's compiler makes of those multiply / add pairs on an NVIDIA card; without it the product is rounded first,
+// as ZLUDA (the captures) does. The activation table is built to match (enc1_ref.act).
+#ifdef RR_FUSE
+#define MADD(d, a, b, c) precise float16_t d = fma((a), (b), (c));
+#define MADD4(d, a, b, c) precise f16vec4 d = fma((a), (b), (c));
+#else
+#define MADD(d, a, b, c) precise float16_t d##_p = (a) * (b); precise float16_t d = (c) + d##_p;
+#define MADD4(d, a, b, c) precise f16vec4 d##_p = (a) * (b); precise f16vec4 d = d##_p + (c);
+#endif
+// RR_NATIVE (D4R_RR_RELAXED=3): the residual steps and the MLP activation in f32, straight into FP8 - no binary16 in
+// between and no activation table. Not the reference's roundings (about 40 dB from it, like RR_RELAXED).
+// (The biases stay binary16: f32 copies were tried for RR_NATIVE and were slower - half the conversions, but one more
+// load per accumulator, and a load costs about three arithmetic instructions here.)
+#define BV(X, i) RV(w16.w[W_##X / 2u + (i)])
+#define BVS(X, stride, n, i) RV(w16.w[(W_##X + (stride) * (n)) / 2u + (i)])
+#ifdef RR_NATIVE
+#define RVT float
+#define E4V(w, b) float(uintBitsToFloate4m3EXT(uint8_t(((w) >> (8u * (b))) & 0xffu)))
+#define RESID(d, a, s, c) const float d = fma(float(a), float(s), float(c));
+#define Q8R(x) q8s(x)
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2(float((h)[i_]), float((h)[i_ + 1])); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#else
+#define RVT float16_t
+#define E4V(w, b) e4((w), (b))
+#define RESID(d, a, s, c) MADD(d, float16_t(a), s, c)
+#define Q8R(x) q8h(x)
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_] = ACTQ(float16_t((h)[i_]));
+#endif
 // once (swin_m.comp explains RR_MIX, the one-rounding variant that is not bit-exact by construction)
 #ifdef RR_MIX
 #define RAC HAC
@@ -82,6 +111,7 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define K32H(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(acc))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_]); }
 #endif
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
+#define BRANCHB BRANCH
 
 shared uint XT[16 * C];          // the window's tokens: [token slot][C FP8 channels in slot order]; later the merge rows
 shared uint KVS[2 * 512];        // the current head's QK ([token slot][32]), then V^T ([32][token slot])
@@ -89,9 +119,15 @@ shared uint KVS[2 * 512];        // the current head's QK ([token slot][32]), th
 shared uint GT[64 * 32];         // the merge input: [token slot][4 sub-positions x 32 FP8 channels]
 #endif
 #if KIND == 2
-shared uint LOW[4 * CL];         // the 4 x 4 tokens one level down: [row-major][CL FP8 channels]
+// Shared memory is what limits how many waves this GPU keeps running: above about 4 KiB per wave (16 KiB for this
+// workgroup) the rate falls in proportion (measured: build/rr/f/nv/cost/occ2.py). So the 4 x 4 tokens one level down
+// ([row-major][CL FP8 channels]) borrow KVS, which the attention only writes later, and the block's input before its
+// FP8 conversion stays in each lane's registers (xr), not in a [token slot][channel slot] array.
+#if 4 * CL > 2 * 512
+#error rr2_m.comp: LOW no longer fits in KVS
+#endif
+#define LOW KVS
 shared uint EX[16 * C];          // their expansion: [low token][sub-position][C FP8 channels in slot order]
-shared float16_t XE[64 * C];     // the block's input before its FP8 conversion: [token slot][channel slot]
 #endif
 #if KIND == 4
 #ifdef RR2_XF_ARENA
@@ -107,6 +143,7 @@ shared uint XF[RR2_GROUP * 64 * 16];   // per window, the features from the gath
 #endif
 shared float16_t HD[RR2_GROUP * 64 * 4];   // per window, the guide head per token (raster order), for the translated tail
 const uint EBRANCH = W_EWD1 - W_EWD0;
+#define EBRANCHB EBRANCH
 #endif
 #if KIND == 5
 shared float16_t RSH[RR2_GROUP * 64 * 32], MSH[RR2_GROUP * 64 * 32];   // per window, r and the MLP sum per token (raster order) and natural channel
@@ -165,18 +202,18 @@ void main()
         [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[kt], XF_SRC, XF_AT + wv * 256u + 4u * kt, 16u, CMJ);
         RAC X[MT];
         [[unroll]] for (uint m = 0u; m < MT; ++m)
-            [[unroll]] for (int i = 0; i < 8; ++i) X[m][i] = RV(w16.w[W_EBU / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) X[m][i] = BV(EBU, 16u * m + 8u * hl + uint(i));
         [[unroll]] for (uint br = 0u; br < 2u; ++br) {
             B8 Hb[2];
             [[unroll]] for (uint c = 0u; c < 2u; ++c) {
                 RAC h;
-                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = RV(w16.w[(W_EBD0 + EBRANCH * br) / 2u + 16u * c + 8u * hl + uint(i)]);
+                [[unroll]] for (int i = 0; i < 8; ++i) h[i] = BVS(EBD0, EBRANCHB, br, 16u * c + 8u * hl + uint(i));
                 [[unroll]] for (uint kt = 0u; kt < 4u; kt += 2u) {
                     A8 a0, a1;
                     LDA(a0, W_EWD0 + EBRANCH * br, 64u, c, kt); LDA(a1, W_EWD0 + EBRANCH * br, 64u, c, kt + 1u);
                     K32(h, a0, fb[kt], a1, fb[kt + 1u])
                 }
-                [[unroll]] for (int i = 0; i < 8; ++i) Hb[c][i] = ACTQ(float16_t(h[i]));
+                ACT8(Hb[c], h)
             }
             [[unroll]] for (uint m = 0u; m < MT; ++m) {
                 A8 a0, a1;
@@ -207,7 +244,7 @@ void main()
         [[unroll]] for (uint kt = 0u; kt < 8u; ++kt) coopMatLoad(gb[kt], GT, wv * 512u + 4u * kt, 32u, CMJ);
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             RAC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_B1 / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = BV(B1, 16u * m + 8u * hl + uint(i));
             [[unroll]] for (uint kt = 0u; kt < 8u; kt += 2u) {
                 A8 w0, w1;
                 LDA(w0, W_W1, 128u, m, kt); LDA(w1, W_W1, 128u, m, kt + 1u);
@@ -221,6 +258,7 @@ void main()
     barrier();
 #else
     // a decoder's first kernel: wave w expands the 16 low tokens to sub-position w, then x = dq(e) + dq(skip) * s3
+    float16_t xr[MT][8];   // x of this lane's token (slot 16 wv + col), channel slots 16 m + 8 hl + i
     {
         const int X0 = x0 >> 1, Y0 = y0 >> 1;
         for (uint i = tid; i < 4u * CL; i += 128u) {
@@ -234,7 +272,7 @@ void main()
         for (uint mm = 0u; mm < MT; ++mm) {
             const uint m = MT * wv + mm;
             RAC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = BV(BE, 16u * m + 8u * hl + uint(i));
             [[unroll]] for (uint kt = 0u; kt < CL / 16; kt += 2u) {
                 A8 w0, w1;
                 LDA(w0, W_WE, CL, m, kt); LDA(w1, W_WE, CL, m, kt + 1u);
@@ -255,13 +293,26 @@ void main()
                 const uint e = EX[r * C + s * (C / 4u) + wd];
                 floate4m3_t c[4];
                 [[unroll]] for (uint b = 0u; b < 4u; ++b) {
-                    precise float16_t ms = e4(sk, b) * s3;
-                    precise float16_t x = e4(e, b) + ms;
-                    XE[tid * C + 4u * wd + b] = x;
+                    MADD(x, e4(sk, b), s3, e4(e, b))
                     c[b] = q8h(x);
                 }
                 XT[tid * (C / 4u) + wd] = pack4(c[0], c[1], c[2], c[3]);
             }
+        }
+        {   // the same x for the residual step: the bytes of the words 4 m + 2 hl and 4 m + 2 hl + 1 of this lane's token
+            const int kx = x0 + int(t & 7u), ky = y0 + int(t >> 3u);
+            const uint tb = (skOff + uint(mirror(ky, ey) * ex + mirror(kx, ex)) * 32u) / 4u;
+            const uint r = uint(((ky >> 1) - Y0) * 4 + ((kx >> 1) - X0)), s = uint(2 * (ky & 1) + (kx & 1));
+            [[unroll]] for (uint m = 0u; m < MT; ++m)
+                [[unroll]] for (uint h2 = 0u; h2 < 2u; ++h2) {
+                    const uint wd = 4u * m + 2u * hl + h2;
+                    const uint sk = arena.w[tb + (wd >> 3u) * (plane >> 2u) + (wd & 7u)];
+                    const uint e = EX[r * C + s * (C / 4u) + wd];
+                    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                        MADD(x, e4(sk, b), s3, e4(e, b))
+                        xr[m][4u * h2 + b] = x;
+                    }
+                }
         }
         barrier();
     }
@@ -270,7 +321,7 @@ void main()
     // ---------------------------------------------------------------- attention: the heads' out-projections sum up
     RAC AT[MT];
     [[unroll]] for (uint m = 0u; m < MT; ++m)
-        [[unroll]] for (int i = 0; i < 8; ++i) AT[m][i] = RV(w16.w[W_BO / 2u + 16u * m + 8u * hl + uint(i)]);
+        [[unroll]] for (int i = 0; i < 8; ++i) AT[m][i] = BV(BO, 16u * m + 8u * hl + uint(i));
     [[dont_unroll]] for (uint hd = 0u; hd < NH; ++hd) {
         barrier();   // every wave is done with the previous head's QK / V
         for (uint j = 0u; j < 2u; ++j) {   // 8 jobs (token tile n, channel tile c)
@@ -302,11 +353,11 @@ void main()
         {
             float16_t e[4][8];
             [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) {
-                HAC c;
-                coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
                 A8 k0, k1;
                 coopMatLoad(k0, KVS, kt * 128u, 8u, RM);
                 coopMatLoad(k1, KVS, kt * 128u + 4u, 8u, RM);
+                HAC c;
+                coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
                 K32H(c, k0, Qb[0], k1, Qb[1])
                 [[unroll]] for (int i = 0; i < 8; ++i) e[kt][i] = hb(uint(w16u.w[W_CUBIC / 2u + bh(c[i])]));
             }
@@ -355,7 +406,7 @@ void main()
     }
 
     // ---------------------------------------------------------------- r = x + attention * s1; the MLP's input q8(r)
-    float16_t rv[MT][8];
+    RVT rv[MT][8];
     B8 Nb[MT];
     [[unroll]] for (uint m = 0u; m < MT; ++m) {
 #if KIND != 2
@@ -364,31 +415,30 @@ void main()
 #endif
         [[unroll]] for (int i = 0; i < 8; ++i) {
 #if KIND == 2
-            const float16_t xb = XE[(16u * wv + col) * C + 16u * m + 8u * hl + uint(i)];
+            const float16_t xb = xr[m][i];
 #else
-            const float16_t xb = e4(xw[i >> 2], uint(i) & 3u);
+            const RVT xb = E4V(xw[i >> 2], uint(i) & 3u);
 #endif
-            precise float16_t sa = float16_t(AT[m][i]) * s1;
-            precise float16_t r = xb + sa;
+            RESID(r, AT[m][i], s1, xb)
             rv[m][i] = r;
-            Nb[m][i] = q8h(r);
+            Nb[m][i] = Q8R(r);
         }
     }
     RAC ML[MT];
     [[unroll]] for (uint m = 0u; m < MT; ++m)
-        [[unroll]] for (int i = 0; i < 8; ++i) ML[m][i] = RV(w16.w[W_BU / 2u + 16u * m + 8u * hl + uint(i)]);
+        [[unroll]] for (int i = 0; i < 8; ++i) ML[m][i] = BV(BU, 16u * m + 8u * hl + uint(i));
     [[dont_unroll]] for (uint br = 0u; br < NB; ++br) {
         const uint w1 = W_WD0 + BRANCH * br, b1 = W_BD0 + BRANCH * br, w2 = W_WU0 + BRANCH * br;
         B8 Hb[2];
         [[unroll]] for (uint c = 0u; c < 2u; ++c) {
             RAC h;
-            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = RV(w16.w[b1 / 2u + 16u * c + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) h[i] = BVS(BD0, BRANCHB, br, 16u * c + 8u * hl + uint(i));
             [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
                 A8 a0, a1;
                 LDA(a0, w1, C, c, kt); LDA(a1, w1, C, c, kt + 1u);
                 K32(h, a0, Nb[kt], a1, Nb[kt + 1u])
             }
-            [[unroll]] for (int i = 0; i < 8; ++i) Hb[c][i] = ACTQ(float16_t(h[i]));
+            ACT8(Hb[c], h)
         }
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             A8 a0, a1;
@@ -402,7 +452,7 @@ void main()
     [[unroll]] for (uint m = 0u; m < MT; ++m)
         [[unroll]] for (int i = 0; i < 8; ++i) {
             const uint at = RR2_WIN * 2048u + t * 32u + inter(16u * m + 8u * hl + uint(i));
-            RSH[at] = rv[m][i];
+            RSH[at] = float16_t(rv[m][i]);
             MSH[at] = float16_t(ML[m][i]);
         }
 #else
@@ -418,9 +468,8 @@ void main()
 #endif
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             [[unroll]] for (int i = 0; i < 8; ++i) {
-                precise float16_t sm = float16_t(ML[m][i]) * s2;
-                precise float16_t y = rv[m][i] + sm;
-                Tb[m][i] = q8h(y);
+                RESID(y, ML[m][i], s2, rv[m][i])
+                Tb[m][i] = Q8R(y);
             }
             const uint w0 = pack4(Tb[m][0], Tb[m][1], Tb[m][2], Tb[m][3]), w1 = pack4(Tb[m][4], Tb[m][5], Tb[m][6], Tb[m][7]);
             const uint at = 4u * (m & 1u) + 2u * hl;
@@ -435,7 +484,7 @@ void main()
 #if GUIDE || KIND == 3 || KIND == 4
     {   // the guide head (rows 0-3 on lanes 0-15)
         RAC hv;
-        [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = RV(w16.w[W_BH / 2u + 8u * hl + uint(i)]);
+        [[unroll]] for (int i = 0; i < 8; ++i) hv[i] = BV(BH, 8u * hl + uint(i));
         [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
             A8 a0, a1;
             LDA(a0, W_WH, C, 0u, kt); LDA(a1, W_WH, C, 0u, kt + 1u);
@@ -457,16 +506,15 @@ void main()
                 precise float16_t ux = float16_t(1.0) - wx, uy = float16_t(1.0) - wy;
                 precise f16vec4 p00 = guideAt(gInOff, bx, by, hx) * ux, p10 = guideAt(gInOff, x1, by, hx) * wx;
                 precise f16vec4 p01 = guideAt(gInOff, bx, y1, hx) * ux, p11 = guideAt(gInOff, x1, y1, hx) * wx;
-                precise f16vec4 a00 = p00 * uy, a10 = p10 * uy, a01 = p01 * wy, a11 = p11 * wy;
-                precise f16vec4 u0 = a00 + a10;
-                precise f16vec4 u1 = u0 + a01;
-                precise f16vec4 up = u1 + a11;
+                precise f16vec4 a10 = p10 * uy;
+                MADD4(u0, p00, f16vec4(uy), a10)
+                MADD4(u1, p01, f16vec4(wy), u0)
+                MADD4(up, p11, f16vec4(wy), u1)
                 const float16_t al = sig(float16_t(hv[3]));
                 precise f16vec4 gt = up * f16vec4(gate, float16_t(0.0));
                 precise float16_t ia = float16_t(1.0) - al;
-                precise f16vec4 pe = guideAt(gEncOff, tx, ty, ex) * ia;
                 precise f16vec4 pg = gt * al;
-                precise f16vec4 mx = pe + pg;
+                MADD4(mx, guideAt(gEncOff, tx, ty, ex), f16vec4(ia), pg)
                 o4 = min(mx, f16vec4(65504.0));
 #else
                 precise f16vec4 gg = guideAt(gInOff, tx, ty, ex) * f16vec4(gate, float16_t(0.0));
@@ -489,7 +537,7 @@ void main()
         const uint o = (mrgOff + uint(Y * hx + X) * 32u) >> 2u;
         for (uint m = wv; m < CM / 16u; m += 4u) {
             RAC a;
-            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BM / 2u + 16u * m + 8u * hl + uint(i)]);
+            [[unroll]] for (int i = 0; i < 8; ++i) a[i] = BV(BM, 16u * m + 8u * hl + uint(i));
             for (uint ks = 0u; ks < C / 8u; ++ks) {
                 B8 g0, g1; A8 w0, w1;
                 coopMatLoad(g0, XT, 8u * ks, C, CMJ);

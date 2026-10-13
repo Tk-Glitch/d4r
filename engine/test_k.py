@@ -36,9 +36,14 @@ def defines(e, extra=()):
     k = e['kind']
     kind = {'plain': 0, 'enc': 1, 'enc0': 1, 'dec': 2, 'dec0': 2}[k]
     n16 = e.get('merge_n', 16)
+    # K_DEFS: extra layer.comp defines. Two token tiles per wave (TPW) in the 32-channel layers by default: the only
+    # ones with registers to spare for it (engine/README.md); K_TPW=1 turns that off, a -DTPW in K_DEFS / extra wins
+    env = os.environ.get('K_DEFS', '').split()
+    given = any(d.startswith('-DTPW=') for d in [*extra, *env])
+    tpw = [f"-DTPW={os.environ.get('K_TPW', '2')}"] if e['C'] == 32 and not given else []
     return [f'-DC={e["C"]}', f'-DNH={e["H"]}', f'-DKIND={kind}', f'-DPOSATTN={int(e["posattn"])}', f'-DEMBED={int(k == "enc0")}',
             f'-DHEAD={int(k == "dec0")}', f'-DXC={e["X"] or 16}', f'-DMERGE_N={n16}', f'-DFOLD_GAINS={int(e.get("fold_gains", True))}',
-            *extra]
+            *tpw, *extra, *env]
 
 def ulps(m, g):
     m, g = m.astype(np.float64), g.astype(np.float64)

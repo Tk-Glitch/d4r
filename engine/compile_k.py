@@ -186,7 +186,7 @@ def main():
     offsets = b''.join(params(ZeroShape(), e)[0][16:] for e in index.values())
     (a.output / 'offsets.bin').write_bytes(MAGIC + struct.pack('<II', 11, weights.stat().st_size) + offsets)
     for name, e in index.items():
-        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e),
+        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines(e, os.environ.get('K_DEFS_' + name.upper(), '').split()),   # per layer, e.g. K_DEFS_DEC0=-DTPW=2
                         str(HERE / 'layer.comp'), '-o', str(a.output / (name + '.spv'))], check=True)
     for name in ('input_k', 'output_k'):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *(['-DLDR=1'] if a.ldr else []),

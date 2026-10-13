@@ -269,7 +269,7 @@ void main()
             A8 a0, a1;
             LDA(a0, w1, 32u, c, 0u); LDA(a1, w1, 32u, c, 1u);
             K32(h, a0, Nb[0], a1, Nb[1])
-            [[unroll]] for (int i = 0; i < 8; ++i) Hb[c][i] = ACTQ(float16_t(h[i]));
+            ACTQ8(Hb[c], h)
         }
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
             A8 a0, a1;

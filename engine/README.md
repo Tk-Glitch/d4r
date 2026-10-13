@@ -290,8 +290,8 @@ The shim loads each model on first use from a folder next to it, or from a varia
 
 `scripts/install_d4r_runtime.sh` stages them from `D4R_ENGINE_MODEL`, `D4R_ENGINE_MODEL_LDR`, `D4R_ENGINE_MODEL_M`,
 `D4R_ENGINE_MODEL_M_LDR`, `D4R_ENGINE_MODEL_L` and `D4R_ENGINE_MODEL_L_LDR`, copying each folder whole (with `hipnet.bin` and `hip/` from `--hip`). A model whose
-`hipnet.bin` belongs to the other preset keeps the Vulkan network. `D4R_ENGINE_NETWORK=vulkan` (`[Engine] Network`)
-forces the Vulkan network for both presets; `D4R_SHIM_ENGINE_GPU_WAIT=0` makes the HIP network wait for its inputs on
+`hipnet.bin` belongs to the other preset keeps the Vulkan network. The Vulkan network is the default since 2026-10-14;
+`D4R_ENGINE_NETWORK=hip` (`[Engine] Network = hip`) selects the HIP network for both presets when the model has it; `D4R_SHIM_ENGINE_GPU_WAIT=0` makes the HIP network wait for its inputs on
 the CPU-visible marker instead of a GPU-side wait, for comparisons.
 
 With the engine enabled, an evaluation of preset K is recorded entirely into the game's own command list through vkd3d-proton's
@@ -1009,6 +1009,65 @@ Those earlier harness images measured 44–47 dB against the CUDA backend (HDR) 
 flag; they are not current accuracy results. Feature release and re-creation at alternating render sizes ran
 clean. The current game timing and longer accuracy comparison are reported above. The kernels are built per
 GPU architecture (gfx1201 with FP8 here); another GPU falls back to Vulkan when they do not load.
+
+### This GPU's own arithmetic for the network: `M_RELAXED` (2026-10-14)
+
+`M_DEFS=-DM_RELAXED python3 engine/compile_m.py CAPTURE OUT` builds `layer_m.comp` (presets M and L) without NVIDIA's
+roundings: the accumulator stays f32 across the 32-deep steps (no scratch round trip), values go from f32 into FP8 two
+per saturating conversion, and the activation is computed in f32. The default build is unchanged (first frame
+byte-identical to the CUDA path through ZLUDA). Against NVIDIA's kernels on an RTX PRO 4500 Blackwell (captures
+capHM / capHL: harness create flags 0x4B, 640x360 -> 1280x720, three frames; `build/rr/f/nv/srm.sh`, `srt4k.sh`):
+
+| | M, dB | M at 1280x720 -> 4K | L, dB | L at 1280x720 -> 4K |
+|---|---|---|---|---|
+| default | 38.4 / 38.2 / 37.9 | 3.19 ms (network 1.42) | 40.8 / 40.9 / 40.9 | 4.47 ms (network 1.46, input 0.67, expansion 0.54) |
+| `M_RELAXED` | 37.6 / 37.2 / 37.2 | 2.90 ms (network 1.13) | 40.1 / 39.8 / 39.8 | 3.83 ms (network 1.13, input 0.50, expansion 0.41) |
+
+`M_WPW=2` (2026-10-14, `layer_m.comp` `WPW`) adds two 4x4-token windows per wave in the five network layers: a
+workgroup is still one 8x8-token block, but its two waves each walk two windows and load every weight tile once for
+both (a window reads the whole layer's weights; with every weight tile replaced by one tile loaded once the network
+took 0.79 ms instead of 1.13). The default build with `M_WPW=2` is still byte-identical to the capture, on three
+reset frames and on a ten-frame temporal capture (capTM), so the restructuring itself changes nothing; it only pays
+together with `M_RELAXED` (the exact build's scratch round trips hide it: 1.41 ms network against 1.38). Four windows
+per wave, or two in the 128-channel layers without spilling, would need fewer registers than the residual stream
+takes (two windows: 256 vector registers, 119 spilled values in the tube layers, none in the others).
+
+| 1280x720 -> 4K | M frame | M network | L frame | L network |
+|---|---|---|---|---|
+| default | 3.16 ms | 1.38 | 4.44 ms | 1.42 |
+| `M_RELAXED` | 2.86 ms | 1.10 | 3.81 ms | 1.11 |
+| `M_RELAXED`, `M_WPW=2` | 2.68 ms | 0.93 | 3.67 ms | 0.98 |
+| the native HIP network (what `[Engine] Network = auto` picks when the model has `hipnet.bin`) | 2.90 ms | 1.08 | | |
+
+`M_RELAXED M_WPW=2` against the NVIDIA card: M 37.6 / 37.3 / 37.2 dB, L 40.1 / 39.9 / 39.8 dB (default: 38.4 / 38.2 /
+37.9 and 40.8 / 40.9 / 40.9). On the temporal capture the relaxed build settles at 34-35 dB from the ZLUDA
+reference after four frames. Replay notes: the D3D12 harness resets every frame unless `D4R_HARNESS_TEMPORAL=1`, so
+its captures are replayed with `D4R_M_RESET_ALL=1 d4r-m ...` (an earlier comparison without it looked like a
+temporal drift of the engine; there is none). `M_DEFS_ENC1`, `M_DEFS_ENC3_TUBE`, ... pass defines to one layer.
+Preset K (`layer.comp`) already accumulates in f32 and is 59.9 dB from the same card (the ZLUDA capture: 49.5 dB),
+so there is no rounding to relax. Its four waves per window each load the layer's weights, and with every weight
+tile replaced by one tile loaded once the eleven layers take 1.16 ms instead of 1.51 at 1280x720 -> 4K, so
+`layer.comp` got the same restructuring (`TPW`: 16-token tiles per wave; `K_DEFS`, `K_DEFS_<LAYER>`, `K_TPW`). The
+output is byte-identical at one, two and four tiles per wave (15 files of a three-frame capture), but K's operands
+are binary16 (eight registers a tile where FP8 takes two): two tiles per wave only fit in the 32-channel layers
+(enc0 277 -> 272 us, dec0 unchanged), four tiles spill there too (enc0 352 us), and in the wider layers two tiles
+spill 15 to 568 values and the frame takes 3.16 ms. `compile_k.py` therefore builds two tiles per wave in the
+32-channel layers only: 2.86 -> 2.81 ms. The native HIP network measures 2.83 - 2.85 ms on the same frames.
+
+### Defaults since 2026-10-14
+
+Every model builder now makes the fastest build measured above unless told otherwise, and the shim runs the network
+on the Vulkan shaders unless `[Engine] Network = hip`:
+
+| model | default build | the exact build (NVIDIA's roundings, bit-identical to the CUDA path) |
+|---|---|---|
+| K (`compile_k.py`) | two tiles per wave in the 32-channel layers (same output) | `K_TPW=1` for the previous layout |
+| M, L (`compile_m.py`) | `M_RELAXED`, two windows per wave | `M_EXACT=1` |
+| RR D, E (`rr/build_native_model.sh`) | `D4R_RR_RELAXED=3` | `D4R_RR_RELAXED=0` |
+| RR F (`compile_rr2.py`) | `D4R_RR_RELAXED=3` | `D4R_RR_RELAXED=0` |
+
+A model built with no options was compared shader by shader with the explicitly optioned build of each row, and the
+exact switches still reproduce the captures (`build/rr/f/nv/defaults.sh`).
 
 ## Preset L (runtime and shim path exist; experimental)
 

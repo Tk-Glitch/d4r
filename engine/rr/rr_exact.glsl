@@ -110,6 +110,13 @@ float16_t fma16q(float16_t a, float16_t b, float16_t c, inout bool mid)
 #define Q8PAIRS(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { fe4m3vec2 t_; saturatedConvertEXT(t_, vec2((src)[i_], (src)[i_ + 1])); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 // q8(act(h)) from the packed table (enc1_pack.act_table; the weight buffer's W8U view at W_ACT)
 #define ACTQ(h) uintBitsToFloate4m3EXT(w8u.w[W_ACT + bh(h)])
+// the activation of a whole accumulator into FP8. RR_NATIVE (D4R_RR_RELAXED=3): in f32, two elements per
+// instruction, straight into FP8 - no binary16 in between and no table (not the reference's roundings)
+#ifdef RR_NATIVE
+#define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#else
+#define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_] = ACTQ(float16_t((h)[i_]));
+#endif
 float16_t act(float16_t x)
 {
     precise float16_t y = clamp(x, float16_t(-2.0), float16_t(2.0));

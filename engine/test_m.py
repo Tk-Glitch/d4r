@@ -87,9 +87,12 @@ def pack_layer(t, name):
 def defines(name):
     C, heads, NPM, CIN = mm.LAYERS[name]
     kind = {'enc0l': 3, 'dec0l': 4}.get(name, 1 if NPM else 2 if CIN else 0)
-    # compile_m.py's arithmetic (ZLUDA's lowering); M_TEXL=0 gives the native accuracy kernels' for the network layers
+    # compile_m.py's arithmetic (ZLUDA's lowering); M_TEXL=0 gives the native accuracy kernels' for the network layers.
+    # M_DEFS: extra defines for every layer_m.comp stage; M_DEFS_ENC1, M_DEFS_ENC3_TUBE, ...: for one layer
     texl = ['-DTEXL=1'] if kind >= 3 or os.environ.get('M_TEXL', '1') != '0' else []
-    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={kind}', f'-DXC={NPM or CIN or 16}'] + texl + os.environ.get('M_DEFS', '').split()
+    # M_WPW=2: two 4x4-token windows per wave in the network layers (layer_m.comp WPW; not L's input / expansion)
+    wpw = [f"-DWPW={os.environ['M_WPW']}"] if kind < 3 and os.environ.get('M_WPW') else []
+    return [f'-DC={C}', f'-DNH={heads}', f'-DKIND={kind}', f'-DXC={NPM or CIN or 16}'] + texl + wpw + os.environ.get('M_DEFS', '').split() + os.environ.get('M_DEFS_' + name.upper(), '').split()
 
 
 def token_codes(buf, off, W, H, C):

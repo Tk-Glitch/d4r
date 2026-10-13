@@ -420,6 +420,7 @@ class RRT(base.T):
     def __init__(self, ptx, kernel, block, weights_arg=40, buffers=()):
         self.weights_arg = weights_arg
         self.buffers = sorted(buffers)   # argument offsets of further buffers, each its own binding
+        self.snorm16 = set()             # texture arguments of --snorm16
         bx, by, bz = block
         if bx * by * bz % 32:
             raise base.Err('block size must be a multiple of the 32-lane subgroup')
@@ -621,6 +622,10 @@ class RRT(base.T):
             raise base.Err(f'unsupported texture op {op}')
         f16 = 'f16' in o
         self.E(f'{{ vec4 t_ = {fetch};')
+        if off in self.snorm16 and o[-1] == 'f32':
+            # --snorm16: a filtered fetch of an 8-bit SNORM texture on an NVIDIA card is this card's value (8-bit weights)
+            # rounded to a 16-bit step (measured on enc0's reprojected normals, build/rr/f/nv; D4R_RR_FUSE models)
+            self.E('{ precise vec4 q_ = roundEven(t_ * 32767.0); precise vec4 d_ = q_ / 32767.0; t_ = d_; }')
         for i, d in enumerate(dst):
             # a binary16 result is the texel rounded to binary16: through H(HU(...) | SUST_Z) so that the driver cannot
             # fold the rounding away when the value is widened again (RR_RUNTIME's note on sust_b)
@@ -837,6 +842,8 @@ def main():
     ap.add_argument('--surface', action='append', default=[], metavar='OFFSET=FORMAT',
                     help="the GLSL image format of a surface whose stores are formatted (sust.p), when it is not the "
                          "store's own guess, e.g. 144=rgba8_snorm (repeatable)")
+    ap.add_argument('--snorm16', action='append', type=int, default=[], metavar='OFFSET',
+                    help='texture argument whose filtered fetches are rounded to 16-bit steps, as an NVIDIA card returns them')
     ap.add_argument('--weights-arg', type=int, default=40,
                     help='argument offset of the weight pointer (40 for the DLSS-D kernels, 24 for rr2_*)')
     ap.add_argument('--buffer', action='append', type=int, default=[], metavar='OFFSET',
@@ -858,6 +865,7 @@ def main():
 
     def make():
         t = RRT(src, ns.kernel, block, ns.weights_arg, ns.buffer)
+        t.snorm16 = set(ns.snorm16)
         t.probes = probes
         t.probe_block = tuple(int(x) for x in ns.probe_block.split(','))
         t.oob = ns.oob_report

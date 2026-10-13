@@ -111,8 +111,23 @@ def softmax_cubic(x):
     return (e * r[:, None]).astype(H)
 
 
+# D4R_RR_FUSE=1: the arithmetic as an NVIDIA card runs it. NVIDIA's compiler contracts a binary16 multiply whose
+# product only feeds an add / sub into a fused multiply-add (the kernels give those no rounding modifier); ZLUDA, and
+# so the captures, round the product first. build/rr/f/nv has the measurements (ptx_contract.py is the rule).
+FUSE = os.environ.get('D4R_RR_FUSE') == '1'
+
+
+def fma16(a, b, c):
+    """binary16 a * b + c with one rounding (the exact value fits a double)"""
+    with np.errstate(all='ignore'):
+        return (np.asarray(a, np.float64) * np.asarray(b, np.float64) + np.asarray(c, np.float64)).astype(H)
+
+
 def act(x):
     y = np.clip(x, H(-2), H(2)).astype(H)
+    if FUSE:
+        g = fma16(y, fma16(-np.abs(y), H(0.0810546875), H(0.412109375)), H(0.5))
+        return (x * g).astype(H)
     g = add(H(0.5), (y * (H(0.412109375) - (H(0.0810546875) * np.abs(y)).astype(H)).astype(H)).astype(H))
     return (x * g).astype(H)
 

@@ -167,8 +167,12 @@ def main():
 
     g = Path(src).read_text().split('\n')
     m = next(i for i, l in enumerate(g) if l.startswith('void main()'))
-    head = '\n'.join(g[:m]).replace('layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;',
-                                    'layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;')
+    # --one-wave (D4R_RR_RELAXED=3): the block as rr2_w.comp, in NVIDIA's own 32-thread group, the tail on the same wave
+    one_wave = '--one-wave' in sys.argv
+    head = '\n'.join(g[:m])
+    if not one_wave:
+        head = head.replace('layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;',
+                            'layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;')
     if dec:   # the tail's tanh from rr2_pack.py's table (ptx2rr.py's RR_TANH_TABLE; its offset from OUT's rr2_stage.h)
         v = head.index('\n') + 1
         table = re.search(r'#define W_TANH (\d+)u', (Path(out).parent / 'rr2_stage.h').read_text()).group(1)
@@ -210,6 +214,10 @@ def main():
         for mo in re.finditer(r'add\.f16\s+(%rs\d+),\s*(%rs\d+),\s*(%rs\d+);', text_tail):
             if mo.group(2) in prod:
                 rmap[var(mo.group(3))] = prod[mo.group(2)]
+        # the same step in a module rewritten by build/rr/f/nv/ptx_contract.py (D4R_RR_FUSE builds): one fused instruction
+        for mo in re.finditer(r'fma\.rn\.f16\s+(%rs\d+),\s*(%rs\d+),\s*(%rs\d+),\s*(%rs\d+);', text_tail):
+            if mo.group(2) in half:
+                rmap[var(mo.group(4))] = half[mo.group(2)]
         if len(rmap) != 2 * 2 * len(last):
             raise SystemExit(f'found {len(rmap)} residual registers, expected {4 * len(last)}')
         restored |= set(rmap)
@@ -258,7 +266,7 @@ def main():
         load.append(f'            {name} = ' + (f'uint16BitsToFloat16(uint16_t({v}));' if name in f16vars else f'{v};'))
     load.append('        }')
     # the native block's source, without its #version line (this shader has its own)
-    block = (Path(__file__).resolve().parent / 'rr2_m.comp').read_text().split('\n', 1)[1]
+    block = (Path(__file__).resolve().parent / ('rr2_w.comp' if one_wave else 'rr2_m.comp')).read_text().split('\n', 1)[1]
     if split == 'block':   # the second pass: the block on the gather pass's record, then the tail on wave 0
         recomputed, saved, record, where = split_layout(xf_word, pre, tail, f16vars)
         restore = ['            ' + (f'{v} = uint16BitsToFloat16(uint16_t(arena.w[rr2_rec + 1024u + {len(saved)}u * l_ + {n}u]));' if v in f16vars

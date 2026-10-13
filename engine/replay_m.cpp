@@ -149,6 +149,8 @@ int main(int argc, char** argv) try {
             }
         std::vector<double> times, walls; std::vector<std::vector<double>> stage(6);
         const auto now = [] { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+        // D4R_M_RESET_ALL=1: every frame is a reset frame, as the D3D12 harness passes them without its temporal option
+        const bool resetAll = std::getenv("D4R_M_RESET_ALL") != nullptr;
         for (int pass = 0; pass <= repeats; ++pass)
             for (int f = 0; f < frames; ++f) {
                 char** a = argv + sep + 1 + 5 * f;
@@ -159,7 +161,7 @@ int main(int argc, char** argv) try {
                 VkBufferImageCopy region{}; region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; region.imageExtent = {rw, rh, 1};
                 if (pass == 0 || frames > 1)
                     for (int k = 0; k < 3; ++k) vkCmdCopyBufferToImage(cb, in[k].buffer, images[k]->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-                d4r::MFrameSettings s; s.jitter[0] = std::atof(a[3]); s.jitter[1] = std::atof(a[4]); s.reset = pass == 0 && f == 0;
+                d4r::MFrameSettings s; s.jitter[0] = std::atof(a[3]); s.jitter[1] = std::atof(a[4]); s.reset = (pass == 0 && f == 0) || resetAll;
                 const double t0 = now();
                 engine.setFrame({color.view, motion.view, depth.view}, s);
                 vkCmdResetQueryPool(cb, qp, 0, 7);

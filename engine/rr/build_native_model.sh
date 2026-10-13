@@ -41,7 +41,13 @@ PRESET="$(awk '$1 == "preset" { print $2 }' "$OUT/rr.txt")"
 # keeps the driver from folding a binary16 rounding away without the opaque OR the shaders otherwise need
 DEFS=(-DRR_EXACT_CONVERT); [[ "$PRESET" == 4 ]] && DEFS+=(-DRR_PRESET_D)
 # D4R_RR_RELAXED=1: one rounding where NVIDIA has two (engine/rr/rr_exact.glsl): faster, not bit-exact
-[[ -n "${D4R_RR_RELAXED:-}" ]] && DEFS+=("-DRR_RELAXED=$D4R_RR_RELAXED")
+# D4R_RR_RELAXED=3 adds RR_NATIVE: the MLP activation in f32 straight into FP8, no activation table
+# Level 3 is the default (the fastest build; about 1.6 dB further from an NVIDIA card for D / E than the exact one);
+# D4R_RR_RELAXED=0 builds NVIDIA's roundings exactly (bit-identical to the CUDA path through ZLUDA).
+D4R_RR_RELAXED="${D4R_RR_RELAXED:-3}"
+if (( D4R_RR_RELAXED > 0 )); then
+    DEFS+=("-DRR_RELAXED=$(( D4R_RR_RELAXED > 2 ? 2 : D4R_RR_RELAXED ))"); (( D4R_RR_RELAXED >= 3 )) && DEFS+=(-DRR_NATIVE)
+fi
 # D4R_RR_MIX=1: the 32-deep steps round once through v_fma_mix (the shaders' K32): ~5% faster, not provably bit-exact
 [[ "${D4R_RR_MIX:-0}" == 1 ]] && DEFS+=(-DRR_MIX)
 glsl() { # glsl OUT.spv SOURCE INCLUDE_DIR...
@@ -49,7 +55,8 @@ glsl() { # glsl OUT.spv SOURCE INCLUDE_DIR...
     local dir inc=(); for dir in "$@"; do inc+=("-I$dir"); done
     "${CAPPED[@]}" glslangValidator --target-env vulkan1.3 -V "${DEFS[@]}" "${inc[@]}" -o "$out" "$src" > "$WORK/glsl.log" 2>&1 ||
         { grep -E 'ERROR' "$WORK/glsl.log" | head -5; exit 1; }
-    python3 "$RR/spv_exact_convert.py" "$out" > /dev/null
+    # from level 2 on the conversions are left to the driver (as compile_rr2.py does for preset F)
+    (( D4R_RR_RELAXED >= 2 )) || python3 "$RR/spv_exact_convert.py" "$out" > /dev/null
 }
 native() { # native STAGE WEIGHT_FILE: point rr.txt's stage line at STAGE_m.spv
     sed -i -E "s/^stage $1 $1\.spv 32 weights-$1\.bin (.*)/stage $1 $1_m.spv 32 $2 \1/; /^stage $1 /s/ noopt\$//" "$OUT/rr.txt"

@@ -674,8 +674,8 @@ static void load_portable_config()
     portable_set("D4R_ENGINE", ini_flag(ini, "engine", "Enabled", 0) ? "1" : "0");
     if (const std::string engineModel = ini_value(ini, "engine", "ModelDir"); !engineModel.empty())
         portable_set(L"D4R_ENGINE_MODEL_DIR", portable_path(engineModel));
-    // Network: preset M's network on the native HIP layers ("hip", the default when the model has them: faster) or
-    // on the engine's Vulkan shader ("vulkan")
+    // Network: the network on the engine's Vulkan shader ("vulkan", and the default: "auto") or on the native HIP
+    // layers ("hip", when the model has them)
     if (const std::string network = ini_value(ini, "engine", "Network"); network == "hip" || network == "vulkan")
         portable_set("D4R_ENGINE_NETWORK", network);
     else if (!network.empty() && network != "auto")
@@ -7748,8 +7748,10 @@ static bool create_engine_network(Feature& feature, const std::string& directory
                                   bool stagesAvailable, unsigned int width, unsigned int height, size_t tokenBytes,
                                   size_t headBytes)
 {
+    // the Vulkan network unless [Engine] Network = hip asks for the native layers (2026-10-14: the shader with
+    // M_RELAXED and two windows per wave is faster than the HIP layers, engine/README.md)
     const std::string choice = env_string("D4R_ENGINE_NETWORK");
-    if (choice == "vulkan")
+    if (choice != "hip")
         return false;
     auto unavailable = [&](const char* reason) {
         logf("engine backend (%s): HIP network unavailable (%s); using the Vulkan network", preset, reason);

@@ -30,6 +30,21 @@ sys.path.insert(0, str(HERE / 'rr'))
 from rr_capture import Capture  # noqa: E402
 from test_layer import stage_params  # noqa: E402
 
+# D4R_RR_FUSE=1: the fused multiply-adds of an NVIDIA card (rr2_m.comp RR_FUSE, enc1_ref.FUSE); give --ptx-dir the
+# modules rewritten the same way (build/rr/f/nv/mkptx.sh) so the translated parts match
+FUSE_DEFS = ['-DRR_FUSE'] if os.environ.get('D4R_RR_FUSE') == '1' else []
+# D4R_RR_RELAXED=1|2|3: this GPU's own arithmetic in the native stages instead of the reference's roundings
+# (engine/rr/rr_exact.glsl; 3 = also the residual steps in f32, rr2_m.comp RR_NATIVE): faster, ~40 dB from the
+# reference, which is also how far two NVIDIA cards are from each other (engine/rr/README.md)
+# level 3 (this GPU's own arithmetic, one wave per window where the shader has it) is the default: the fastest build,
+# as far from an NVIDIA card as two NVIDIA setups are from each other. D4R_RR_RELAXED=0 builds NVIDIA's roundings
+# exactly (bit-identical to the CUDA path through ZLUDA)
+RELAXED = int(os.environ.get('D4R_RR_RELAXED', '3') or 0)
+# the stages that have a one-wave shader for level 3 (engine/rr/rr2_w.comp: byte-identical to rr2_m.comp there, faster)
+ONE_WAVE = {'dec0_0', 'enc0'}
+RELAX_DEFS = ([f'-DRR_RELAXED={min(RELAXED, 2)}'] if RELAXED else []) + (['-DRR_NATIVE'] if RELAXED >= 3 else [])
+# ... and the normals' filtered fetch of encoder 0 (argument 528) rounded to 16-bit steps, as an NVIDIA card returns it
+SNORM16 = {'enc0': [528]} if FUSE_DEFS else {}
 NETWORK = ['enc0', 'enc1', 'enc2', 'enc3', 'enc4', 'enc5'] + [f'dec{n}_{k}' for n in (4, 3, 2, 1, 0) for k in (0, 1)]
 STAGES = NETWORK + ['post', 'down', 'pooled']
 KERNEL = {s: f'rr2_{s}_kernel' for s in NETWORK[:6]}
@@ -101,12 +116,13 @@ def main():
             weights = f'weights-{stage}m.bin'
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
-            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else [])
+            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defs, f'-I{work}',
-                                     f'-I{HERE / "rr"}', str(HERE / 'rr' / 'rr2_m.comp'), '-o', str(out / f'{stage}_m.spv')],
+                                     f'-I{HERE / "rr"}', str(HERE / 'rr' / ('rr2_w.comp' if RELAXED >= 3 and stage in ONE_WAVE else 'rr2_m.comp')), '-o', str(out / f'{stage}_m.spv')],
                            check=True, stdout=subprocess.DEVNULL)
-            subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}_m.spv')],
-                           check=True, stdout=subprocess.DEVNULL)
+            if RELAXED < 2:   # (the relaxed stages leave their conversions to the driver)
+                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}_m.spv')],
+                               check=True, stdout=subprocess.DEVNULL)
             (out / f'{stage}.args').write_bytes(stage_params(launch, 24)[:len(launch.args)])
             arena = launch.arena_alloc
             unit = launch.allocs[arena][1] / 3152
@@ -118,6 +134,7 @@ def main():
         cmd = [sys.executable, str(HERE / 'rr' / 'ptx2rr.py'), str(find_module(a.ptx_dir, kernel)), kernel, str(generated),
                '--block', BLOCK[stage], '--weights-arg', '24' if network else '9999']
         cmd += [f'--buffer={off}' for off in BUFFERS.get(stage, [])]
+        cmd += [f'--snorm16={off}' for off in SNORM16.get(stage, [])]
         cmd += [f'--surface={off}={fmt}' for off, fmt in SURFACES.get(stage, {}).items()]
         subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
         info = json.loads(generated.with_suffix('.json').read_text())
@@ -129,7 +146,7 @@ def main():
             weights = f'weights-{stage}m.bin'
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
-            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else [])
+            defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
             # encoder 0 in two passes (gen_rr2_enc0.py --split): its gather as the stage enc0g, whose record's address
             # is a word appended to the argument block
             split = stage == 'enc0' and SPLIT and GROUP == 1
@@ -144,6 +161,8 @@ def main():
                 subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
                                check=True, stdout=subprocess.DEVNULL)
                 record = int((work / 'enc0_g.record').read_text())
+            if RELAXED >= 3 and stage in ONE_WAVE and split:
+                how = how + ['--one-wave']
             subprocess.run([sys.executable, str(HERE / 'rr' / 'gen_rr2_enc0.py'), str(find_module(a.ptx_dir, kernel)),
                             str(generated), str(work / f'{stage}_m.comp'), *HYBRID[stage], *how],
                            check=True, stdout=subprocess.DEVNULL)

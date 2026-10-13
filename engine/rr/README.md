@@ -353,3 +353,148 @@ scripts/run_rr_engine_compare.sh`, frames aligned by one):
   rounds, a last-bit difference in a few elements. With a non-identity camera, hit distance and mask bound and a
   moving scene that showed as 40 - 50 dB on later frames in a synthetic scene whose affected feature is rounding
   noise around zero in both paths; no other configuration was affected.
+
+## Against a real NVIDIA card: `D4R_RR_FUSE` (2026-10-13)
+
+Every reference above is the CUDA path through ZLUDA. NVIDIA's own kernels (310.9.1's `rr2_*` PTX, replayed through
+plain CUDA on an RTX PRO 4500 Blackwell, driver 580; tools and logs in `build/rr/f/nv/`) give an image 39-42 dB from
+that reference on every frame of capF, capF4K and capFQ. Register bisection between the two (`probe_pack.py`,
+`probe_cmp.py`: a debug store after every instruction, run on both) found why:
+
+- **Fused multiply-adds.** NVIDIA's compiler contracts a `mul.f16` / `mul.f16x2` whose product only feeds an
+  `add` / `sub` into one fused multiply-add; the kernels give those instructions no rounding modifier. ZLUDA runs them
+  as written. `ptx_contract.py` is the rule (single-use product, same block, the first operand when both are
+  products): with it ZLUDA's result of every network kernel matches the card's (0 of ~5900 4 KiB chunks for most
+  launches, a handful where an `ex2.approx` / `div.approx` differs by one f32 step). The FP8 products, the e4m3
+  conversions and every unfiltered texture fetch were already identical. The sites are the residual steps
+  `out = in + branch * s`, the MLP activation `x (0.5 + y (0.412 - 0.081 |y|))` and the guide's bilinear blend.
+  Probing a product stops the card from fusing it: compare unprobed results, or probe everything.
+- **Filtered fetches of 8-bit textures.** A filtered fetch of the SNORM8 normals returns this card's value (8-bit
+  weights) rounded to a 16-bit step: `f32(roundEven(v * 32767) / 32767)`, exact on 256 of 256 probed values. The
+  output filter's UNORM8 fetches differ too; no model for those yet.
+- **Approximate instructions.** `lg2.approx` near 1 differs by ~8e-8 absolute, `ex2.approx` / `rcp.approx` /
+  `div.approx` by one f32 step. Not emulated.
+
+`D4R_RR_FUSE=1 compile_rr2.py CAPTURE OUT --ptx-dir <build/rr/f/nv/mkptx.sh output> --native DLL` builds the model
+with the first two: `rr2_m.comp -DRR_FUSE` (`MADD` / `MADD4`), the activation table from `enc1_ref.act` with
+`FUSE`, the translated parts from the rewritten modules, encoder 0's normals through `ptx2rr.py --snorm16 528`. All
+14 native stages are byte-identical to ZLUDA running the rewritten modules (`build/rr/f/nv/nfuse.sh`), and so is
+the whole model on capF's three frames. Presented image against the NVIDIA card, 640x360 -> 1080p:
+
+| frame | default build | `D4R_RR_FUSE` |
+|---|---|---|
+| 1 (reset) | 40.9 dB, 27.3% of values equal | 85.6 dB, 99.5% equal |
+| 2 | 39.2 dB | 43.0 dB |
+| 3 | 39.3 dB | 41.8 dB |
+
+Temporal frames stay near 42 dB: the remaining one-step differences (approximate instructions, the UNORM8 fetches)
+enter encoder 0's reprojection and the recurrent history amplifies them, as the one-step values of the output stage
+did before the fused-convert fix. 1280x720 -> 4K: 5.68 / 6.24 ms (default 5.78 / 6.35). The default build is
+unchanged and still byte-identical to the captures.
+
+### This GPU's own arithmetic for preset F: `D4R_RR_RELAXED` (2026-10-13)
+
+Two NVIDIA setups differ from each other as much as a relaxed build differs from the reference: NVIDIA's kernels on
+an RTX 4000 Ada (driver 595) and on the Blackwell cards (driver 580) give images 41.0 / 39.0 / 38.9 dB apart on
+capF's three frames, although their approximate instructions and filtered texture fetches are bit-identical
+(`build/rr/f/nv/math/`); the `D4R_RR_FUSE` build matches the Blackwell result only. So there is no single NVIDIA
+image to reproduce, and `compile_rr2.py` now takes `D4R_RR_RELAXED=1|2` like `build_native_model.sh` does for D / E
+(`rr_exact.glsl`: f32 accumulators across the 32-deep steps, one rounding into FP8; 2 also leaves the conversions to
+the driver). Preset F, 1280x720 -> 4K: 5.40 / 5.99 ms against 5.78 / 6.35 (network 3.45 / 3.77 against 3.83 / 4.14);
+40.8 / 39.1 / 39.2 dB from the exact build and 39-41 dB from either NVIDIA card. The default stays exact.
+
+Why only 6%: with the rounding gone the products are about a sixth of a full-resolution stage. dec0's first kernel
+at 720p, relaxed (`build/rr/f/nv/exp/t.sh`, cutting parts out): 626 us, of which the two attention heads ~370, the
+four MLP branches ~100-160, expansion / residual / store ~120-160, an empty dispatch 10; inside the attention the
+softmax table ~30, the bias tiles ~40, weight loads ~12. Its 88 products alone would take ~108 us at the measured
+198 T MAC/s. The compiled stage still has 338 binary16 <-> f32 conversions, 176 FP8 conversions and 128 clamps for
+44 product instructions (biases and tables are binary16, the activation and softmax tables are indexed by binary16
+bits, FP8 conversions saturate): what is left is format traffic and the four waves' shared-memory hand-offs, not
+arithmetic. NVIDIA's kernel runs the same stage in 203 us with one 32-thread warp per window.
+
+`D4R_RR_RELAXED=3` adds `RR_NATIVE` (rr2_m.comp): the residual steps and the MLP activation in f32, straight into
+FP8, with no binary16 in between and no activation table. 1280x720 -> 4K: 5.17 / 5.72 ms (network 3.24 / 3.48), still
+39-41 dB from the exact build and from both NVIDIA cards. dec0's first kernel at that level: 588 us; the barriers
+cost nothing; reading the constants (weight tiles, bias tiles, the softmax table) costs 170 us; the products about
+108; the rest is the tokens' way through shared memory and the arena, conversions and the expansion
+(`build/rr/f/nv/exp/run1.sh`).
+
+What bounds a stage (2026-10-13; `build/rr/f/nv/exp/`). dec0's first kernel at level 3 takes 581 us at 720p and a
+wave executes about 2500 instructions (`dyn.py`): 96 products, 356 binary16 <-> f32 conversions, 296 FP8
+conversions, 224 clamps of the saturating FP8 conversions, 142 buffer loads, 75 shared-memory operations, about 400
+wait / delay markers. What was tried on top of level 3, none of it a gain:
+
+- the clamps removed: -30 us (2.2 ps per instruction and wave), but not usable: without the clamp the hardware
+  conversion returns NaN above 464 where the clamp gives 448 (`satprobe.comp`);
+- f32 copies of the biases: 176 fewer conversions and 78 more loads per wave, slightly slower (587-595 us): a load
+  costs about three arithmetic instructions;
+- the softmax cubic computed, not read from its table: the same time;
+- no barriers: the same time;
+- one wave per window walking the four token slices, every weight, key and value tile read once
+  (`rr2_w.comp`, byte-identical to the four-wave build): 27% fewer instructions per window, 30% fewer buffer loads,
+  60% fewer shared-memory loads, and the same time (600 us); it needs all 256 vector registers (four waves: 192).
+
+So time here is not a function of the instruction count alone, and there is no model yet that predicts both the
+clamp result and the one-wave result. The output stage is compute-bound too: 100 / 300 extra integer steps per
+thread in the filter add 0.45 / 1.33 ms (`dz.sh`). NVIDIA's kernel runs dec0's first kernel in 203 us.
+
+Shared memory throttles this GPU (2026-10-13, `build/rr/f/nv/cost/occ.py`, `occ2.py`). A dependent chain of f32
+multiply-adds runs at full rate while the workgroup declares up to about 4 KiB of `shared` storage per wave; above
+that the rate falls in proportion (one wave per workgroup: 6 KiB 1.24x slower, 8 KiB 1.55x, 13 KiB 3.1x, 62 KiB 12x;
+four waves: 13 KiB full rate, 26 KiB 1.55x, 52 KiB 3.1x). The register count does not matter (0 to 224 live values:
+the same rate). The decoders' first kernels held 21 to 46 KiB (LOW, EX, XE): `rr2_m.comp` now keeps the 4 x 4 low
+tokens in KVS and the block's unquantised input in each lane's registers (`xr`), byte-identical on every stage
+checked, and the network is 0.10 - 0.13 ms faster at 1280x720 -> 4K: exact build 5.68 / 6.25 ms (was 5.78 / 6.35),
+`D4R_RR_RELAXED=3` 5.07 / 5.56 ms (was 5.17 / 5.72). It is also why the first one-wave prototype (13 KiB in one
+wave) showed no gain: with 4 KiB (`exp/rr2_w.comp`: the low tokens borrow XT, the expansion borrows KVS, V^T is
+stored, read into registers and overwritten by QK) it takes 534 us against the four-wave shader's 581, still
+byte-identical to it. Extra arithmetic injected into either shader costs one instruction per cycle on about 128
+wave slots (3.8e11 wave-instructions per second); NVIDIA's card measures 7.5e11 (`build/rr/f/nv/sass/rate.cpp`), and
+its compiled kernel for this stage is 3,729 instructions per window (`sass/nv/dec0_0.sass`) against about 10,000
+executed here. What an instruction costs here (`cost/cost.py`, `cost2.py`): an f32 multiply-add is the unit; a
+32-bit integer multiply about seven; converting a pair to FP8 with the clamp about eight; a buffer read about 0.1 ps
+per byte and lane (16 bytes: some forty multiply-adds), nearly twice that from a 1 MiB table.
+
+`engine/rr/rr2_w.comp` (2026-10-13) is decoder 0's first kernel for `D4R_RR_RELAXED=3` with one wave per window:
+every weight, key and value tile read once per window, the expansion plus skip computed once and kept in registers,
+the scores' cross quadrant computed once and reused transposed (368 products for 384), FP8 values converted in
+pairs, 4 KiB of shared memory. `compile_rr2.py` uses it for dec0_0 at level 3 (`ONE_WAVE`). The stage alone:
+453 us against 581 us at 1280x720, arena byte-identical to `rr2_m.comp` at that level
+(`build/rr/f/nv/invest-20261013/REPORT.md`: 20 variants, each change's instruction count and time). In the engine
+every image of capF's three frames is identical to the four-wave level 3 model's, and 1280x720 -> 4K is about
+5.00 / 5.55 ms (four-wave level 3: 5.10 / 5.61; network 3.05 / 3.31 against 3.15 / 3.39). The shader covers C = 32
+only; the other stages still use `rr2_m.comp`.
+
+`rr2_w.comp` also covers encoder 0's block now (KIND 4, embedded by `gen_rr2_enc0.py --one-wave` in NVIDIA's own
+32-thread group, the translated guide tail on the same wave; `compile_rr2.py` `ONE_WAVE = {'dec0_0', 'enc0'}` at
+`D4R_RR_RELAXED=3`). All 45 images of capF's three frames are identical to the four-wave level 3 model's.
+1280x720 -> 4K, four interleaved runs each: four-wave 5.10 / 5.68 ms, dec0_0 on one wave 5.04 / 5.62, encoder 0 as
+well 4.98 / 5.59. Decoder 0's second kernel is not converted: it hands r and the MLP sum (8 KiB of binary16) to its
+translated tail through shared memory, which a single wave cannot hold without losing the 4 KiB rate.
+
+### Presets D and E against a real NVIDIA card, and level 3 for them (2026-10-14)
+
+NVIDIA's own kernels for presets D and E were replayed on an RTX PRO 4500 Blackwell (drivers 595.91 and 580.178: the
+two give identical images; `build/rr/f/nv/pack.py --corpus ~/.cache/d4r-rr-corpus --first luma_convert`, captures
+capD / capE3 at 640x360 -> 1280x720, every frame a reset frame). `D4R_RR_RELAXED=3` now also exists for
+`build_native_model.sh`: level 2 plus `RR_NATIVE` (`rr_exact.glsl` `ACTQ8`: the MLP activation in f32, two elements
+per saturating conversion, no activation table), and from level 2 on the modules are no longer passed through
+`spv_exact_convert.py`. Presented image against the NVIDIA card, and the time at 1280x720 -> 4K (reset / next frame):
+
+| build | D, dB | D, ms | E, dB | E, ms |
+|---|---|---|---|---|
+| exact (identical to the CUDA path through ZLUDA) | 38.5 / 39.0 / 38.5 | 4.4 / 4.7 | 40.0 / 39.9 / 40.0 | 4.34 / 4.54 |
+| `D4R_RR_RELAXED=1` | 36.8 / 37.4 / 36.8 | 3.86 / 4.08 | 38.5 / 38.3 / 38.3 | 3.74 / 3.98 |
+| `D4R_RR_RELAXED=2` | 36.8 / 37.4 / 36.8 | 3.76 / 3.99 | 38.5 / 38.3 / 38.3 | 3.65 / 3.82 |
+| `D4R_RR_RELAXED=3` | 36.7 / 37.4 / 36.7 | 3.65 / 3.95 | 38.5 / 38.3 / 38.3 | 3.51 / 3.70 |
+
+The NVIDIA card runs D at 1280x720 -> 4K in 2.19 / 2.39 ms. Unlike preset F, relaxing costs about 1.6 dB here. What
+was measured and not built for D / E (`build/rr/f/nv/dstage.sh`, `dnl.sh`, level 3, 720p):
+
+- shared memory: encoder 1 with 4 / 8 / 16 KiB of extra shared storage takes 287 -> ~305 / ~320 / ~343 us, so the
+  stages above the limit (decoder 1 at 21 KiB, decoder 0 at 17 KiB) would gain a few per cent each, under 1% of a
+  frame;
+- one wave per window: with every weight tile replaced by one tile loaded once (wrong values, the ceiling of sharing
+  loads between a window's waves) decoder 0 takes the same time (803-818 us), encoder 1 the same, decoder 1 10% less.
+  These windows also have 96 key tokens (3 KiB each for the tokens, the keys and the values at C = 32), which does
+  not fit the 4 KiB a single wave can hold at full rate.

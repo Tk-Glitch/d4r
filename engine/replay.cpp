@@ -270,7 +270,7 @@ struct Image {
         auto r = region(w,h); vkCmdCopyBufferToImage(context.command, upload.handle, handle, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     }
 };
-struct Frame { d4r::InputParams input; d4r::OutputParams output; std::array<d4r::LayerShape,d4r::KLayers> windows; unsigned color, motion, depth; };
+struct Frame { d4r::InputParams input; d4r::OutputParams output; std::array<d4r::LayerShape,d4r::KLayers> windows; unsigned color, motion, depth;; bool autoWindows = false; };
 
 int run(const std::string& modelDir, const std::string& caseFile, const std::string& outputDir, int repeats, bool hip) {
 #ifndef D4R_ENGINE_HIP
@@ -323,7 +323,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
               >> settings.motionOffset[0] >> settings.motionOffset[1] >> settings.sharpness;
             if (!s || f.color >= images.size() || reset > 1) throw std::runtime_error("malformed standard frame declaration");
             settings.renderWidth = images[f.color]->w; settings.renderHeight = images[f.color]->h; settings.reset = reset != 0;
-            auto params = d4r::makeKFrameParams(shape,settings); f.input = params.input; f.output = params.output; f.windows = shape.layers;
+            auto params = d4r::makeKFrameParams(shape,settings); f.input = params.input; f.output = params.output; f.windows = shape.layers; f.autoWindows = true;
             frames.push_back(f);
         } else if (!kind.empty()) throw std::runtime_error("unknown case declaration " + kind);
     }
@@ -334,6 +334,7 @@ int run(const std::string& modelDir, const std::string& caseFile, const std::str
     if (hip) {
         for (size_t i = 0; i < frames.size(); ++i) {
             const auto expected = d4r::makeKWindows(shape, uint32_t(i));
+            if (frames[i].autoWindows) { frames[i].windows = expected; continue; }   // ordinary frames: NGX's window cycle
             for (unsigned layer = 0; layer < d4r::KLayers; ++layer) {
                 const auto& a = frames[i].windows[layer];
                 const auto& b = expected[layer];
