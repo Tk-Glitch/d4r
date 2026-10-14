@@ -50,7 +50,7 @@ def blob_of(directory, ptr_offset=0):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('capture'); ap.add_argument('output', type=Path); ap.add_argument('--frame', type=int, default=0)
-    ap.add_argument('--ldr', action='store_true', help="NGX's *_ldr_* stages, for games without the HDR flag (capture such a frame)")
+    ap.add_argument('--ldr', action='store_true', help="NGX's *_ldr_* stages, for games without the HDR flag (the weights may come from an HDR capture)")
     ap.add_argument('--hip', type=Path, metavar='KERNEL_DIR', help='also package the network for the native HIP layers: the layer '
                     'weights as NGX uploads them (hipnet.bin) and the rrlite_*_4x4.hsaco kernels of KERNEL_DIR (kernels/build.sh output)')
     a = ap.parse_args()
@@ -60,6 +60,10 @@ def main():
         if len(d) <= a.frame: raise ValueError(f'no launch of {kernel} for frame {a.frame}')
         return d[a.frame]
     R = 'ldr' if a.ldr else 'hdr'
+    # NGX's HDR and LDR stages read the same weights and constants (RE Requiem's m / m-ldr and l / l-ldr packages,
+    # built from separate captures, are identical but for the shaders): an LDR model can come from an HDR capture
+    if a.ldr and not glob.glob(f'{a.capture}/replay/replay-*-rrlite_enc0_4x4_mvlo_ldr*'):
+        R = 'hdr'
     preset_l = bool(glob.glob(f'{a.capture}/replay/replay-*-rrlite_enc0_4x4_mvlo_{R}'))
     if preset_l == bool(glob.glob(f'{a.capture}/replay/replay-*-rrlite_enc0_4x4_mvlo_{R}_folded')):
         raise ValueError(f'the capture must hold the input stage of exactly one of preset M or L ({R})')

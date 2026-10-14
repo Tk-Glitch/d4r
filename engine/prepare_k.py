@@ -2,7 +2,9 @@
 """Prepare a full-frame native K replay from a capture. Does not translate kernels.
 
 prepare_k.py CAPTURE_DIR OUTPUT_DIR [--frames N] [--start FRAME]
-The model's reconstruction tables can be packaged using OUTPUT_DIR/lut.bin.
+prepare_k.py CAPTURE_DIR OUTPUT_DIR --lut-only
+The model's reconstruction tables can be packaged using OUTPUT_DIR/lut.bin. --lut-only writes only that, from the
+first output launch's replay (a capture without the launch dumps: install.sh's weight dump).
 """
 import argparse
 import json
@@ -21,7 +23,15 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--frames', type=int, default=0, help='0 = all captured frames')
     parser.add_argument('--start', type=int, default=0)
+    parser.add_argument('--lut-only', action='store_true', help='write only lut.bin')
     a = parser.parse_args()
+    if a.lut_only:
+        outputs = launches(a.capture, OUTPUT)
+        if not outputs:
+            raise ValueError('capture holds no K output launch')
+        a.output.mkdir(parents=True, exist_ok=True)
+        (a.output / 'lut.bin').write_bytes(outputs[0].allocation(280, 16 * 32768))
+        return
     inputs, outputs = launches(a.capture, INPUT), launches(a.capture, OUTPUT)
     if not inputs or not outputs or len(outputs) > len(inputs):
         raise ValueError('capture must contain complete K input/output frame pairs')

@@ -83,6 +83,26 @@ It fails for missing/wrong-sized results, nonfinite values, or PSNR below its th
 `test_k.py --chain` remains available for isolated-layer diagnosis; it now selects the first launch consistently and
 fails on dispatch errors rather than continuing with a broken chain.
 
+## Models on the user's machine (install.sh)
+
+A release's `install.sh` builds every model the shim loads, from the user's own DLLs, with
+`d4r/tools/build-engine-models.sh` (`packaging/build_engine_models.sh`; `scripts/stage_engine_kit.sh` puts it and
+d4r's compilers, shaders, the D3D12 harness and glslang into the release):
+
+- Ray Reconstruction needs no capture. `nvngx_dlssd.dll` 310.9.1 holds presets D and E (the kernels and weights of
+  310.7) and F. `engine/rr/build_native_model.sh --dll DLL D|E OUT` and `engine/compile_rr2.py --dll DLL OUT
+  --ptx-dir DIR` take the PTX from the DLL (`kernels/tools/extract_dlss_ptx.py`), the weights as before
+  (`dll_weights.py`, `rr2_pack.py`) and what the capture used to supply from the DLL too: the argument-block
+  constants (`engine/rr/rr_templates.py`, `rr2_templates.py`, which replays the routine that builds NGX's model
+  description), encoder 0's second table of preset F and its arena regions. Built this way, D, E and F are
+  byte-identical to the capture-built models (every file, and `d4r-rr`'s outputs on the reference inputs).
+- Super Resolution weights are packed inside `nvngx_dlss.dll`; they are read where NGX unpacks them. The harness
+  renders one frame per preset (11, 13, 12) through the release's own d4r folder under GE-Proton with
+  `D4R_CUDA_REPLAY_DUMP_DIR` set; `extract_k.py`, `prepare_k.py --lut-only` and `compile_k.py` / `compile_m.py`
+  build K, M and L from that, and `--ldr` their LDR variants from the same frame (NGX's HDR and LDR stages read the
+  same weights). About a minute per preset, ~280 MB of dumps that are deleted afterwards. The results are identical
+  to the models built from full captures.
+
 ## Ordinary frames, without a capture
 
 Create a JSON description with raw linear HDR color, inverse depth, and render-resolution motion vectors:
