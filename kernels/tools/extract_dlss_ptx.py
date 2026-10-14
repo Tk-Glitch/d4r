@@ -52,7 +52,12 @@ ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 
 
 def zstd_frame(src: bytes) -> bytes:
-    """One zstd frame, through the zstandard module when it is installed and the zstd tool otherwise."""
+    """One zstd frame, through Python's own zstd (3.14), the zstandard module or the zstd tool."""
+    try:
+        from compression import zstd   # Python 3.14
+        return zstd.ZstdDecompressor().decompress(src)
+    except ImportError:
+        pass
     try:
         import zstandard
         return zstandard.ZstdDecompressor().decompressobj().decompress(src)

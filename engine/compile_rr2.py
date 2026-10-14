@@ -3,6 +3,7 @@
 nvngx_dlssd.dll 310.9) from a capture of the denoiser.
 
 usage: compile_rr2.py CAPTURE_DIR OUT_DIR [--ptx-dir DIR] [--frame N] [--native NVNGX_DLSSD_DLL]
+       compile_rr2.py --dll NVNGX_DLSSD_DLL OUT_DIR --ptx-dir DIR
 
 CAPTURE_DIR is a bridge capture of a few preset F frames (engine/rr/rr_capture.py, taken with
 D4R_CUDA_REPLAY_DUMP_FILTER=rr2 D4R_CUDA_LAUNCH_STATS_FILTER=rr2 and preset hint 6). Writes:
@@ -16,6 +17,9 @@ D4R_CUDA_REPLAY_DUMP_FILTER=rr2 D4R_CUDA_LAUNCH_STATS_FILTER=rr2 and preset hint
 With --native, the stages engine/rr/rr2_m.comp implements (enc1 ... enc5, dec4 ... dec1, dec0's first kernel) are that
 shader with weights read from the DLL itself (engine/rr/rr2_pack.py) instead of the translation: bit-identical to
 NVIDIA's kernels on the reference captures and about three times faster. D4R_RR_MIX=1 builds the one-rounding variant.
+--dll builds the same model without a capture: the native stages from the DLL's weights (as --native), the argument
+templates, encoder 0's second table and the arena regions from engine/rr/rr2_templates.py, and the particle variant of
+the downsample (downp) always. This is what install.sh runs.
 Everything but the exposure shader is derived from NVIDIA's DLL: it stays on the user's machine and is never packaged.
 """
 import argparse
@@ -88,28 +92,49 @@ def find_module(ptx_dir, kernel):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('capture')
+    ap.add_argument('capture', nargs='?')
     ap.add_argument('output', type=Path)
+    ap.add_argument('--dll', help="build without a capture, from the user's nvngx_dlssd.dll 310.9")
     ap.add_argument('--ptx-dir', default=os.path.expanduser('~/.cache/d4r-rr-corpus-f'))
     ap.add_argument('--frame', type=int, default=2, help='which captured frame supplies the templates (1-based)')
     ap.add_argument('--particles', metavar='CAPTURE_DIR',
                     help='a capture taken with DLSSD.ColorBeforeParticles: adds the downsample kernel NGX runs then (downp)')
     ap.add_argument('--native', metavar='DLL', help='nvngx_dlssd.dll 310.9: build the native stages from its weights')
     a = ap.parse_args()
-    cap = Capture(a.capture)
+    if a.dll:
+        if a.capture or a.particles:
+            ap.error('--dll takes no capture')
+        from rr2_templates import ARENA, aux_table, templates
+        dll = Path(a.dll).read_bytes()
+        blocks, aux = templates(dll), aux_table(dll)
+        a.native = a.native or a.dll
+        cap = None
+    elif not a.capture:
+        ap.error('a capture directory, or --dll')
+    else:
+        cap = Capture(a.capture)
     out = a.output
     out.mkdir(parents=True, exist_ok=True)
     capped = ['systemd-run', '--user', '--scope', '-q', '-p', 'MemoryMax=24G', '-p', 'MemorySwapMax=0']
+    # each compiler job in a memory-capped scope where systemd provides one (D4R_NO_SCOPE=1: none)
+    if os.environ.get('D4R_NO_SCOPE') == '1' or subprocess.run(capped[:4] + ['true'], stderr=subprocess.DEVNULL,
+                                                                 stdout=subprocess.DEVNULL).returncode:
+        capped = []
     lines = ['D4RR0002', 'preset 6']
     pcap = Capture(a.particles) if a.particles else None
-    for stage in STAGES + (['downp'] if pcap else []):
+    for stage in STAGES + (['downp'] if pcap or a.dll else []):
         kernel = KERNEL[stage]
-        if stage == 'downp':
-            cap = pcap
-        launches = [l for l in cap.launches if l.kernel == kernel]
-        per_frame = len(launches) // len([l for l in cap.launches if l.kernel == KERNEL['enc0']])
-        launch = launches[(a.frame - 1) * per_frame]
         network = stage in NETWORK
+        if a.dll:
+            launch = None
+            if network and stage not in NATIVE and stage not in HYBRID:
+                raise SystemExit(f'{stage}: no native stage, and its weights come from a capture')
+        else:
+            if stage == 'downp':
+                cap = pcap
+            launches = [l for l in cap.launches if l.kernel == kernel]
+            per_frame = len(launches) // len([l for l in cap.launches if l.kernel == KERNEL['enc0']])
+            launch = launches[(a.frame - 1) * per_frame]
         if a.native and stage in NATIVE:
             work = out / 'native-work' / stage
             work.mkdir(parents=True, exist_ok=True)
@@ -123,10 +148,14 @@ def main():
             if RELAXED < 2:   # (the relaxed stages leave their conversions to the driver)
                 subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}_m.spv')],
                                check=True, stdout=subprocess.DEVNULL)
-            (out / f'{stage}.args').write_bytes(stage_params(launch, 24)[:len(launch.args)])
-            arena = launch.arena_alloc
-            unit = launch.allocs[arena][1] / 3152
-            ptrs = [f'{p.offset}:{p.delta / unit:g}' for p in launch.pointers if p.alloc == arena and p.offset != 24]
+            if launch is None:
+                (out / f'{stage}.args').write_bytes(blocks[stage])
+                ptrs = [ARENA[stage]]
+            else:
+                (out / f'{stage}.args').write_bytes(stage_params(launch, 24)[:len(launch.args)])
+                arena = launch.arena_alloc
+                unit = launch.allocs[arena][1] / 3152
+                ptrs = [f'{p.offset}:{p.delta / unit:g}' for p in launch.pointers if p.alloc == arena and p.offset != 24]
             lines.append(f'stage {stage} {stage}_m.spv 32 {weights} {stage}.args - - - {",".join(ptrs)}')
             print(f'{stage}: native (engine/rr/rr2_m.comp)')
             continue
@@ -150,7 +179,8 @@ def main():
             # encoder 0 in two passes (gen_rr2_enc0.py --split): its gather as the stage enc0g, whose records' place
             # (three ranges) is six words appended to the argument block
             split = stage == 'enc0' and SPLIT and GROUP == 1
-            how = ['--split', 'block', '--xf-word', str((len(launch.args) + 7) // 8 * 2)] if split else ['--group', str(GROUP)]
+            n_args = len(blocks[stage]) if launch is None else len(launch.args)
+            how = ['--split', 'block', '--xf-word', str((n_args + 7) // 8 * 2)] if split else ['--group', str(GROUP)]
             if split:
                 subprocess.run([sys.executable, str(HERE / 'rr' / 'gen_rr2_enc0.py'), str(find_module(a.ptx_dir, kernel)),
                                 str(generated), str(work / 'enc0_g.comp'), '--split', 'gather', *how[2:]],
@@ -183,16 +213,19 @@ def main():
             weights = f'weights-{stage}.bin'
             (out / weights).write_bytes(generated.with_suffix('.globals.bin').read_bytes())
         if stage == 'enc0':
-            (out / 'enc0-aux.bin').write_bytes(launch.pre(launch.pointer(104).alloc))
-        args = stage_params(launch, 24 if network else 9999)[:len(launch.args)]
+            (out / 'enc0-aux.bin').write_bytes(aux if launch is None else launch.pre(launch.pointer(104).alloc))
+        args = blocks[stage] if launch is None else stage_params(launch, 24 if network else 9999)[:len(launch.args)]
         if hybrid and split:
             args = args + bytes(-len(args) % 8) + bytes(24)   # the gather records' three ranges (the runtime's)
         (out / f'{stage}.args').write_bytes(args)
         # the stage's arena regions, in units of 1/3152 of NGX's arena (W0 * H0 / 32 bytes: the regions scale with it)
-        arena = launch.arena_alloc
-        unit = launch.allocs[arena][1] / 3152 if arena is not None else 1
-        ptrs = [f'{p.offset}:{p.delta / unit:g}' for p in launch.pointers
-                if p.alloc == arena and p.offset not in BUFFERS.get(stage, []) and not (network and p.offset == 24)]
+        if launch is None:
+            ptrs = [ARENA[stage]] if network else []
+        else:
+            arena = launch.arena_alloc
+            unit = launch.allocs[arena][1] / 3152 if arena is not None else 1
+            ptrs = [f'{p.offset}:{p.delta / unit:g}' for p in launch.pointers
+                    if p.alloc == arena and p.offset not in BUFFERS.get(stage, []) and not (network and p.offset == 24)]
         if not network:
             ptrs = []   # the output passes' regions are the runtime's own
         tex = ','.join(map(str, info['textures'])) or '-'
@@ -205,7 +238,7 @@ def main():
                      (f' x{GROUP}' if hybrid and GROUP > 1 else ''))   # windows per workgroup (engine/rr/gen_rr2_enc0.py)
         if hybrid and split:   # the same block, bindings and regions; "rN": N words per window record, "s3": in three ranges
             lines.append(f'stage enc0g enc0g.spv 32 - {stage}.args {tex} {surf} {buf} {",".join(ptrs) or "-"} r{record} s3')
-        print(f'{stage}: {kernel}, {len(launch.args)} argument bytes' + (' (native block)' if hybrid else ''))
+        print(f'{stage}: {kernel}, {len(args)} argument bytes' + (' (native block)' if hybrid else ''))
     for p in (0, 1):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-DPASS={p}',
                         str(HERE / 'rr' / 'exposure_f.comp'), '-o', str(out / f'exposure_f{p}.spv')],

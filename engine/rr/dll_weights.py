@@ -133,8 +133,11 @@ def noise_table(dll):
         if b - a >= 2048:
             t = u[b - 2048:b]
             if len(np.unique(t)) > 1024 and (t & 31 == 31).sum() > 256:
-                found.append(t.tobytes())
-    return found[0] if len(set(found)) == 1 else None   # some DLLs hold the same table twice
+                found.append((2 * (b - 2048), t.tobytes()))
+    # 310.9.1 also holds a second, unreferenced array of this kind at an odd address; the table the code uses is aligned
+    if len({t for _, t in found}) > 1:
+        found = [(at, t) for at, t in found if at % 16 == 0]
+    return found[0][1] if len({t for _, t in found}) == 1 else None   # some DLLs hold the same table twice
 
 
 class Reader:

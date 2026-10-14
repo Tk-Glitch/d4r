@@ -5,6 +5,11 @@ set -euo pipefail
 # for the preset the capture was taken with (D or E).
 #
 # usage: build_native_model.sh CAPTURE_DIR OUT_DIR [NVNGX_DLSSD_DLL]
+#        build_native_model.sh --dll NVNGX_DLSSD_DLL D|E OUT_DIR
+#
+# With --dll no capture is needed: everything comes from the DLL (its PTX: kernels/tools/extract_dlss_ptx.py; the
+# argument-block templates: engine/rr/rr_templates.py; the weights: dll_weights.py, model 0 = D, model 1 = E in 310.7's
+# file order) and step 3's checks against a captured frame are skipped. This is what install.sh runs.
 #
 # CAPTURE_DIR is a bridge capture of a few denoiser frames (engine/rr/rr_capture.py); the DLL is the one it was taken
 # with (default: CAPTURE_DIR/run/app/nvngx_dlssd.dll, then $D4R_RR_DLL). The steps:
@@ -23,19 +28,38 @@ set -euo pipefail
 #
 # GPU jobs run one at a time, each in a memory-capped scope (a translated stage's pipeline compile can take tens of GB).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CAP="$(realpath "${1:?usage: build_native_model.sh CAPTURE_DIR OUT_DIR}")"
-OUT="$(realpath -m "${2:?usage: build_native_model.sh CAPTURE_DIR OUT_DIR}")"
+USAGE="usage: build_native_model.sh CAPTURE_DIR OUT_DIR [NVNGX_DLSSD_DLL] | --dll NVNGX_DLSSD_DLL D|E OUT_DIR"
+CAP=""
+if [[ "${1:-}" == --dll ]]; then
+    DLL="$(realpath "${2:?$USAGE}")"; WANT="${3:?$USAGE}"; OUT="$(realpath -m "${4:?$USAGE}")"
+    [[ "$WANT" == D || "$WANT" == E ]] || { echo "$USAGE" >&2; exit 2; }
+else
+    CAP="$(realpath "${1:?$USAGE}")"
+    OUT="$(realpath -m "${2:?$USAGE}")"
+    DLL="${3:-${D4R_RR_DLL:-$CAP/run/app/nvngx_dlssd.dll}}"
+fi
 RR="$ROOT/engine/rr"
 WORK="$OUT/native-work"
-DLL="${3:-${D4R_RR_DLL:-$CAP/run/app/nvngx_dlssd.dll}}"
 [[ -f "$DLL" ]] || { echo "no nvngx_dlssd.dll at $DLL: pass the DLL the capture was taken with" >&2; exit 1; }
 FRAME="${D4R_RR_MODEL_FRAME:-2}"
-CAPPED=(systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0)
+# each GPU / compiler job in a memory-capped scope where systemd provides one (D4R_NO_SCOPE=1: none)
+CAPPED=()
+if [[ "${D4R_NO_SCOPE:-0}" != 1 ]] && command -v systemd-run > /dev/null && systemd-run --user --scope -q true 2> /dev/null; then
+    CAPPED=(systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0)
+fi
 mkdir -p "$OUT" "$WORK"
 cd "$ROOT"
 
-python3 engine/compile_rr.py "$CAP" "$OUT" > "$WORK/compile_rr.log" 2>&1 || { tail -5 "$WORK/compile_rr.log"; exit 1; }
-python3 "$RR/dll_weights.py" "$DLL" "$WORK/dll" --capture "$CAP" ${D4R_RR_ANY_KERNELS:+--any-kernels}
+if [[ -n "$CAP" ]]; then
+    python3 engine/compile_rr.py "$CAP" "$OUT" > "$WORK/compile_rr.log" 2>&1 || { tail -5 "$WORK/compile_rr.log"; exit 1; }
+    python3 "$RR/dll_weights.py" "$DLL" "$WORK/dll" --capture "$CAP" ${D4R_RR_ANY_KERNELS:+--any-kernels}
+else
+    python3 kernels/tools/extract_dlss_ptx.py "$DLL" "$WORK/ptx" > /dev/null
+    python3 engine/compile_rr.py --dll "$DLL" --preset "$WANT" "$OUT" --ptx-dir "$WORK/ptx" --network-bindings-only \
+        > "$WORK/compile_rr.log" 2>&1 || { tail -5 "$WORK/compile_rr.log"; exit 1; }
+    python3 "$RR/dll_weights.py" "$DLL" "$WORK/dll" --model "$([[ "$WANT" == D ]] && echo 0 || echo 1)" \
+        ${D4R_RR_ANY_KERNELS:+--any-kernels} > /dev/null
+fi
 PRESET="$(awk '$1 == "preset" { print $2 }' "$OUT/rr.txt")"
 # RR_EXACT_CONVERT: the compiled module's float conversions are decorated NoContraction (spv_exact_convert.py), which
 # keeps the driver from folding a binary16 rounding away without the opaque OR the shaders otherwise need
@@ -68,7 +92,7 @@ for s in enc1 enc2 enc3 enc4 enc5 dec4 dec3 dec2 dec1; do
     b=1,1; case $s in enc1|enc2|dec1|dec2) b=5,5 ;; esac
     d="$WORK/$s"; mkdir -p "$d"
     cp "$WORK/dll/$s.npz" "$d/weights.npz"
-    python3 "$RR/swin_ref.py" "$CAP" "$s" "$FRAME" "$d/weights.npz" --blocks "$b" 0,0 | tail -2 | sed "s/^/$s: /"
+    [[ -z "$CAP" ]] || python3 "$RR/swin_ref.py" "$CAP" "$s" "$FRAME" "$d/weights.npz" --blocks "$b" 0,0 | tail -2 | sed "s/^/$s: /"
     python3 "$RR/swin_pack.py" "$s" "$d/weights.npz" "$OUT/weights-${s}m.bin" "$d/swin_stage.h" > /dev/null
     glsl "$OUT/${s}_m.spv" "$RR/swin_m.comp" "$d" "$RR"
     native "$s" "weights-${s}m.bin"
@@ -77,7 +101,7 @@ done
 # decoder 0
 d="$WORK/dec0"; mkdir -p "$d"
 cp "$WORK/dll/dec0.npz" "$d/weights.npz"
-python3 "$RR/dec0_ref.py" "$CAP" "$FRAME" "$d/weights.npz" --blocks 5,5 0,0 | tail -2 | sed 's/^/dec0: /'
+[[ -z "$CAP" ]] || python3 "$RR/dec0_ref.py" "$CAP" "$FRAME" "$d/weights.npz" --blocks 5,5 0,0 | tail -2 | sed 's/^/dec0: /'
 python3 "$RR/dec0_pack.py" "$d/weights.npz" "$OUT/weights-dec0m.bin" "$d/dec0_m_w.h" > /dev/null
 glsl "$OUT/dec0_m.spv" "$RR/dec0_m.comp" "$d" "$RR"
 native dec0 weights-dec0m.bin
