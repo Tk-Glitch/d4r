@@ -238,6 +238,10 @@ struct R2Engine {
             if (surface && offset == 40) return Resource{output, false, false};
         } else if (stage == R2DownP) {
             if (surface && offset == 40) return Resource{output, false, false};
+            // the game's colour, which this variant reads at the render rectangle (arguments 88 - 100) where it
+            // composites the particle layer. NGX binds it (a CUDA-path replay of a harness frame with
+            // ColorBeforeParticles, 2026-10-14); left null, the kernel's output is NaN (Cyberpunk 2077 showed black)
+            if (!surface && offset == 80) return G(in.color);
             if (surface && offset == 264) return T(pb[par]);
             if (!surface && offset == 208) return in.colorBeforeParticles ? G(in.colorBeforeParticles) : Resource{};
             if (!surface && offset == 256) return T(pb[par ^ 1], true);
@@ -477,9 +481,11 @@ struct R2Engine {
             bindImage(d.handle, set, binding++, res.view ? res.view : spare.at(format).view);
         }
         for (uint32_t offset : st.buffers) {
-            // the exposure values (enc0 256, post 16, down 72), enc0's second table (104); the progress counters
-            // are never accessed (their pointers are null)
-            const bool vals = (stage == R2Enc0 && offset == 256) || (stage == R2Post && offset == 16) || (stage == R2Down && offset == 72);
+            // the exposure values (enc0 256, post 16, down and downp 72), enc0's second table (104); the progress counters
+            // are never accessed (their pointers are null). downp scales its output by 1 / the exposure: with the
+            // zeroed dummy there every pixel was NaN (Cyberpunk 2077, which passes ColorBeforeParticles, showed black)
+            const bool vals = (stage == R2Enc0 && offset == 256) || (stage == R2Post && offset == 16) ||
+                              ((stage == R2Down || stage == R2DownP) && offset == 72);
             bindBuffer(d.handle, set, binding++, vals ? values : (stage == R2Enc0 && offset == 104) ? model.aux : dummy);
         }
         return set;
