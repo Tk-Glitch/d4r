@@ -30,6 +30,15 @@
 //   D4R_SHIM_INPUT_STATE / D4R_SHIM_DEPTH_STATE / D4R_SHIM_OUTPUT_STATE
 //                       D3D12 resource states the inputs/output are in when
 //                       EvaluateFeature is called (defaults 0x40, 0x40, 0x8)
+//   D4R_SHIM_GPU_INPUT_WAIT=1 experimental NGX null-stream input wait (default 0; split VRAM only)
+//   D4R_SHIM_OUTPUT_RGBA8=1 validated native K output stores RGBA8 directly (default 0)
+//   D4R_SHIM_NATIVE_COMPLETION=1 native null-stream callback signals/wakes split completion (default 0)
+//   D4R_SHIM_FUSE_RGBA8_INPUT=1 combine RGBA8 color conversion and linear-buffer copy (default 0)
+//   D4R_SHIM_GPU_COMPLETION=1 (needs GPU_INPUT_WAIT) the game's queue polls DLSS's completion word on the GPU
+//                       instead of a CPU-signalled split (bounded poll; default 0)
+//   D4R_PROFILE_GPU_EVENTS / _TIMESTAMPS / _LOG / _CPU_TIME=0 drop one part of D4R_PROFILE (bisection)
+//   D4R_NGX_STREAM_PRIORITY=high|normal (bridge) run NGX on one priority HIP stream (default off; no gain measured)
+//   D4R_SHIM_MARKER_POLL_US=N fixed CPU marker pacing; unset: adaptive (0 yields)
 //   D4R_SHIM_VRAM_INTEROP=1 keep inputs and output in VRAM (see "VRAM interop")
 //   D4R_SHIM_SPLIT_FRAME=1 with VRAM interop and the d4r vkd3d-proton patch,
 //                       present each frame's own DLSS result (see "Split frames")
@@ -54,6 +63,8 @@
 #include <dxgi1_4.h>
 #include <vulkan/vulkan_core.h>
 #include "d4r_motion_dilation.h"
+#include "d4r_input_wait.h"
+#include "d4r_vulkan_staging.h"
 
 #include <algorithm>
 #include <bit>
@@ -266,10 +277,23 @@ struct CudaApi
     int(WINAPI* memcpy2DAsync)(const CudaMemcpy2D*, void*) = nullptr;
     // Optional (d4r nvcuda bridge): null-stream wait for a device u32, and a write from another stream.
     int(WINAPI* streamWaitValue32)(CudaDevicePtr, uint32_t) = nullptr;
+    int(WINAPI* streamWaitValue32Eq)(CudaDevicePtr, uint32_t) = nullptr;
+    int(WINAPI* ngxWriteValue32)(CudaDevicePtr, uint32_t) = nullptr; // D4R_SHIM_GPU_COMPLETION
+    int(WINAPI* ngxArmCompletion)(CudaDevicePtr, uint32_t, int) = nullptr; // early word behind the output kernel
+    int(WINAPI* ngxCompletionFired)() = nullptr;
+    double(WINAPI* threadCpuTimeMs)() = nullptr;
     int(WINAPI* writeValue32)(CudaDevicePtr, uint32_t) = nullptr;
     // Optional (d4r nvcuda bridge): surfaces of an array store to linear memory instead (d4r native kernels).
     int(WINAPI* setArrayRedirect)(CudaArray, CudaDevicePtr, uint32_t) = nullptr;
     int(WINAPI* outputKernelNative)() = nullptr;
+    int(WINAPI* outputKernelRgba8)() = nullptr;
+    int(WINAPI* timelineCreate)(VkDevice, uint64_t, void**) = nullptr;
+    int(WINAPI* timelinePrepare)(void*) = nullptr;
+    void(WINAPI* timelineCancel)(void*) = nullptr;
+    int(WINAPI* timelineQueue)(void*, uint64_t) = nullptr;
+    int(WINAPI* timelineSignal)(void*, uint64_t) = nullptr;
+    void(WINAPI* timelineDestroy)(void*) = nullptr;
+    int(WINAPI* timelineWait)(void*) = nullptr;
     // Optional (d4r nvcuda bridge): report a pitch-linear texture to NGX as an array of that size/format.
     int(WINAPI* registerLinearTexture)(CudaObject, size_t, size_t, uint32_t, uint32_t) = nullptr;
     int(WINAPI* dilateMotion)(const D4rMotionDilationParams*) = nullptr;
@@ -665,7 +689,8 @@ static void load_portable_config()
         portable_set(setting.variable, ini_flag(ini, "interop", setting.key, setting.fallback) ? "1" : "0");
     portable_set_unix("D4R_ELIDE_NGX_SYNC", ini_flag(ini, "interop", "ElideNgxSync", 1) ? "1" : "0");
     const std::string poll = ini_value(ini, "interop", "MarkerPollUs");
-    portable_set("D4R_SHIM_MARKER_POLL_US", poll.empty() ? "200" : poll);
+    if (!poll.empty() && ascii_lower(poll) != "auto")
+        portable_set("D4R_SHIM_MARKER_POLL_US", poll);
     // Direct output takes effect only while NGX runs the native output kernel (the bridge reports it); the
     // release cannot ship that kernel, which is built from NVIDIA's PTX.
     portable_set("D4R_SHIM_OUTPUT_DIRECT", ini_flag(ini, "interop", "DirectOutput", nativeOn) ? "1" : "0");
@@ -784,16 +809,6 @@ using ProfileClock = std::chrono::steady_clock;
 static double profile_ms(ProfileClock::time_point start, ProfileClock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
-static double profile_thread_cpu_ms()
-{
-    FILETIME created = {}, exited = {}, kernel = {}, user = {};
-    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
-        return -1.0;
-    const uint64_t kernelTicks = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
-    const uint64_t userTicks = (static_cast<uint64_t>(user.dwHighDateTime) << 32) | user.dwLowDateTime;
-    return static_cast<double>(kernelTicks + userTicks) / 10000.0;
 }
 
 // --- CUDA worker thread --------------------------------------------------------
@@ -1357,6 +1372,14 @@ static bool denoiser_has_preset_f()
 {
     return g.denoiserVersion[0] > 310 || (g.denoiserVersion[0] == 310 && g.denoiserVersion[1] >= 9);
 }
+
+static double profile_thread_cpu_ms()
+{
+    // Wine's GetThreadTimes is tick-accounted (10 ms on this host), despite FILETIME's 100 ns units.
+    // The Unix bridge reads the current worker's actual thread CPU clock. Older bridges report n/a.
+    static const bool wanted = env_uint("D4R_PROFILE_CPU_TIME", 1) != 0; // 0: skip the Unix call (bisection)
+    return wanted && g.cu.threadCpuTimeMs != nullptr ? g.cu.threadCpuTimeMs() : -1.0;
+}
 static std::mutex g_featureApiMutex;
 
 template <typename Function> static bool load_export(HMODULE module, const char* name, Function& function)
@@ -1536,10 +1559,31 @@ static bool load_libraries()
     if (!load_export(g.cuda, "d4rStreamWaitValue32", g.cu.streamWaitValue32) ||
         !load_export(g.cuda, "d4rWriteValue32", g.cu.writeValue32))
         g.cu.streamWaitValue32 = nullptr, g.cu.writeValue32 = nullptr;
+    g.cu.streamWaitValue32Eq = reinterpret_cast<decltype(g.cu.streamWaitValue32Eq)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rStreamWaitValue32Eq")));
+    g.cu.ngxWriteValue32 = reinterpret_cast<decltype(g.cu.ngxWriteValue32)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxWriteValue32")));
+    g.cu.ngxArmCompletion = reinterpret_cast<decltype(g.cu.ngxArmCompletion)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxArmCompletion")));
+    g.cu.ngxCompletionFired = reinterpret_cast<decltype(g.cu.ngxCompletionFired)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxCompletionFired")));
+    if (g.cu.ngxArmCompletion == nullptr || g.cu.ngxCompletionFired == nullptr)
+        g.cu.ngxArmCompletion = nullptr, g.cu.ngxCompletionFired = nullptr;
+    g.cu.threadCpuTimeMs = reinterpret_cast<decltype(g.cu.threadCpuTimeMs)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rThreadCpuTimeMs")));
     if (!load_export(g.cuda, "d4rSetArrayRedirect", g.cu.setArrayRedirect))
         g.cu.setArrayRedirect = nullptr;
     if (!load_export(g.cuda, "d4rOutputKernelNative", g.cu.outputKernelNative))
         g.cu.outputKernelNative = nullptr;
+    g.cu.outputKernelRgba8 = reinterpret_cast<decltype(g.cu.outputKernelRgba8)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rOutputKernelRgba8")));
+    g.cu.timelineCreate = reinterpret_cast<decltype(g.cu.timelineCreate)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelineCreate")));
+    g.cu.timelinePrepare = reinterpret_cast<decltype(g.cu.timelinePrepare)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelinePrepare")));
+    g.cu.timelineCancel = reinterpret_cast<decltype(g.cu.timelineCancel)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelineCancel")));
+    g.cu.timelineQueue = reinterpret_cast<decltype(g.cu.timelineQueue)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelineQueue")));
+    g.cu.timelineSignal = reinterpret_cast<decltype(g.cu.timelineSignal)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelineSignal")));
+    g.cu.timelineDestroy = reinterpret_cast<decltype(g.cu.timelineDestroy)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelineDestroy")));
+    g.cu.timelineWait = reinterpret_cast<decltype(g.cu.timelineWait)>(reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rNgxTimelineWait")));
     if (!load_export(g.cuda, "d4rRegisterLinearTexture", g.cu.registerLinearTexture))
         g.cu.registerLinearTexture = nullptr;
     g.cu.dilateMotion = reinterpret_cast<decltype(g.cu.dilateMotion)>(
@@ -1876,6 +1920,15 @@ struct VramBuffer
     // What a pooled buffer can be reused as: 0 the interop transfer buffers (create_vram_buffer), 1 and 2 the
     // engine's device-local and host-coherent storage buffers (create_engine_shared_buffer).
     uint8_t kind = 0;
+};
+
+// Per-slot descriptors and their source texture live until recorded allocators retire.
+struct FusedColorInput {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    D4rVkStagingSet set;
+    ID3D12Resource* owner = nullptr;
 };
 
 // A temporary image for colour or exposure format conversion.
@@ -2318,6 +2371,8 @@ struct FrameParams
     int createQuality = 0, createFlags = 0, createSubrects = 0;
     unsigned int createPreset = 0;
     bool vram = false; // inputs and output stay in VRAM (VRAM interop)
+    bool gpuInputMarker = false; // this list recorded the exportable per-slot readiness mirror
+    bool gpuCompletion = false; // the game's queue polls this frame's completion word instead of a split wait
     bool split = false; // this frame presents its own result (split frames)
     unsigned motionDilation = 0; // actually applied, worker only
     // D4R_SHIM_INPLACE: the game's linear output texture, written without a game-side copy (0 = none)
@@ -2326,6 +2381,7 @@ struct FrameParams
     // D4R_SHIM_OUTPUT_PACKED: the output kernel stores the game's R10G10B10A2 texels itself, so the game-side
     // copy (or the in-place texture) takes them without the RGBA16F conversion image and blit
     bool packedOutput = false;
+    bool packedRgba8 = false; // R8G8B8A8_UNORM after the original half rounding
     // Ray Reconstruction: the denoiser's own per-frame settings and camera matrices, copied
     // off the caller's parameter object on the game thread so the worker never reads an
     // object the game may have destroyed by then. A scalar the caller did not set this frame
@@ -2350,11 +2406,23 @@ struct FrameTiming
     double download = 0, outputConvert = 0;
     double prep = 0, worker = 0, workerWait = 0, finishWait = 0, markerWait = 0;
     double ngxHost = 0, ctxSync = 0, gpuEval = -1;
+    // GPU-input-wait frames split gpu_eval at an event recorded right behind the wait: input_gpu_wait is launch ->
+    // inputs released (the game's remaining input work), dlss_gpu is inputs released -> completion (the real DLSS
+    // cost). CPU-wait frames have no wait on the GPU: dlss_gpu equals gpu_eval and input_gpu_wait is 0.
+    double dlssGpu = -1, inputGpuWait = -1;
+    // Game-queue GPU timestamps around this evaluation (D3D12 queries, read 4 frames later, so these describe the
+    // frame kOutputSlots earlier): vk_input = shim input commands, vk_dlss_wait = input marker -> second half
+    // starts (input release, DLSS, completion signal), vk_output = second-half commands, vk_total = all of it
+    // (what an overlay timing the evaluate call on the game's list reports).
+    double vkInput = -1, vkDlssWait = -1, vkOutput = -1, vkTotal = -1;
+    bool inputEventRecorded = false;
     double motionDilationWall = 0;
     bool markerDeferred = false; // the worker waits for the input marker (D4R_SHIM_DEFER_MARKER)
+    bool gpuInputWait = false; // GPU events span wait enqueue -> NGX completion, including input readiness
     bool gpuEventsRecorded = false;
     double outputSyncWall = 0, outputSyncCpu = -1;
     bool outputSyncBlocking = false;
+    bool outputSyncNative = false;
     double h2dTotal = 0, d2hIssue = 0, d2hWait = 0;
     ProfileClock::time_point prepStart, workerQueued, finishQueued;
     size_t queueDepth = 0;
@@ -2512,12 +2580,20 @@ struct Feature
     // Output.Subrect origins are read at all, so a replay must create the feature the same way.
     int outputSubrects = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
+    CudaEvent profileInputsReleased = nullptr; // D4R_PROFILE only: recorded right behind the GPU-side input wait
+    // D4R_PROFILE only: 4 game-queue timestamps per output slot (start, input marker, second half, end)
+    ID3D12QueryHeap* timestampHeap = nullptr;
+    ID3D12Resource* timestampReadback = nullptr;
+    volatile uint64_t* timestampValues = nullptr;
+    double timestampTicksPerMs = 0.0;
+    bool timestampFailed = false;
     CudaEvent outputReadyEvent = nullptr;
     // output wait pacing (D4R_SHIM_OUTPUT_POLL_US): smoothed time from the event record to its completion, kept
     // separately for each wait site (they wait for very different amounts of GPU work)
     double publishWaitEmaUs = 0.0, evalWaitEmaUs = 0.0;
     // native Vulkan input wait: smoothed time from recording to the input event (waiters may overlap)
     std::atomic<double> vkInputWaitEmaUs{0.0};
+    std::atomic<double> markerWaitEmaUs{0.0}; // prep or worker waits; never both for the same frame
     bool profileEventsReady = false;
 
     CudaImage color, depth, motion, exposure, output;
@@ -2541,6 +2617,9 @@ struct Feature
     // VRAM interop: decided on the first evaluation, dropped for good if the
     // formats later stop qualifying.
     bool vram = false, vramDecided = false;
+    bool fusedColorAllowed = true;
+    FusedColorInput fusedColor[kSlots];
+    std::vector<FusedColorInput> retiredFusedColor;
     VramImage colorConversion;
     VramImage depthConversion;
     VramImage motionConversion;
@@ -2553,14 +2632,14 @@ struct Feature
     std::mutex splitMutex;
     uint64_t splitSignalled = 0; // under splitMutex
     D4rFrameCompletion splitCompletion; // under splitMutex; cancellation can finish out of order
-    // Inputs become ready on the CPU before CUDA work is queued. GPU-side waits
-    // for recorded-but-discarded command lists can otherwise wedge the device.
+    // GPU input waits are opt-in, with an independent CPU watchdog that can release discarded lists.
     // D4R_SHIM_OUTPUT_DIRECT: this frame's result is stored by the native output kernel straight into its
     // destination buffer (worker only), so the array -> buffer copy is skipped.
     bool outputRedirected = false;
     // The previous frame's output kernel was the native one and honoured the redirect (worker writes, game
     // thread reads): only then is a frame recorded for packed output.
     std::atomic<bool> packedReady{false};
+    std::atomic<bool> rgba8Ready{false};
     bool outputDirectAllowed = false; // the forced preset's output kernel honours the redirect
     // D4R_SHIM_LINEAR_INPUTS: NGX samples the interop buffers directly through pitch-linear
     // texture objects (rows padded to 256 bytes), so the buffer -> array copies disappear.
@@ -2570,6 +2649,24 @@ struct Feature
     std::vector<VramImage> retiredImages;
     ID3D12Resource* marker = nullptr;
     volatile uint32_t* markerValue = nullptr; // [0] latest input; [1 + slot] exact input frame
+    // The D3D12 READBACK marker has no exportable HIP pointer. Mirror its per-slot tags in a dedicated
+    // HOST_VISIBLE | HOST_COHERENT Vulkan allocation imported into HIP, as engineSync is. Keep the original
+    // marker as the authority: releasing a wait from the CPU must not turn unsubmitted input into ready input.
+    VramBuffer ngxInputSync;
+    // D4R_SHIM_GPU_COMPLETION: words kCompletionWord + frame % kOutputSlots of ngxInputSync carry each frame's
+    // completion (written by HIP after the output, or by the CPU in frame_retired); the game's queue polls them.
+    bool gpuCompletion = false;
+    bool completionFired = false; // worker only: the bridge queued this frame's word behind the native output kernel
+    D4rVkStagingSet completionSet;
+    void* ngxTimeline = nullptr; // native completion and CPU drops share this timeline writer
+    bool ngxNativeCompletion = false; // worker only after feature setup
+    std::atomic<bool> ngxGpuWait{false};
+    bool ngxWaitEventsWarmed = false; // worker only: initialize event storage before the first stream wait
+    std::mutex ngxWaitMutex;
+    bool ngxWaitActive = false, ngxWaitCancelled = false; // under ngxWaitMutex, armed before calling HIP
+    uint32_t ngxWaitFrame = 0;
+    int ngxWaitSlot = 0;
+    ProfileClock::time_point ngxWaitStart;
     uint32_t frame = 0;
     uint32_t rejectedFormatCount = 0; // game thread; rate-limits format diagnostics
     std::atomic<int> latestOutput{-1};
@@ -2671,6 +2768,14 @@ static bool create_buffer(D3D12_HEAP_TYPE heapType, UINT64 size, ID3D12Resource*
     }
     return true;
 }
+
+// D4R_PROFILE: game-queue timestamps for one evaluation. Point 0 is written before the input commands, 1 after the
+// input marker, 2 at the start of the split's second half, 3 after the output commands (which also resolves the
+// slot). Reading slot frame % kOutputSlots returns the evaluation kOutputSlots frames earlier, whose second half has
+// normally run by now; incomplete (zero) values are skipped. Allocation failure disables it for the feature.
+struct Feature;
+static bool profile_timestamps_ready(Feature& feature);
+static void profile_timestamp(Feature& feature, ID3D12GraphicsCommandList* list, uint32_t frame, int point);
 
 // Ensures staging matches the resource's first subresource; heap selects
 // readback (inputs) or upload (output).
@@ -3036,6 +3141,8 @@ struct VulkanInterop
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkGetBufferMemoryRequirements bufferRequirements = nullptr;
     PFN_vkBindBufferMemory bindBuffer = nullptr;
+    PFN_vkCreateImageView createView = nullptr;
+    PFN_vkDestroyImageView destroyView = nullptr;
     PFN_vkCreateImage createImage = nullptr;
     PFN_vkDestroyImage destroyImage = nullptr;
     PFN_vkGetImageMemoryRequirements imageRequirements = nullptr;
@@ -3056,6 +3163,14 @@ struct VulkanInterop
     int(WINAPI* release)(void*) = nullptr;
 };
 static VulkanInterop g_vk;
+static D4rVkStaging g_fusedColorStage;
+// D4R_SHIM_GPU_COMPLETION: the bounded completion-word wait (kernels/support/vulkan_wait.comp)
+static D4rVkStaging g_waitStage;
+static bool g_waitReady = false;
+constexpr uint32_t kCompletionWord = 16;
+// ~1 us per poll of coherent memory: at most about a second, far below the kernel driver's 10 s GPU timeout
+constexpr uint32_t kCompletionPollLimit = 1u << 20;
+static bool g_fusedColorReady = false;
 
 static bool vram_interop_requested()
 {
@@ -3117,6 +3232,8 @@ static void init_vram_interop()
     load(g_vk.destroyBuffer, "vkDestroyBuffer");
     load(g_vk.bufferRequirements, "vkGetBufferMemoryRequirements");
     load(g_vk.bindBuffer, "vkBindBufferMemory");
+    load(g_vk.createView, "vkCreateImageView");
+    load(g_vk.destroyView, "vkDestroyImageView");
     load(g_vk.createImage, "vkCreateImage");
     load(g_vk.destroyImage, "vkDestroyImage");
     load(g_vk.imageRequirements, "vkGetImageMemoryRequirements");
@@ -3141,6 +3258,16 @@ static void init_vram_interop()
         FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDeviceD4R3), reinterpret_cast<void**>(&g_vk.linear))))
         g_vk.linear = nullptr;
     g_vk.ready = ok;
+    if (ok && env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 0) != 0)
+    {
+        g_fusedColorReady = g_fusedColorStage.init(g_vk.device, deviceProc);
+        if (!g_fusedColorReady) g_fusedColorStage.destroy();
+    }
+    if (ok && env_uint("D4R_SHIM_GPU_COMPLETION", 0) != 0)
+    {
+        g_waitReady = g_waitStage.init(g_vk.device, deviceProc) && g_waitStage.wait_ready();
+        if (!g_waitReady) g_waitStage.destroy();
+    }
     logf("VRAM interop: %s (VkDevice %p), split frames %s", ok ? "ready" : "missing Vulkan entry points",
          static_cast<void*>(g_vk.device), g_vk.split != nullptr ? "available" : "unavailable (stock vkd3d-proton)");
 }
@@ -3200,6 +3327,7 @@ static bool create_vram_buffer(VramBuffer& target, size_t bytes, bool importNow 
     VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
     info.size = bytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (g_fusedColorReady) info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult result = g_vk.createBuffer(g_vk.device, &info, nullptr, &buffer.buffer);
     VkMemoryRequirements requirements = {};
@@ -3546,10 +3674,41 @@ static VkBufferImageCopy full_region(const VramCopy& copy)
     return region;
 }
 
+static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* source, const VramCopy& copy)
+{
+    if (!g_fusedColorReady || !feature.fusedColorAllowed || env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 0) == 0 || source->GetDesc().Format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        (source->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return false;
+    // Descriptor/image lifetimes extend through allocator retirement, including discarded lists.
+    // Bound that retention if a game creates a new transient input resource every frame; fallback
+    // to the original blit/copy path without invalidating descriptors already recorded on the GPU.
+    if (feature.retiredFusedColor.size() >= 64)
+    {
+        feature.fusedColorAllowed = false;
+        logf("fused color input descriptor retention reached its bound; using blit/copy for this feature");
+        return false;
+    }
+    auto& slot = feature.fusedColor[slotIndex];
+    auto& target = feature.inputs[slotIndex].vram[0];
+    if (slot.image == copy.image && slot.buffer == target.buffer && slot.owner == source) return true;
+    if (slot.owner != nullptr) feature.retiredFusedColor.push_back(slot);
+    slot = {};
+    VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = copy.image; view.viewType = VK_IMAGE_VIEW_TYPE_2D; view.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (g_vk.createView(g_vk.device, &view, nullptr, &slot.view) != VK_SUCCESS) return false;
+    if (!g_fusedColorStage.set(slot.set, slot.view, view.format, target.buffer, feature.inputs[slotIndex].host[0].size(), false))
+    {
+        g_fusedColorStage.free(slot.set); g_vk.destroyView(g_vk.device, slot.view, nullptr); slot = {}; return false;
+    }
+    slot.image = copy.image; slot.buffer = target.buffer; slot.owner = source; source->AddRef();
+    logf("fused RGBA8 input conversion active for slot %d", slotIndex);
+    return true;
+}
+
 // Records the input copies into the slot's buffers. The resources are in
 // COPY_SOURCE state already.
 static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list, InputSlot& slot,
-                               const VramCopy* copies, int count)
+                               const VramCopy* copies, int count, bool fusedColor = false)
 {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
@@ -3561,6 +3720,27 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
         const VramCopy& copy = copies[index];
         VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
         g_vk.interop->GetVulkanImageLayout(copy.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, &layout);
+        if (index == 0 && fusedColor)
+        {
+            const VkMemoryBarrier writable = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         1, &writable, 0, nullptr, 0, nullptr);
+            VkImageMemoryBarrier sampled = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            sampled.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; sampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sampled.oldLayout = layout; sampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            sampled.srcQueueFamilyIndex = sampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sampled.image = copy.image; sampled.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &sampled);
+            auto& stage = feature.fusedColor[&slot - feature.inputs];
+            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, 5, slot.host[0].rowBytes / 8);
+            sampled.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; sampled.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            sampled.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; sampled.newLayout = layout;
+            g_vk.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &sampled);
+            continue;
+        }
         VkBufferImageCopy region = full_region(copy);
         static const Plane kPlanes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
         if (feature.linearInputs)
@@ -3604,7 +3784,11 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
         g_vk.copyImageToBuffer(cmd, conversion, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.vram[index].buffer, 1,
                                &region);
     }
-    g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &kAfterTransfer, 0,
+    const VkMemoryBarrier completed = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    g_vk.barrier(cmd, fusedColor ? VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT :
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                 fusedColor ? &completed : &kAfterTransfer, 0,
                  nullptr, 0, nullptr);
     return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
 }
@@ -3670,6 +3854,54 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
 // watchdog reports delays without releasing an unfinished producer.
 
 static VkResult signal_split_semaphore(Feature& feature, uint64_t value);
+
+// Only the private wait word is released; never write the game's original readback marker. No HIP call
+// belongs here: HIP may hold its queue lock while NGX submits, and this runs independently of that worker.
+// The coherent allocation stays alive through CUDA drain and through recorded command-list retirement.
+static void release_ngx_input_wait_locked(Feature& feature, const char* reason, bool disable)
+{
+    if (!feature.ngxWaitActive || feature.ngxWaitCancelled)
+        return;
+    feature.ngxWaitCancelled = true;
+    if (feature.ngxTimeline != nullptr) g.cu.timelineCancel(feature.ngxTimeline);
+    if (disable)
+        feature.ngxGpuWait.store(false);
+    auto* word = static_cast<volatile uint32_t*>(feature.ngxInputSync.mapped) + 1 + feature.ngxWaitSlot;
+    *word = feature.ngxWaitFrame;
+    MemoryBarrier();
+    logf("NGX frame %u: %s; CPU released the coherent GPU-side input wait; dropping after stream drain",
+         feature.ngxWaitFrame, reason);
+}
+
+static void ngx_input_watchdog()
+{
+    for (;;)
+    {
+        d4r_sleep_us(1000);
+        // Registry ownership prevents feature destruction while we inspect or release its wait. The
+        // worker never holds ngxWaitMutex across a CUDA call, including the wait enqueue itself.
+        std::lock_guard<std::mutex> registryLock(g_featuresMutex);
+        for (Feature* feature : g_features)
+        {
+            std::lock_guard<std::mutex> lock(feature->ngxWaitMutex);
+            if (!feature->ngxWaitActive || feature->ngxWaitCancelled)
+                continue;
+            const double elapsedUs = std::chrono::duration<double, std::micro>(
+                ProfileClock::now() - feature->ngxWaitStart).count();
+            const uint32_t aggregate = feature->markerValue[0];
+            MemoryBarrier();
+            // Read the exact slot after the aggregate, as the CPU path's recheck does: a marker that
+            // landed between the reads must not be mistaken for a discarded command list.
+            const auto reason = d4r_input_wait_abort(feature->ngxWaitFrame,
+                feature->markerValue[1 + feature->ngxWaitSlot], aggregate, feature->retiring.load(), elapsedUs);
+            if (reason != D4rInputWaitAbort::None)
+                release_ngx_input_wait_locked(*feature,
+                    reason == D4rInputWaitAbort::Retired ? "the feature retired" :
+                    reason == D4rInputWaitAbort::Discarded ? "its command list was discarded" :
+                    "the input wait or evaluation timed out (5 s)", reason == D4rInputWaitAbort::Timeout);
+        }
+    }
+}
 
 static void release_split_frame(Feature* feature, uint32_t frame)
 {
@@ -3773,6 +4005,20 @@ static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT wid
 
 static void release_vram(Feature& feature)
 {
+    for (auto& stage : feature.fusedColor) feature.retiredFusedColor.push_back(stage);
+    for (auto& stage : feature.retiredFusedColor)
+    {
+        g_fusedColorStage.free(stage.set);
+        if (stage.view != VK_NULL_HANDLE) g_vk.destroyView(g_vk.device, stage.view, nullptr);
+        if (stage.owner != nullptr) stage.owner->Release();
+    }
+    feature.retiredFusedColor.clear();
+    if (feature.ngxTimeline != nullptr)
+    {
+        g.cu.timelineDestroy(feature.ngxTimeline);
+        feature.ngxTimeline = nullptr;
+    }
+    recycle_vram_buffer(feature.ngxInputSync);
     if (feature.splitSemaphore != VK_NULL_HANDLE)
         g_vk.destroySemaphore(g_vk.device, feature.splitSemaphore, nullptr);
     for (InputSlot& slot : feature.inputs)
@@ -5645,10 +5891,21 @@ static bool wait_for_release(const std::atomic<bool>& flag)
 }
 
 static void release_split_frame(Feature* feature, uint32_t frame);
+static bool complete_ngx_input_wait(Feature& feature, uint32_t frame, bool abort);
 
 // Every queued frame ends in exactly one call of this (published or dropped).
 static void frame_retired(Feature* feature, uint32_t frame)
 {
+    // Covers every early error exit, even failures after the wait but before an output event was recorded.
+    // Never release the split timeline or input ownership while queued NGX writes can still be running.
+    complete_ngx_input_wait(*feature, frame, true);
+    if (feature->gpuCompletion)
+    {
+        // Every queued frame ends here after its GPU work completed or was drained: release a game queue that may
+        // be polling for it (success paths wrote the same value from the GPU already).
+        static_cast<volatile uint32_t*>(feature->ngxInputSync.mapped)[kCompletionWord + frame % kOutputSlots] = frame;
+        MemoryBarrier();
+    }
     if (feature->split)
         release_split_frame(feature, frame);
     // The denoiser inputs this frame bound belong to the slot it used, and the caller stops
@@ -5944,12 +6201,12 @@ static CudaObject prepare_dilated_motion(Feature& feature, InputSlot& slot, cons
 // into the CUDA arrays on the GPU. With D4R_SHIM_VRAM_VERIFY also compares
 // them with the host-staged planes of the same frame.
 static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposure, uint32_t frame,
-                               FrameTiming* timing)
+                               FrameTiming* timing, bool gpuWait = false)
 {
     const Plane planes[4] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
     CudaImage* images[4] = {&feature.color, &feature.depth, &feature.motion, &feature.exposure};
     const int count = hasExposure ? 4 : 3;
-    const bool verify = env_uint("D4R_SHIM_VRAM_VERIFY", 0) != 0;
+    const bool verify = !gpuWait && env_uint("D4R_SHIM_VRAM_VERIFY", 0) != 0;
     const auto start = ProfileClock::now();
     int result = 0;
     for (int index = 0; index < count && result == 0; ++index)
@@ -5986,11 +6243,13 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
         copy.dstArray = images[index]->array;
         copy.WidthInBytes = geometry.rowBytes;
         copy.Height = geometry.height;
-        result = copy_2d(copy);
+        // An active GPU wait requires the known null-stream async route. Do not silently fall back to
+        // a synchronous or differently ordered copy while this frame's input boundary is outstanding.
+        result = gpuWait ? g.cu.memcpy2DAsync(&copy, nullptr) : copy_2d(copy);
         // D4R_SHIM_VRAM_ARRAY_VERIFY=1: read the CUDA array DLSS samples back
         // and compare it with the imported buffer it was filled from.
         static const bool arrayVerify = env_uint("D4R_SHIM_VRAM_ARRAY_VERIFY", 0) != 0;
-        if (arrayVerify && result == 0 && g.cu.ctxSynchronize() == 0)
+        if (!gpuWait && arrayVerify && result == 0 && g.cu.ctxSynchronize() == 0)
         {
             std::vector<uint8_t> fromBuffer(geometry.size()), fromArray(geometry.size());
             CudaMemcpy2D readBuffer = {};
@@ -6028,7 +6287,12 @@ static bool upload_inputs_vram(Feature& feature, InputSlot& slot, bool hasExposu
     if (timing != nullptr)
         timing->h2dTotal = profile_ms(start, ProfileClock::now());
     if (result != 0)
+    {
         logf("VRAM input copy failed: %d", result);
+        if (gpuWait && feature.ngxGpuWait.exchange(false))
+            logf("NGX feature %u: null-stream async input copy failed; using CPU marker polling from now on",
+                 feature.handle.Id);
+    }
     return result == 0;
 }
 
@@ -6104,7 +6368,7 @@ static int synchronize_default_stream(Feature& feature, bool* querySleep, double
 // A frame recorded for packed output whose output kernel then did not pack it (it was not the native one
 // after all): the RGBA16F result is converted on the host, rounding as the kernel store and the game-side
 // blit do. Slow, and only expected around a kernel change.
-static int pack_output_on_host(Feature& feature, CudaMemcpy2D copy, size_t packedPitch, uint32_t frame)
+static int pack_output_on_host(Feature& feature, CudaMemcpy2D copy, size_t packedPitch, uint32_t frame, bool rgba8 = false)
 {
     const size_t width = feature.output.width, height = feature.output.height;
     std::vector<uint16_t> halves(width * height * 4);
@@ -6123,8 +6387,11 @@ static int pack_output_on_host(Feature& feature, CudaMemcpy2D copy, size_t packe
         return static_cast<uint32_t>(value * scale + 0.5f);
     };
     for (size_t texel = 0; texel < packed.size(); ++texel)
-        packed[texel] = unorm(halves[texel * 4], 1023.0f) | unorm(halves[texel * 4 + 1], 1023.0f) << 10 |
-                        unorm(halves[texel * 4 + 2], 1023.0f) << 20 | unorm(halves[texel * 4 + 3], 3.0f) << 30;
+        packed[texel] = rgba8
+            ? unorm(halves[texel * 4], 255.0f) | unorm(halves[texel * 4 + 1], 255.0f) << 8 |
+              unorm(halves[texel * 4 + 2], 255.0f) << 16 | unorm(halves[texel * 4 + 3], 255.0f) << 24
+            : unorm(halves[texel * 4], 1023.0f) | unorm(halves[texel * 4 + 1], 1023.0f) << 10 |
+              unorm(halves[texel * 4 + 2], 1023.0f) << 20 | unorm(halves[texel * 4 + 3], 3.0f) << 30;
     CudaMemcpy2D upload = {};
     upload.srcMemoryType = CUDA_MEMORY_HOST;
     upload.srcHost = packed.data();
@@ -6137,6 +6404,33 @@ static int pack_output_on_host(Feature& feature, CudaMemcpy2D copy, size_t packe
     result = g.cu.memcpy2D(&upload);
     logf("frame %u: output kernel did not pack its result; converted on the host (%d)", frame, result);
     return result;
+}
+
+// Worker only: finish the tracked wait once output completed, or release and drain an aborted submission.
+static bool complete_ngx_input_wait(Feature& feature, uint32_t frame, bool abort)
+{
+    {
+        std::lock_guard<std::mutex> lock(feature.ngxWaitMutex);
+        if (!feature.ngxWaitActive || feature.ngxWaitFrame != frame)
+            return true;
+        if (abort)
+            release_ngx_input_wait_locked(feature, "submission or output completion failed", false);
+    }
+    // Success callers already synchronized the output; error callers may have no completion event, so
+    // drain the real context (the bridge export bypasses NGX sync elision) after releasing the wait. Keep
+    // the watchdog armed during this call, and the slot/resources owned until it returns.
+    if (abort && g.cu.ctxSynchronize() != 0)
+    {
+        feature.ngxGpuWait.store(false);
+        feature.retiring.store(true);
+        logf("NGX frame %u: context drain failed after input-wait release; retiring feature", frame);
+    }
+    std::lock_guard<std::mutex> lock(feature.ngxWaitMutex);
+    const bool valid = !feature.ngxWaitCancelled;
+    feature.ngxWaitActive = false;
+    if (!valid)
+        feature.evaluatedFrames = 0; // a discarded evaluation must not supply temporal history to the next one
+    return valid;
 }
 
 // VRAM interop, worker thread: copies the finished result into a free output
@@ -6174,13 +6468,57 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     int result = rowBytes / (params.packedOutput ? 2 : 1) * feature->output.height > buffer.bytes ? -1
                  : feature->outputRedirected ? 0
                  : params.packedOutput ? pack_output_on_host(*feature, copy, params.outputInPlace != 0 ? copy.dstPitch
-                                                                               : rowBytes / 2, frame)
+                                                                               : rowBytes / 2, frame, params.packedRgba8)
                  : copy_2d(copy);
+    // GPU-side completion: the word is written behind every output write on NGX's stream. A failed enqueue is
+    // covered by frame_retired's CPU write once this frame has synchronized below.
+    if (result == 0 && params.gpuCompletion && !feature->completionFired &&
+        g.cu.ngxWriteValue32(feature->ngxInputSync.device + sizeof(uint32_t) * (kCompletionWord + frame % kOutputSlots),
+                             frame) != 0)
+    {
+        static bool logged = false;
+        if (!logged)
+            logf("frame %u: GPU completion write could not be queued; the CPU releases the game's queue", frame);
+        logged = true;
+    }
+    bool nativeQueued = false;
+    if (result == 0 && params.split && feature->ngxNativeCompletion && !feature->retiring.load())
+    {
+        bool head;
+        {
+            std::lock_guard<std::mutex> lock(feature->splitMutex);
+            head = feature->splitCompletion.can_signal(frame);
+        }
+        // The callback is ordered after every output write. It releases this frame on the GPU's
+        // completion boundary and wakes the native condition; the worker retains resources until
+        // that condition completes. Future discarded frames cannot cross an earlier producer.
+        if (head)
+        {
+            nativeQueued = g.cu.timelineQueue(feature->ngxTimeline, frame) == 0;
+            if (!nativeQueued)
+            {
+                feature->ngxNativeCompletion = false;
+                logf("NGX native completion enqueue failed; using CPU output completion from now on");
+            }
+        }
+    }
     if (result == 0)
     {
         const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
         const double cpuStart = timing.enabled ? profile_thread_cpu_ms() : -1.0;
-        result = synchronize_default_stream(*feature, &timing.outputSyncBlocking, &feature->publishWaitEmaUs);
+        if (nativeQueued)
+        {
+            result = g.cu.timelineWait(feature->ngxTimeline);
+            timing.outputSyncNative = result == 0;
+            if (result != 0)
+            {
+                g.cu.timelineCancel(feature->ngxTimeline);
+                feature->ngxNativeCompletion = false;
+                logf("NGX native completion wait failed (%d); using CPU output completion from now on", result);
+            }
+        }
+        if (!nativeQueued || result != 0)
+            result = synchronize_default_stream(*feature, &timing.outputSyncBlocking, &feature->publishWaitEmaUs);
         if (timing.enabled)
         {
             timing.outputSyncWall = profile_ms(syncStart, ProfileClock::now());
@@ -6189,11 +6527,29 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
                 timing.outputSyncCpu = std::max(0.0, cpuEnd - cpuStart);
         }
     }
+    if (result == 0 && !complete_ngx_input_wait(*feature, frame, false))
+    {
+        frame_retired(feature, frame);
+        return; // queued work drained, but watchdog-released input is not a publishable frame
+    }
     if (result == 0 && timing.gpuEventsRecorded)
     {
         float gpuEvalMs = -1.0f;
         if (g.cu.eventElapsedTime(&gpuEvalMs, feature->profileStart, feature->profileEnd) == 0)
             timing.gpuEval = gpuEvalMs;
+        float dlssMs = -1.0f, inputMs = -1.0f;
+        if (timing.inputEventRecorded &&
+            g.cu.eventElapsedTime(&dlssMs, feature->profileInputsReleased, feature->profileEnd) == 0 &&
+            g.cu.eventElapsedTime(&inputMs, feature->profileStart, feature->profileInputsReleased) == 0)
+        {
+            timing.dlssGpu = dlssMs;
+            timing.inputGpuWait = inputMs;
+        }
+        else if (!timing.gpuInputWait && timing.gpuEval >= 0.0)
+        {
+            timing.dlssGpu = timing.gpuEval;
+            timing.inputGpuWait = 0.0;
+        }
     }
     if (result != 0)
     {
@@ -6316,6 +6672,18 @@ static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint
 
 static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t frame);
 
+static bool ngx_gpu_wait_eligible(Feature& feature, const FrameParams& params, uint32_t frame)
+{
+    char directory[MAX_PATH];
+    // The denoiser can mix GPU guides with CPU-transcoded auxiliary guides and alpha readbacks. Keep
+    // that mixed route on the CPU readiness contract; never infer that main-plane VRAM means all guides
+    // are GPU-only. Likewise verification, captures, dilation and host staging must see real input first.
+    return feature.ngxGpuWait.load() && params.gpuInputMarker && params.vram && params.split && !feature.rayReconstruction &&
+           env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0 && env_uint("D4R_SHIM_VRAM_ARRAY_VERIFY", 0) == 0 &&
+           env_uint("D4R_MOTION_DILATION", 0) == 0 && !input_dump_directory(frame, directory) &&
+           (feature.linearInputs || (env_uint("D4R_SHIM_ASYNC_2D", 1) != 0 && g.cu.memcpy2DAsync != nullptr));
+}
+
 static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, FrameParams params, FrameTiming timing)
 {
     InputSlot& slot = feature->inputs[slotIndex];
@@ -6324,19 +6692,102 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         timing.workerWait = profile_ms(timing.workerQueued, start);
     FrameTiming* stages = timing.enabled ? &timing : nullptr;
     const bool overlapped = async_copies() && copy_streams() != nullptr;
+    if (feature->ngxNativeCompletion && g.cu.timelinePrepare(feature->ngxTimeline) != 0)
+    {
+        feature->ngxNativeCompletion = false;
+        logf("NGX native completion still busy; using CPU output completion from now on");
+    }
+    int eventStartResult = -1;
     if (timing.markerDeferred)
     {
         const auto markerStart = ProfileClock::now();
-        if (!wait_for_input_marker(feature, slotIndex, frame))
-            return;
-        if (timing.enabled)
-            timing.markerWait = profile_ms(markerStart, ProfileClock::now());
+        if (ngx_gpu_wait_eligible(*feature, params, frame))
+        {
+            complete_pending_download(); // earlier host staging must not synchronize against our new wait
+            // Mint textures/arrays before blocking the null stream. Lazy allocation can synchronize
+            // internally; it must not be part of the steady-state input-readiness submission window.
+            bool ready = feature->linearInputs ? ensure_linear_inputs(slot, params.hasExposure) : true;
+            if (!feature->linearInputs)
+            {
+                const Plane planes[] = {Plane::Color, Plane::Depth, Plane::Motion, Plane::Exposure};
+                CudaImage* images[] = {&feature->color, &feature->depth, &feature->motion, &feature->exposure};
+                for (int index = 0; index < (params.hasExposure ? 4 : 3) && ready; ++index)
+                    ready = ensure_cuda_image(*images[index], slot.host[index].width, slot.host[index].height,
+                        plane_format(planes[index]), plane_channels(planes[index]), false, index == 0);
+            }
+            ready = ready && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight,
+                                               CUDA_FORMAT_HALF, 4, true, false);
+            if (!ready)
+            {
+                slot.busy = false;
+                frame_retired(feature, frame);
+                return;
+            }
+            if (!feature->ngxWaitEventsWarmed)
+            {
+                if (feature->outputReadyEvent != nullptr)
+                    g.cu.eventRecord(feature->outputReadyEvent, nullptr);
+                if (timing.enabled && feature->profileEventsReady)
+                    g.cu.eventRecord(feature->profileEnd, nullptr);
+                feature->ngxWaitEventsWarmed = true;
+            }
+            eventStartResult = timing.enabled && feature->profileEventsReady
+                                   ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
+            {
+                std::lock_guard<std::mutex> lock(feature->ngxWaitMutex);
+                feature->ngxWaitActive = true;
+                feature->ngxWaitCancelled = false;
+                feature->ngxWaitFrame = frame;
+                feature->ngxWaitSlot = slotIndex;
+                feature->ngxWaitStart = ProfileClock::now();
+            }
+            // Arm before the call: a blocked HIP enqueue/NGX evaluate must never prevent timeout release.
+            const int queued = g.cu.streamWaitValue32Eq(
+                feature->ngxInputSync.device + sizeof(uint32_t) * (1 + slotIndex), frame);
+            if (queued == 0)
+            {
+                timing.gpuInputWait = true;
+                // Profiling only: a timing event behind the wait completes when the game's input word is released,
+                // so it splits gpu_eval into input readiness and DLSS's own work. Recording queues one marker on
+                // the null stream and never waits on the CPU; elapsed times are read after output completion.
+                timing.inputEventRecorded = eventStartResult == 0 && feature->profileInputsReleased != nullptr &&
+                                            g.cu.eventRecord(feature->profileInputsReleased, nullptr) == 0;
+                bool cancelled;
+                {
+                    std::lock_guard<std::mutex> lock(feature->ngxWaitMutex);
+                    cancelled = feature->ngxWaitCancelled;
+                }
+                if (cancelled)
+                {
+                    complete_ngx_input_wait(*feature, frame, true);
+                    slot.busy = false;
+                    frame_retired(feature, frame);
+                    return;
+                }
+            }
+            else
+            {
+                // Release and drain even on rejection: a partially submitted driver operation must
+                // never survive a switch back to CPU polling. Do not hold the ticket lock over HIP.
+                complete_ngx_input_wait(*feature, frame, true);
+                feature->ngxGpuWait.store(false);
+                logf("NGX feature %u: GPU-side input wait unavailable (%d); using CPU marker polling from now on",
+                     feature->handle.Id, queued);
+            }
+        }
+        if (!timing.gpuInputWait)
+        {
+            if (!wait_for_input_marker(feature, slotIndex, frame))
+                return;
+            if (timing.enabled)
+                timing.markerWait = profile_ms(markerStart, ProfileClock::now());
+        }
     }
-    if (params.vram && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
+    if (!timing.gpuInputWait && params.vram && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
         dump_vram_inputs(slot, frame, params, params.hasExposure ? 4 : 3);
     const bool linearInputs = params.vram && feature->linearInputs;
     bool ok = linearInputs ? ensure_linear_inputs(slot, params.hasExposure)
-              : params.vram ? upload_inputs_vram(*feature, slot, params.hasExposure, frame, stages)
+              : params.vram ? upload_inputs_vram(*feature, slot, params.hasExposure, frame, stages, timing.gpuInputWait)
               : overlapped
                   ? upload_inputs_async(*feature, slot, params.hasExposure, frame, stages)
                   : upload_plane(Plane::Color, slot.host[0], feature->color, frame, stages, 0) &&
@@ -6347,7 +6798,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     ok = ok && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight, CUDA_FORMAT_HALF, 4,
                                  true, false);
     const auto dilationStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
-    const CudaObject dilatedMotion = ok ? prepare_dilated_motion(*feature, slot, params) : 0;
+    const CudaObject dilatedMotion = ok && !timing.gpuInputWait ? prepare_dilated_motion(*feature, slot, params) : 0;
     // Ray Reconstruction: the auxiliary surfaces are copied in the same window as the four
     // main planes, so the one synchronize below covers them as well. The lock is taken only
     // around the copies and, later, around the evaluate - never across the synchronize, which
@@ -6363,19 +6814,21 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         }
         if (!auxUploaded)
         {
+            complete_ngx_input_wait(*feature, frame, true);
             slot.busy = false;
             frame_retired(feature, frame);
             return;
         }
     }
     // Device-to-array copies (VRAM interop, staged uploads) return before they
-    // finish, and NGX does not evaluate on the stream they were issued on, so
-    // without this DLSS can sample a mix of this frame's and the previous
+    // finish. Staged copies can use another stream, so without their completion
+    // DLSS can sample a mix of this frame's and the previous
     // frame's colour/depth/motion: invisible when the camera is still, beaded
     // thin geometry in motion. D4R_SHIM_INPUT_SYNC=0 restores the old behaviour.
     static const bool inputSync = env_uint("D4R_SHIM_INPUT_SYNC", 1) != 0;
-    // Linear inputs are already ready; other copies need completion before NGX samples them.
-    if (ok && (dilatedMotion != 0 || auxUploaded || (inputSync && !linearInputs)))
+    // Linear inputs are ready after the marker. The GPU-wait route orders all copies and NGX on
+    // the null stream itself, so its input-sync CPU wait would only put readiness back on the critical path.
+    if (ok && !timing.gpuInputWait && (dilatedMotion != 0 || auxUploaded || (inputSync && !linearInputs)))
     {
         const int syncResult = synchronize_default_stream(*feature);
         if (syncResult != 0)
@@ -6395,6 +6848,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     complete_pending_download();
     if (!ok)
     {
+        complete_ngx_input_wait(*feature, frame, true);
         slot.busy = false;
         frame_retired(feature, frame);
         return;
@@ -6415,6 +6869,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         if (!publish_alpha_output(*feature, slot))
         {
             auxLock.unlock();
+            complete_ngx_input_wait(*feature, frame, true);
             slot.busy = false;
             frame_retired(feature, frame);
             return;
@@ -6450,7 +6905,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         else if (params.vram && params.split && feature->outputs[frame % kOutputSlots].vram.bytes >= bytes)
             target = feature->outputs[frame % kOutputSlots].vram.device;
         if (params.packedOutput)
-            rowBytes |= 1; // the bridge's flag for R10G10B10A2 texels (row pitches are multiples of 8)
+            rowBytes |= params.packedRgba8 ? 2 : 1; // R4: RGBA8, R3: RGB10A2; row pitches are multiples of 8
         else if (!params.vram && overlapped && ensure_linear(feature->outputLinear, feature->outputLinearBytes, bytes))
             target = feature->outputLinear;
         const bool redirect = nativeOutput && target != 0 &&
@@ -6465,8 +6920,14 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         }
         feature->outputRedirected = redirect;
     }
-    const int eventStartResult = timing.enabled && feature->profileEventsReady
-                                     ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
+    if (!timing.gpuInputWait)
+        eventStartResult = timing.enabled && feature->profileEventsReady
+                              ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
+    // GPU completion: with a redirected output the native output kernel is the last writer the game reads, so
+    // the bridge may queue the completion word right behind it (it checks the kernel actually launched).
+    if (params.gpuCompletion && feature->outputRedirected && g.cu.ngxArmCompletion != nullptr)
+        g.cu.ngxArmCompletion(feature->ngxInputSync.device + sizeof(uint32_t) * (kCompletionWord + frame % kOutputSlots),
+                              frame, params.packedRgba8 ? 1 : 0);
     const auto evalStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     // The core dispatches feature 13 to the denoiser it loaded, so this call is the same
     // either way; only the feature id that created it differs.
@@ -6475,13 +6936,16 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
     if (auxLock.owns_lock())
         auxLock.unlock();
-    if (feature->outputRedirected && g.cu.outputKernelNative != nullptr && g.cu.outputKernelNative() != 1)
+    feature->completionFired = g.cu.ngxCompletionFired != nullptr && g.cu.ngxCompletionFired() == 1;
+    if (feature->outputRedirected && ((g.cu.outputKernelNative != nullptr && g.cu.outputKernelNative() != 1) ||
+        (params.packedRgba8 && (g.cu.outputKernelRgba8 == nullptr || g.cu.outputKernelRgba8() != 1))))
     {
         // this frame's output kernel ignored the redirect: publish from the array as usual
         g.cu.setArrayRedirect(feature->output.array, 0, 0);
         feature->outputRedirected = false;
     }
     feature->packedReady = feature->outputRedirected;
+    feature->rgba8Ready = feature->outputRedirected && g.cu.outputKernelRgba8 != nullptr && g.cu.outputKernelRgba8() == 1;
     const auto evalReturned = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
     const int eventEndResult = eventStartResult == 0 ? g.cu.eventRecord(feature->profileEnd, nullptr) : -1;
     const auto syncStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
@@ -6499,6 +6963,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     if (result != NGX_SUCCESS || syncResult != 0)
     {
         logf("frame %u: CUDA_EvaluateFeature -> 0x%08x, sync %d", frame, result, syncResult);
+        complete_ngx_input_wait(*feature, frame, true);
         slot.busy = false;
         frame_retired(feature, frame);
         return;
@@ -6508,6 +6973,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     // alpha would leave the caller believing it was written.
     if (feature->rayReconstruction && !download_alpha_output(*feature, frame, params))
     {
+        complete_ngx_input_wait(*feature, frame, true);
         slot.busy = false;
         frame_retired(feature, frame);
         return;
@@ -6517,6 +6983,11 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         timing.ngxHost = profile_ms(evalStart, evalReturned);
         timing.ctxSync = profile_ms(syncStart, evaluated);
         timing.gpuEval = gpuEvalMs;
+        if (gpuEvalMs >= 0.0f && !timing.gpuInputWait)
+        {
+            timing.dlssGpu = gpuEvalMs;
+            timing.inputGpuWait = 0.0;
+        }
         timing.gpuEventsRecorded = gpuEventsRecorded && params.vram && !eval_sync_enabled();
     }
     if (params.vram)
@@ -6566,17 +7037,21 @@ static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t fram
 {
     InputSlot& slot = feature->inputs[slotIndex];
     const auto start = std::chrono::steady_clock::now();
+    static const bool fixedOverride = GetEnvironmentVariableA("D4R_SHIM_MARKER_POLL_US", nullptr, 0) != 0;
+    static const unsigned fixedPoll = env_uint("D4R_SHIM_MARKER_POLL_US", 200);
+    const double predictedUs = feature->markerWaitEmaUs.load();
+    double lastNotReadyUs = -1.0;
     // A later input marker does not prove this slot's copies were submitted:
     // the game may have discarded this frame's command list. Require its own
     // tag, otherwise stale input data can enter DLSS's temporal history.
     const volatile uint32_t* inputMarker = feature->markerValue + 1 + slotIndex;
-    while (*inputMarker != frame)
+    while (*inputMarker != frame || feature->retiring.load())
     {
         std::atomic_thread_fence(std::memory_order_acquire);
         const bool skipped = static_cast<int32_t>(*feature->markerValue - frame) > 0;
         // The GPU may have filled our slot between the loop condition and
         // the aggregate-marker read. Recheck before deciding it was skipped.
-        if (*inputMarker == frame)
+        if (*inputMarker == frame && !feature->retiring.load())
             break;
         if (feature->retiring.load() || skipped || std::chrono::steady_clock::now() - start > std::chrono::seconds(5))
         {
@@ -6587,12 +7062,18 @@ static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t fram
             frame_retired(feature, frame);
             return false;
         }
-        // D4R_SHIM_MARKER_POLL_US: poll interval (0 = yield); detection latency is on the critical path
-        static const unsigned markerPollUs = env_uint("D4R_SHIM_MARKER_POLL_US", 200);
-        if (markerPollUs == 0)
-            std::this_thread::yield();
-        else
-            d4r_sleep_us(markerPollUs);
+        lastNotReadyUs = std::chrono::duration<double, std::micro>(ProfileClock::now() - start).count();
+        // An explicit N retains fixed pacing (0 yields). Otherwise learn readiness per feature, sleep
+        // in <=200 us chunks, yield near prediction, and back off when late, as the output wait does.
+        d4r_sleep_us(fixedOverride ? fixedPoll
+                                  : d4r_marker_poll_delay_us(predictedUs, lastNotReadyUs));
+    }
+    if (!fixedOverride)
+    {
+        const double waitedUs = std::chrono::duration<double, std::micro>(ProfileClock::now() - start).count();
+        // Estimate readiness between the last not-ready read and this one, not the end of our sleep.
+        const double sample = std::min(lastNotReadyUs >= 0.0 ? 0.5 * (lastNotReadyUs + waitedUs) : waitedUs, 20000.0);
+        feature->markerWaitEmaUs.store(predictedUs == 0.0 ? sample : 0.8 * predictedUs + 0.2 * sample);
     }
     return true;
 }
@@ -6606,7 +7087,8 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
     // uploads and diagnostic readbacks; waiting only before NGX would copy stale data into its arrays.
     static const bool deferMarker = env_uint("D4R_SHIM_DEFER_MARKER", 1) != 0 &&
                                     env_uint("D4R_MOTION_DILATION", 0) == 0;
-    if (params.vram && deferMarker && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
+    if (params.vram && (deferMarker || ngx_gpu_wait_eligible(*feature, params, frame)) &&
+        env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
     {
         timing.markerDeferred = true;
         if (timing.enabled)
@@ -6705,7 +7187,8 @@ static void finish_publish(Feature* feature, int target, uint32_t frame, const F
     const uint32_t completed = ++feature->completedFrames;
     frame_retired(feature, frame);
     const auto finished = ProfileClock::now();
-    if (timing.enabled)
+    static const bool profileLog = env_uint("D4R_PROFILE_LOG", 1) != 0; // 0: time everything, write no lines
+    if (timing.enabled && profileLog)
     {
         static thread_local ProfileClock::time_point lastFinished;
         const double interval = lastFinished.time_since_epoch().count() != 0
@@ -6720,11 +7203,12 @@ static void finish_publish(Feature* feature, int target, uint32_t frame, const F
              "d3d_input_record=%.3f d3d_output_record=%.3f game_call=%.3f "
              "color_convert=%.3f depth_convert=%.3f motion_convert=%.3f exposure_convert=%.3f "
              "color_h2d=%.3f depth_h2d=%.3f motion_h2d=%.3f exposure_h2d=%.3f "
-             "ngx_host=%.3f ctx_sync=%.3f gpu_eval=%.3f output_sync_wall=%.3f "
+             "ngx_host=%.3f ctx_sync=%.3f gpu_eval=%.3f gpu_eval_scope=%s input_wait=%s output_sync_wall=%.3f "
              "output_sync_cpu=%.3f output_sync_blocking=%d output_sync_method=%s d2h=%.3f output_convert=%.3f "
              "h2d_total=%.3f d2h_issue=%.3f d2h_wait=%.3f "
              "prep=%.3f worker_wait=%.3f worker=%.3f finish_wait=%.3f finish=%.3f pipeline=%.3f "
-             "throughput_interval=%.3f presented=%u age=%d motion_dilation=%u motion_dilation_wall=%.3f",
+             "throughput_interval=%.3f presented=%u age=%d motion_dilation=%u motion_dilation_wall=%.3f "
+             "dlss_gpu=%.3f input_gpu_wait=%.3f vk_input=%.3f vk_dlss_wait=%.3f vk_output=%.3f vk_total=%.3f",
              frame, params.renderWidth, params.renderHeight, feature->outWidth, feature->outHeight,
              slot.host[0].width, slot.host[0].height, slot.host[1].width, slot.host[1].height,
              slot.host[2].width, slot.host[2].height, params.hasExposure, feature->quality, feature->flags,
@@ -6734,14 +7218,18 @@ static void finish_publish(Feature* feature, int target, uint32_t frame, const F
              timing.inputRecord, timing.outputRecord, timing.gameCall,
              timing.convert[0], timing.convert[1], timing.convert[2], timing.convert[3],
              timing.upload[0], timing.upload[1], timing.upload[2], timing.upload[3],
-             timing.ngxHost, timing.ctxSync, timing.gpuEval, timing.outputSyncWall, timing.outputSyncCpu,
-             timing.outputSyncBlocking, timing.outputSyncBlocking ? "event_query_sleep" : "context",
+             timing.ngxHost, timing.ctxSync, timing.gpuEval,
+             timing.gpuInputWait ? "launch_to_completion" : "evaluation", timing.gpuInputWait ? "gpu" : "cpu",
+             timing.outputSyncWall, timing.outputSyncCpu,
+             timing.outputSyncBlocking, timing.outputSyncNative ? "native_callback_wait" :
+                                        timing.outputSyncBlocking ? "event_query_sleep" : "context",
              timing.download, timing.outputConvert,
              timing.h2dTotal, timing.d2hIssue, timing.d2hWait,
              timing.prep, timing.workerWait, timing.worker, timing.finishWait, profile_ms(start, finished),
              profile_ms(timing.prepStart, finished), interval,
              timing.presentedFrame, timing.presentedFrame != 0 ? static_cast<int>(frame - timing.presentedFrame) : -1,
-             params.motionDilation, timing.motionDilationWall);
+             params.motionDilation, timing.motionDilationWall, timing.dlssGpu, timing.inputGpuWait,
+             timing.vkInput, timing.vkDlssWait, timing.vkOutput, timing.vkTotal);
     }
     if (completed <= 5 || completed % 120 == 0)
         logf("frame %u done (slot %d)", frame, target);
@@ -7206,12 +7694,17 @@ static NgxResult create_cuda_feature(Feature& feature)
             else
                 logf("output event query/sleep wait enabled for this feature");
         }
-        if (created == NGX_SUCCESS && profile_enabled() && g.cu.eventCreate != nullptr &&
+        // D4R_PROFILE_GPU_EVENTS=0 keeps D4R_PROFILE's CPU timings without the CUDA timing events
+        if (created == NGX_SUCCESS && profile_enabled() && env_uint("D4R_PROFILE_GPU_EVENTS", 1) != 0 &&
+            g.cu.eventCreate != nullptr &&
             g.cu.eventRecord != nullptr && g.cu.eventElapsedTime != nullptr && g.cu.eventDestroy != nullptr)
         {
             const int startResult = g.cu.eventCreate(&feature.profileStart, 0);
             const int endResult = startResult == 0 ? g.cu.eventCreate(&feature.profileEnd, 0) : -1;
             feature.profileEventsReady = startResult == 0 && endResult == 0;
+            // optional: without it GPU-input-wait frames report dlss_gpu=-1 and keep gpu_eval
+            if (feature.profileEventsReady && g.cu.eventCreate(&feature.profileInputsReleased, 0) != 0)
+                feature.profileInputsReleased = nullptr;
             if (!feature.profileEventsReady)
             {
                 logf("D4R_PROFILE: CUDA event creation failed (%d, %d)", startResult, endResult);
@@ -7621,6 +8114,8 @@ static VkResult signal_split_semaphore(Feature& feature, uint64_t value)
 {
     if (feature.engineNetTimeline)
         return static_cast<VkResult>(g_engineNet.signalTimeline(feature.engineNet, value));
+    if (feature.ngxTimeline != nullptr)
+        return static_cast<VkResult>(g.cu.timelineSignal(feature.ngxTimeline, value));
     VkSemaphoreSignalInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
     info.semaphore = feature.splitSemaphore;
     info.value = value;
@@ -7723,6 +8218,78 @@ static bool create_engine_shared_buffer(VramBuffer& target, size_t bytes, bool h
     buffer.bytes = bytes;
     target = buffer;
     return true;
+}
+
+static bool initialize_ngx_gpu_wait(Feature& feature)
+{
+    if (env_uint("D4R_SHIM_GPU_INPUT_WAIT", 0) == 0)
+        return false;
+    // Age-zero output only; keep queue depth and the existing split-frame contract unchanged.
+    if (!feature.split || feature.rayReconstruction || g_vk.fill == nullptr ||
+        g.cu.streamWaitValue32Eq == nullptr ||
+        !create_engine_shared_buffer(feature.ngxInputSync, 256, true))
+    {
+        logf("NGX feature %u: GPU-side input wait unavailable (needs split VRAM, Super Sampling, coherent export "
+             "and the matching bridge); using CPU marker polling", feature.handle.Id);
+        return false;
+    }
+    static std::once_flag watchdog;
+    std::call_once(watchdog, [] { std::thread(ngx_input_watchdog).detach(); });
+    feature.ngxGpuWait.store(true);
+    // D4R_SHIM_GPU_COMPLETION=1 (default 0): the game's queue waits for DLSS on the GPU, polling the frame's word
+    // in the same coherent buffer, instead of a split list released by a CPU timeline signal (one host round trip,
+    // ~0.1 ms, per frame). The pool is never freed: game command lists still reference the set after retirement.
+    if (env_uint("D4R_SHIM_GPU_COMPLETION", 0) != 0)
+    {
+        if (feature.completionSet.set == VK_NULL_HANDLE && g_waitReady && g.cu.ngxWriteValue32 != nullptr)
+            feature.gpuCompletion = g_waitStage.wait_set(feature.completionSet, feature.ngxInputSync.buffer, 256);
+        else
+            feature.gpuCompletion = feature.completionSet.set != VK_NULL_HANDLE && g.cu.ngxWriteValue32 != nullptr;
+        for (uint32_t index = 0; index < kOutputSlots; ++index)
+            static_cast<volatile uint32_t*>(feature.ngxInputSync.mapped)[kCompletionWord + index] = 0;
+        logf("NGX feature %u: GPU-side completion %s", feature.handle.Id,
+             feature.gpuCompletion ? "enabled (the game's queue polls DLSS's completion word)"
+                                   : "unavailable (wait shader or bridge export missing); using the split timeline");
+    }
+    return true;
+}
+
+// The game's queue holds here until DLSS wrote this frame's completion word (or the bounded poll gives up).
+static bool record_gpu_completion_wait(Feature& feature, ID3D12GraphicsCommandList* list, uint32_t frame)
+{
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &command)))
+        return false;
+    g_waitStage.record_wait(command, feature.completionSet, kCompletionWord + frame % kOutputSlots, frame,
+                            kCompletionPollLimit);
+    // Everything after the wait, including the output copy, sees DLSS's writes.
+    const VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    g_vk.barrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after,
+                 0, nullptr, 0, nullptr);
+    return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+}
+
+static bool record_ngx_input_ready(Feature& feature, ID3D12GraphicsCommandList* list, int slotIndex, uint32_t frame)
+{
+    if (!feature.ngxGpuWait.load())
+        return false;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &command)))
+        return false;
+    // All input copies/conversions precede this release marker. The imported inputs and the shared word
+    // use the same memory barrier protocol as the engine's GPU handoff. Keep this before the list split:
+    // placing the fill in its second half would deadlock that half against its own NGX input wait.
+    const VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                    VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+    g_vk.barrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before,
+                 0, nullptr, 0, nullptr);
+    g_vk.fill(command, feature.ngxInputSync.buffer, sizeof(uint32_t) * (1 + slotIndex), sizeof(uint32_t), frame);
+    const VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    g_vk.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after,
+                 0, nullptr, 0, nullptr);
+    return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
 }
 
 // Only once no command list uses the engine and no network launch is pending.
@@ -8839,6 +9406,74 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
     return true;
 }
 
+static bool profile_timestamps_ready(Feature& feature)
+{
+    if (feature.timestampHeap != nullptr)
+        return true;
+    if (feature.timestampFailed || g.device == nullptr)
+        return false;
+    feature.timestampFailed = true;
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* queue = nullptr;
+    UINT64 frequency = 0;
+    if (SUCCEEDED(g.device->CreateCommandQueue(&queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue))))
+    {
+        queue->GetTimestampFrequency(&frequency);
+        queue->Release();
+    }
+    D3D12_QUERY_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heapDesc.Count = 4 * kOutputSlots;
+    uint8_t* mapped = nullptr;
+    if (frequency == 0 ||
+        FAILED(g.device->CreateQueryHeap(&heapDesc, __uuidof(ID3D12QueryHeap), reinterpret_cast<void**>(&feature.timestampHeap))))
+    {
+        logf("D4R_PROFILE: game-queue timestamps unavailable (frequency %llu)", static_cast<unsigned long long>(frequency));
+        feature.timestampHeap = nullptr;
+        return false;
+    }
+    if (!create_buffer(D3D12_HEAP_TYPE_READBACK, 8 * 4 * kOutputSlots, &feature.timestampReadback, &mapped))
+    {
+        feature.timestampHeap->Release();
+        feature.timestampHeap = nullptr;
+        return false;
+    }
+    feature.timestampValues = reinterpret_cast<volatile uint64_t*>(mapped);
+    for (int index = 0; index < 4 * kOutputSlots; ++index)
+        feature.timestampValues[index] = 0;
+    feature.timestampTicksPerMs = static_cast<double>(frequency) / 1000.0;
+    feature.timestampFailed = false;
+    logf("D4R_PROFILE: game-queue timestamps enabled (%llu Hz)", static_cast<unsigned long long>(frequency));
+    return true;
+}
+
+static void profile_timestamp(Feature& feature, ID3D12GraphicsCommandList* list, uint32_t frame, int point)
+{
+    const UINT base = 4 * (frame % kOutputSlots);
+    list->EndQuery(feature.timestampHeap, D3D12_QUERY_TYPE_TIMESTAMP, base + point);
+    if (point == 3)
+        list->ResolveQueryData(feature.timestampHeap, D3D12_QUERY_TYPE_TIMESTAMP, base, 4, feature.timestampReadback,
+                               8ull * base);
+}
+
+// The evaluation kOutputSlots frames earlier, if its resolve has landed; clears the slot for this frame.
+static void read_profile_timestamps(Feature& feature, uint32_t frame, FrameTiming& timing)
+{
+    volatile uint64_t* t = feature.timestampValues + 4 * (frame % kOutputSlots);
+    const uint64_t t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3];
+    if (t0 != 0 && t0 <= t1 && t1 <= t2 && t2 <= t3)
+    {
+        const double perMs = feature.timestampTicksPerMs;
+        timing.vkInput = (t1 - t0) / perMs;
+        timing.vkDlssWait = (t2 - t1) / perMs;
+        timing.vkOutput = (t3 - t2) / perMs;
+        timing.vkTotal = (t3 - t0) / perMs;
+    }
+    for (int index = 0; index < 4; ++index)
+        t[index] = 0;
+}
+
 static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters)
 {
     std::lock_guard<std::mutex> apiLock(g_featureApiMutex);
@@ -9060,9 +9695,23 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                                 g.cu.registerLinearTexture != nullptr;
         if (feature->linearInputs)
             logf("linear inputs: NGX samples the interop buffers directly");
+        const bool gpuWait = p.vram && initialize_ngx_gpu_wait(*feature);
+        if (feature->split && !feature->rayReconstruction && !feature->engineNetTimeline &&
+            env_uint("D4R_SHIM_NATIVE_COMPLETION", 0) != 0 && g.cu.timelineCreate != nullptr &&
+            g.cu.timelinePrepare != nullptr && g.cu.timelineCancel != nullptr && g.cu.timelineQueue != nullptr &&
+            g.cu.timelineSignal != nullptr && g.cu.timelineDestroy != nullptr && g.cu.timelineWait != nullptr)
+        {
+            feature->ngxNativeCompletion = g.worker.call([&] {
+                return g.cu.timelineCreate(g_vk.device, reinterpret_cast<uint64_t>(feature->splitSemaphore),
+                                          &feature->ngxTimeline);
+            }) == 0;
+            logf("NGX output completion for this feature: %s", feature->ngxNativeCompletion
+                ? "native HIP callback signals the split timeline" : "CPU event polling (native callback unavailable)");
+        }
         logf("VRAM interop %s for this feature%s%s", p.vram ? "on" : "off",
              feature->split ? ", presenting each frame's own result (split frames)" : "",
-             p.vram ? ", waiting for input readiness with CPU sleeps" : "");
+             gpuWait ? ", GPU-side input wait on NGX's null stream (CPU waits for diagnostics/host input reads)" :
+             p.vram ? ", waiting for input readiness with adaptive CPU polling (or explicit MarkerPollUs)" : "");
     }
     else if (feature->vram && !p.vram)
     {
@@ -9096,11 +9745,17 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                          outputDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && vramOutput.width % 2 == 0 &&
                          env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_PACKED", 0) != 0 &&
                          feature->packedReady.load();
+        p.packedRgba8 = feature->split && feature->outputDirectAllowed && feature->preset == 11 &&
+                       outputDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && vramOutput.width % 2 == 0 &&
+                       env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0 && env_uint("D4R_SHIM_OUTPUT_RGBA8", 0) != 0 &&
+                       feature->rgba8Ready.load();
+        p.packedOutput |= p.packedRgba8;
         static bool packedLogged = false;
         if (p.packedOutput && !packedLogged)
         {
             packedLogged = true;
-            logf("frame %u: packed output (the output kernel stores R10G10B10A2 texels; no conversion blit)", frame);
+            logf("frame %u: packed output (the output kernel stores %s texels; no conversion blit)", frame,
+                 p.packedRgba8 ? "RGBA8" : "R10G10B10A2");
         }
         InPlaceTexture outputTexture;
         const size_t outputTexelBytes = p.packedOutput ? 4 : 8;
@@ -9185,12 +9840,21 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     const auto depthState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_DEPTH_STATE", 0x40));
     const auto outputState = static_cast<D3D12_RESOURCE_STATES>(env_uint("D4R_SHIM_OUTPUT_STATE", 0x8));
     const auto inputRecordStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
+    static const bool timestampsWanted = env_uint("D4R_PROFILE_TIMESTAMPS", 1) != 0;
+    const bool timestamps = timing.enabled && timestampsWanted && p.vram && feature->split &&
+                            profile_timestamps_ready(*feature);
+    if (timestamps)
+    {
+        read_profile_timestamps(*feature, frame, timing);
+        profile_timestamp(*feature, list, frame, 0);
+    }
     if (p.vram)
     {
         const D3D12_RESOURCE_STATES states[4] = {inputState, depthState, inputState, inputState};
         for (int index = 0; index < inputCount; ++index)
             transition(list, inputs[index], states[index], D3D12_RESOURCE_STATE_COPY_SOURCE);
-        const bool recorded = record_vram_inputs(*feature, list, slot, vramInputs, inputCount);
+        const bool fused = ensure_fused_color(*feature, slotIndex, color, vramInputs[0]);
+        const bool recorded = record_vram_inputs(*feature, list, slot, vramInputs, inputCount, fused);
         for (int index = 0; index < inputCount; ++index)
             transition(list, inputs[index], D3D12_RESOURCE_STATE_COPY_SOURCE, states[index]);
         if (!recorded)
@@ -9253,6 +9917,20 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     list2->WriteBufferImmediate(2, markers, modes);
     list2->Release();
 
+    if (feature->ngxGpuWait.load())
+    {
+        p.gpuInputMarker = record_ngx_input_ready(*feature, list, slotIndex, frame);
+        if (!p.gpuInputMarker)
+        {
+            feature->ngxGpuWait.store(false);
+            logf("NGX feature %u: recording the GPU input marker failed; using CPU marker polling from now on",
+                 feature->handle.Id);
+        }
+    }
+
+    if (timestamps)
+        profile_timestamp(*feature, list, frame, 1);
+
     // Present the most recent finished DLSS result.
     int latest;
     uint32_t colorFrame = 0; // the frame whose colour is presented below, 0 if none
@@ -9268,7 +9946,9 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         }
     }
     const auto outputRecordStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
-    if (p.vram && feature->split)
+    if (p.vram && feature->split && p.gpuInputMarker && feature->gpuCompletion)
+        p.split = p.gpuCompletion = record_gpu_completion_wait(*feature, list, frame);
+    if (p.vram && feature->split && !p.gpuCompletion)
         p.split = SUCCEEDED(g_vk.split->SplitCommandListForExternalWait(
             list, reinterpret_cast<UINT64>(feature->splitSemaphore), frame));
     if (!p.split)
@@ -9276,6 +9956,8 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         p.outputInPlace = 0; // only a split frame waits for the result before the game reads its texture
         p.packedOutput = false;
     }
+    if (p.split && timestamps)
+        profile_timestamp(*feature, list, frame, 2);
     if (p.split)
     {
         // Runs in the second half of the list, once frame's result is in place. Split frames
@@ -9323,6 +10005,8 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
     if (feature->rayReconstruction &&
         !record_alpha_copyback(*feature, list, slot, outputState, colorFrame, p.split))
         return NGX_FAIL_PLATFORM_ERROR;
+    if (p.split && timestamps)
+        profile_timestamp(*feature, list, frame, 3);
     if (timing.enabled)
     {
         timing.outputRecord = profile_ms(outputRecordStart, ProfileClock::now());
@@ -9361,6 +10045,10 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList
 
 static void release_feature(Feature* feature)
 {
+    {
+        std::lock_guard<std::mutex> lock(feature->ngxWaitMutex);
+        release_ngx_input_wait_locked(*feature, "the feature is being released", false);
+    }
     // A queued GPU-side input wait for a frame that never ran would stall the network's stream: release it
     // before the drain below waits for the worker (the worker also releases waits it sees stuck).
     if (feature->engineNet != nullptr)
@@ -9415,6 +10103,12 @@ static void release_feature(Feature* feature)
             g.cu.eventDestroy(feature->profileStart);
         if (feature->profileEnd != nullptr)
             g.cu.eventDestroy(feature->profileEnd);
+        if (feature->profileInputsReleased != nullptr)
+            g.cu.eventDestroy(feature->profileInputsReleased);
+        if (feature->timestampHeap != nullptr)
+            feature->timestampHeap->Release();
+        if (feature->timestampReadback != nullptr)
+            feature->timestampReadback->Release();
         if (feature->outputReadyEvent != nullptr)
             g.cu.eventDestroy(feature->outputReadyEvent);
         if (feature->scratch != 0)
@@ -9472,8 +10166,12 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle)
     {
         std::lock_guard<std::mutex> lock(g_featuresMutex);
         for (Feature* candidate : g_features)
-            if (&candidate->handle == handle && !candidate->nativeVulkan && !candidate->retiring.exchange(true))
+            if (&candidate->handle == handle && !candidate->nativeVulkan)
             {
+                // The API mutex serializes releases and release_feature removes the registry entry. An
+                // internal drain failure may already have marked this feature retiring; it still needs
+                // the caller's normal release to clean up, rather than becoming an unreleasable handle.
+                candidate->retiring.store(true);
                 feature = candidate;
                 break;
             }
@@ -9493,6 +10191,7 @@ static void finish_shutdown()
         return;
     if (g_vk.ready)
         free_vram_pool();
+    if (g_fusedColorReady) { g_fusedColorStage.destroy(); g_fusedColorReady = false; }
     if (g.ngxInitialized)
     {
         drain_pipeline();

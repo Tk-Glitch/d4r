@@ -30,8 +30,10 @@ struct Feature {
     int splitSemaphore = 1;
     bool engineNetTimeline = false; // the Vulkan timeline of this test, not the native network's
     int engineNet = 0;
+    void* ngxTimeline = nullptr;
 };
 static struct { int (*signalTimeline)(int, uint64_t) = nullptr; } g_engineNet;
+static struct { struct { int (*timelineSignal)(void*, uint64_t) = nullptr; } cu; } g;
 static uint64_t gpuTimeline = 0;
 static bool failSignal = false;
 static int signal(int, const VkSemaphoreSignalInfo* info) {

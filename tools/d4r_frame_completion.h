@@ -11,6 +11,11 @@ class D4rFrameCompletion
 public:
     void admit(uint32_t frame) { pending_.push_back({frame, false}); }
 
+    // A native completion callback can release this value without crossing an unfinished producer
+    // only when it is the first admitted frame still outstanding. Retirement itself stays on the
+    // worker, which also folds any later discarded frames into the completed prefix.
+    bool can_signal(uint32_t frame) const { return !pending_.empty() && pending_.front().frame == frame; }
+
     uint64_t retire(uint32_t frame)
     {
         for (auto& pending : pending_)

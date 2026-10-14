@@ -35,10 +35,13 @@ class ShimConfigTests(unittest.TestCase):
             ini = Path(temporary) / 'd4r.ini'
             env = {key: value for key, value in os.environ.items() if not key.startswith('D4R_')}
             cmd = ['python3', str(ROOT / 'scripts/d4r_config.py'), '--config', str(ini)]
-            for value, expected in ((None, '200'), ('auto', '200'), ('200', '200'), ('0', '0'), ('75', '75')):
+            for value, expected in ((None, None), ('auto', None), ('200', '200'), ('0', '0'), ('75', '75')):
                 ini.write_text('[Interop]\n' + (f'MarkerPollUs = {value}\n' if value is not None else ''))
                 result = subprocess.run(cmd, env=env, text=True, capture_output=True, check=True)
-                self.assertIn(f'export D4R_SHIM_MARKER_POLL_US={expected}\n', result.stdout)
+                if expected is None:
+                    self.assertNotIn('export D4R_SHIM_MARKER_POLL_US=', result.stdout)
+                else:
+                    self.assertIn(f'export D4R_SHIM_MARKER_POLL_US={expected}\n', result.stdout)
             # An explicit environment variable keeps its existing precedence.
             result = subprocess.run(cmd, env=dict(env, D4R_SHIM_MARKER_POLL_US='35'),
                                     text=True, capture_output=True, check=True)

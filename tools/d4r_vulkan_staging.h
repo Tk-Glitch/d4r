@@ -16,6 +16,10 @@ struct D4rVkStaging {
     VkDescriptorSetLayout readSet = VK_NULL_HANDLE, writeSet = VK_NULL_HANDLE;
     VkPipelineLayout readLayout = VK_NULL_HANDLE, writeLayout = VK_NULL_HANDLE;
     VkPipeline readPipeline = VK_NULL_HANDLE;
+    // D4R_SHIM_GPU_COMPLETION: one storage buffer of words, push constants {index, value, limit}
+    VkDescriptorSetLayout waitSet = VK_NULL_HANDLE;
+    VkPipelineLayout waitLayout = VK_NULL_HANDLE;
+    VkPipeline waitPipeline = VK_NULL_HANDLE;
     struct OutputPipeline { VkFormat format; VkPipeline pipeline; } outputs[5] = {};
     PFN_vkCreateSampler createSampler = nullptr;
     PFN_vkDestroySampler destroySampler = nullptr;
@@ -81,13 +85,51 @@ struct D4rVkStaging {
             set.bindingCount = 2; set.pBindings = bindings;
             auto& setLayout = output ? writeSet : readSet;
             if (createSetLayout(d, &set, nullptr, &setLayout) != VK_SUCCESS) return false;
-            VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, output ? 8u : 12u};
+            VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, output ? 8u : 16u};
             VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             layout.setLayoutCount = 1; layout.pSetLayouts = &setLayout;
             layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &range;
             if (createLayout(d, &layout, nullptr, output ? &writeLayout : &readLayout) != VK_SUCCESS) return false;
         }
         return pipeline(d4r_vk_read, sizeof(d4r_vk_read), readLayout, readPipeline);
+    }
+    // Created on first use; false leaves GPU completion off.
+    bool wait_ready() {
+        if (waitPipeline) return true;
+        VkDescriptorSetLayoutBinding binding = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo set = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        set.bindingCount = 1; set.pBindings = &binding;
+        if (!waitSet && createSetLayout(device, &set, nullptr, &waitSet) != VK_SUCCESS) return false;
+        VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+        VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount = 1; layout.pSetLayouts = &waitSet;
+        layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &range;
+        if (!waitLayout && createLayout(device, &layout, nullptr, &waitLayout) != VK_SUCCESS) return false;
+        return pipeline(d4r_vk_wait, sizeof(d4r_vk_wait), waitLayout, waitPipeline);
+    }
+    bool wait_set(D4rVkStagingSet& result, VkBuffer buffer, VkDeviceSize bytes) {
+        if (!wait_ready()) return false;
+        VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo pool = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool.maxSets = 1; pool.poolSizeCount = 1; pool.pPoolSizes = &size;
+        if (!result.pool && createPool(device, &pool, nullptr, &result.pool) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo alloc = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = result.pool; alloc.descriptorSetCount = 1; alloc.pSetLayouts = &waitSet;
+        if (!result.set && allocateSets(device, &alloc, &result.set) != VK_SUCCESS) return false;
+        VkDescriptorBufferInfo storage = {buffer, 0, bytes};
+        VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = result.set; write.dstBinding = 0; write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; write.pBufferInfo = &storage;
+        updateSets(device, 1, &write, 0, nullptr);
+        result.pipeline = waitPipeline;
+        return true;
+    }
+    void record_wait(VkCommandBuffer cmd, const D4rVkStagingSet& set, uint32_t index, uint32_t value, uint32_t limit) {
+        bindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, waitPipeline);
+        bindSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, waitLayout, 0, 1, &set.set, 0, nullptr);
+        const uint32_t constants[] = {index, value, limit};
+        push(cmd, waitLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, constants);
+        dispatch(cmd, 1, 1, 1);
     }
     VkPipeline output_pipeline(VkFormat format) {
         for (auto& item : outputs) if (item.pipeline && item.format == format) return item.pipeline;
@@ -135,12 +177,12 @@ struct D4rVkStaging {
         updateSets(device, 2, writes, 0, nullptr);
         return true;
     }
-    void record(VkCommandBuffer cmd, const D4rVkStagingSet& set, uint32_t width, uint32_t height, uint32_t inputMode = 0) {
+    void record(VkCommandBuffer cmd, const D4rVkStagingSet& set, uint32_t width, uint32_t height, uint32_t inputMode = 0, uint32_t stride = 0) {
         const auto layout = set.output ? writeLayout : readLayout;
         bindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, set.pipeline);
         bindSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set.set, 0, nullptr);
-        const uint32_t dimensions[] = {width, height, inputMode};
-        push(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, set.output ? 8 : 12, dimensions);
+        const uint32_t dimensions[] = {width, height, inputMode, stride ? stride : width};
+        push(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, set.output ? 8 : 16, dimensions);
         dispatch(cmd, (width+7)/8, (height+7)/8, 1);
     }
     void free(D4rVkStagingSet& set) {
@@ -149,6 +191,9 @@ struct D4rVkStaging {
     }
     void destroy() {
         if (readPipeline) destroyPipeline(device, readPipeline, nullptr);
+        if (waitPipeline) destroyPipeline(device, waitPipeline, nullptr);
+        if (waitLayout) destroyLayout(device, waitLayout, nullptr);
+        if (waitSet) destroySetLayout(device, waitSet, nullptr);
         for (auto& item : outputs) if (item.pipeline) destroyPipeline(device, item.pipeline, nullptr);
         if (readLayout) destroyLayout(device, readLayout, nullptr);
         if (writeLayout) destroyLayout(device, writeLayout, nullptr);

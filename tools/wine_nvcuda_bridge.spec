@@ -104,10 +104,24 @@
 @ stdcall d4rSetShutdownHook(ptr) d4rSetShutdownHook
 @ stdcall d4rEventSynchronize(ptr) d4rEventSynchronize
 @ stdcall d4rStreamWaitValue32(int64 long) d4rStreamWaitValue32
+@ stdcall d4rStreamWaitValue32Eq(int64 long) d4rStreamWaitValue32Eq
+@ stdcall d4rNgxStreamPriority(ptr) d4rNgxStreamPriority
+@ stdcall d4rNgxWriteValue32(int64 long) d4rNgxWriteValue32
+@ stdcall d4rNgxArmCompletion(int64 long long) d4rNgxArmCompletion
+@ stdcall d4rNgxCompletionFired() d4rNgxCompletionFired
+@ stdcall d4rThreadCpuTimeMs() d4rThreadCpuTimeMs
 @ stdcall d4rWriteValue32(int64 long) d4rWriteValue32
 @ stdcall d4rSetArrayRedirect(ptr int64 long) d4rSetArrayRedirect
 @ stdcall d4rRegisterLinearTexture(int64 int64 int64 long long) d4rRegisterLinearTexture
 @ stdcall d4rSetEnv(str str long) d4rSetEnv
 @ stdcall d4rLoadError() d4rLoadError
 @ stdcall d4rOutputKernelNative() d4rOutputKernelNative
+@ stdcall d4rOutputKernelRgba8() d4rOutputKernelRgba8
+@ stdcall d4rNgxTimelineCreate(ptr int64 ptr) d4rNgxTimelineCreate
+@ stdcall d4rNgxTimelinePrepare(ptr) d4rNgxTimelinePrepare
+@ stdcall d4rNgxTimelineCancel(ptr) d4rNgxTimelineCancel
+@ stdcall d4rNgxTimelineQueue(ptr int64) d4rNgxTimelineQueue
+@ stdcall d4rNgxTimelineSignal(ptr int64) d4rNgxTimelineSignal
+@ stdcall d4rNgxTimelineDestroy(ptr) d4rNgxTimelineDestroy
+@ stdcall d4rNgxTimelineWait(ptr) d4rNgxTimelineWait
 @ stdcall d4rDilateMotionVectors(ptr) d4rDilateMotionVectors

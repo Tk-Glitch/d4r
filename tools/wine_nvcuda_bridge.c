@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include "d4r_native_selection.h"
 #include "d4r_motion_dilation.h"
 #ifdef D4R_MOTION_KERNELS
@@ -366,11 +367,41 @@ typedef struct
     char name[128];
     uint64_t hash;
     int linked;
+    int rgba8;
 } NativeKernel;
 
 static NativeKernel* native_kernels;
 static size_t native_kernel_count;
 static char native_source[1024];
+
+/* Packed stores are a code-object capability, not a property of the kernel's name. A legacy native
+   kernel ignores the R4 redirect tag. The sidecar must therefore name the exact bytes installed
+   alongside the PTX compatibility manifest; the per-process cache retains those same bytes. */
+static int native_rgba8_verified(const char* directory, const char* name)
+{
+    char path[1400], row[256], entry[128];
+    unsigned long long expected = 0;
+    snprintf(path, sizeof(path), "%s/d4r-rgba8.txt", directory);
+    FILE* manifest = fopen(path, "r");
+    if (manifest == NULL) return 0;
+    int found = 0;
+    while (fgets(row, sizeof(row), manifest) != NULL)
+        if (sscanf(row, "%127s %llx", entry, &expected) == 2 && strcmp(entry, name) == 0)
+        { found = 1; break; }
+    fclose(manifest);
+    if (!found) return 0;
+    snprintf(path, sizeof(path), "%s/%s.hsaco", directory, name);
+    FILE* object = fopen(path, "rb");
+    if (object == NULL) return 0;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    unsigned char bytes[4096];
+    size_t count;
+    while ((count = fread(bytes, 1, sizeof(bytes), object)) != 0)
+        for (size_t i = 0; i < count; ++i) hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+    const int valid = !ferror(object) && hash == (uint64_t)expected;
+    fclose(object);
+    return valid;
+}
 static char native_served[1024];
 static pthread_mutex_t native_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -506,6 +537,7 @@ static void prepare_native_kernels(const char* cache_home)
         snprintf(kernel->name, sizeof(kernel->name), "%s", name);
         kernel->hash = hash;
         kernel->linked = 0;
+        kernel->rgba8 = native_rgba8_verified(source, name);
     }
     fclose(manifest);
     if (!d4r_native_swin_encoders_enabled())
@@ -733,9 +765,22 @@ static struct
 {
     CUfunction function;
     int native;
+    int rgba8;
 } output_kernels[OUTPUT_KERNEL_CAPACITY]; /* the latest lookups, newest last */
 static pthread_mutex_t output_kernel_lock = PTHREAD_MUTEX_INITIALIZER;
 static int last_output_native = -1;
+static int last_output_rgba8;
+/* Most NGX launches are network/input kernels. A monotonic membership filter lets those bypass the
+   output registry's lock and scan. Collisions only take the old lookup path; a bit is never cleared,
+   so function-handle reuse, feature recreation and concurrent lookups cannot hide an output kernel. */
+static uint64_t output_kernel_bits[16];
+
+static unsigned output_kernel_bit(CUfunction function)
+{
+    uint64_t value = (uint64_t)(uintptr_t)function >> 4;
+    value ^= value >> 17;
+    return (unsigned)((value * UINT64_C(0x9e3779b97f4a7c15)) >> 54);
+}
 
 static void note_function_lookup(CUfunction function, const char* name)
 {
@@ -755,20 +800,34 @@ static void note_function_lookup(CUfunction function, const char* name)
     memmove(output_kernels, output_kernels + 1, sizeof(output_kernels) - sizeof(output_kernels[0]));
     output_kernels[OUTPUT_KERNEL_CAPACITY - 1].function = function;
     output_kernels[OUTPUT_KERNEL_CAPACITY - 1].native = native;
+    int rgba8 = 0;
+    for (size_t i = 0; i < native_kernel_count; ++i)
+        if (strcmp(native_kernels[i].name, name) == 0) { rgba8 = native_kernels[i].rgba8; break; }
+    output_kernels[OUTPUT_KERNEL_CAPACITY - 1].rgba8 = native && rgba8;
     pthread_mutex_unlock(&output_kernel_lock);
+    const unsigned bit = output_kernel_bit(function);
+    __atomic_fetch_or(&output_kernel_bits[bit >> 6], UINT64_C(1) << (bit & 63), __ATOMIC_RELEASE);
 }
 
-static void note_launch(CUfunction function)
+/* Returns 1 + native + 2 * rgba8 when `function` is an output kernel, 0 otherwise. */
+static int note_launch(CUfunction function)
 {
+    const unsigned bit = output_kernel_bit(function);
+    if ((__atomic_load_n(&output_kernel_bits[bit >> 6], __ATOMIC_ACQUIRE) & (UINT64_C(1) << (bit & 63))) == 0)
+        return 0;
+    int kind = 0;
     pthread_mutex_lock(&output_kernel_lock);
     /* newest first, so a recycled handle resolves with its latest lookup */
     for (int i = OUTPUT_KERNEL_CAPACITY - 1; i >= 0 && output_kernels[i].function != NULL; --i)
         if (output_kernels[i].function == function)
         {
             __atomic_store_n(&last_output_native, output_kernels[i].native, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_output_rgba8, output_kernels[i].rgba8, __ATOMIC_RELAXED);
+            kind = 1 + output_kernels[i].native + 2 * output_kernels[i].rgba8;
             break;
         }
     pthread_mutex_unlock(&output_kernel_lock);
+    return kind;
 }
 
 /* 1 when the last output kernel launched was d4r's native one, 0 when it was ZLUDA's compile of
@@ -776,6 +835,11 @@ static void note_launch(CUfunction function)
 int WINAPI d4rOutputKernelNative(void)
 {
     return __atomic_load_n(&last_output_native, __ATOMIC_RELAXED);
+}
+
+int WINAPI d4rOutputKernelRgba8(void)
+{
+    return __atomic_load_n(&last_output_rgba8, __ATOMIC_RELAXED);
 }
 
 static void load_zluda(void)
@@ -964,7 +1028,7 @@ CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters
     D4rMotionDilationParams copy = *parameters;
     void* arguments[] = {&copy};
     const uint64_t pixels = (uint64_t)copy.motion_width * copy.motion_height;
-    return launch(function, (unsigned)((pixels + 127) / 128), 1, 1, 128, 1, 1, 0, NULL, arguments, NULL);
+    return launch(function, (unsigned)((pixels + 127) / 128), 1, 1, 128, 1, 1, 0, d4r_ngx_stream(NULL), arguments, NULL);
 #else
     return CUDA_ERROR_NOT_SUPPORTED;
 #endif
@@ -1126,6 +1190,16 @@ static void ensure_context(void)
 {
     pthread_once(&context_once, create_default_zluda_context);
 }
+
+/* D4R_NGX_STREAM_PRIORITY=high|normal (default off): the null-stream work of NGX, the shim and this bridge
+   (kernels, async copies and memsets, events, stream waits, input waits, completion callbacks) moves from
+   HIP's null stream to one blocking HIP stream. "high" creates it at the device's greatest priority, so its
+   HSA queue (and the hardware queue it maps to) dispatches ahead of normal-priority queues; "normal" creates
+   it at the default priority, the control that isolates the stream change itself. Every caller passes NULL
+   and gets the same stream, so the order of the work is unchanged; being blocking, the stream also stays
+   ordered with ZLUDA's own synchronous null-stream operations. Off: NULL stays HIP's null stream. */
+static CUstream d4r_ngx_stream(CUstream stream);
+static void* hip_symbol(const char* name);
 
 /* Opt-in stage instrumentation. With D4R_CUDA_LAUNCH_STATS=1 every
    cuLaunchKernel is followed by a context synchronize and a summary of each
@@ -1402,15 +1476,17 @@ static CUresult write_redirect_tail(CUsurfObject object, CUdeviceptr pointer, ui
     static unsigned int next;
     unsigned char* tail = ring[next++ % 256];
     // dword 21: 0x5232 ('R2', RGBA16F texels) << 16 | pitch / 8 (0 = off); dwords 22-23: pointer.
-    // Row pitches are multiples of 8, so bit 0 of `pitch` selects 'R3': R10G10B10A2_UNORM texels.
-    const uint32_t word = pitch != 0 ? ((pitch & 1u) != 0 ? 0x52330000u : 0x52320000u) | ((pitch >> 3) & 0xffffu) : 0u;
+    // Row pitches are multiples of 8: bit 0 selects R3 (RGB10A2), bit 1 selects R4 (RGBA8).
+    const uint32_t word = pitch != 0 ? ((pitch & 2u) != 0 ? 0x52340000u :
+                                      (pitch & 1u) != 0 ? 0x52330000u : 0x52320000u) |
+                                      ((pitch >> 3) & 0xffffu) : 0u;
     memset(tail, 0, 16);
     memcpy(tail, &word, 4);
     memcpy(tail + 4, &pointer, 8);
     CUMEMCPYHTODASYNC_FN function = (CUMEMCPYHTODASYNC_FN)find_zluda_symbol("cuMemcpyHtoDAsync_v2");
     if (function == NULL)
         return CUDA_ERROR_NOT_SUPPORTED;
-    CUresult result = function((CUdeviceptr)object + 84, tail, 12, NULL);
+    CUresult result = function((CUdeviceptr)object + 84, tail, 12, d4r_ngx_stream(NULL));
     if (result == CUDA_SUCCESS && !async)
     {
         CUCTX_SYNCHRONIZE_FN sync = (CUCTX_SYNCHRONIZE_FN)find_zluda_symbol("cuCtxSynchronize");
@@ -2431,6 +2507,33 @@ CUresult WINAPI cuModuleGetFunction(CUfunction* function_out, CUmodule module, c
     return result;
 }
 
+/* D4R_SHIM_GPU_COMPLETION, early form: the shim arms a completion word before NGX's evaluate. When the output
+   kernel that follows is d4r's native one (which writes the game-visible buffer directly; RGBA8-capable when
+   the frame needs the packed store), the word is queued right behind that kernel, ahead of NGX's trailing
+   bookkeeping kernels, which the game never reads. Any other output kernel leaves it to the shim's own write
+   after the output copy. Only the CUDA worker evaluates, so the arm state needs no lock. */
+static CUdeviceptr ngx_completion_pointer;
+static uint32_t ngx_completion_value;
+static int ngx_completion_rgba8, ngx_completion_fired;
+
+CUresult WINAPI d4rNgxArmCompletion(CUdeviceptr pointer, uint32_t value, int rgba8)
+{
+    ngx_completion_pointer = pointer;
+    ngx_completion_value = value;
+    ngx_completion_rgba8 = rgba8;
+    ngx_completion_fired = 0;
+    return CUDA_SUCCESS;
+}
+
+/* 1 when the armed word was queued behind the native output kernel; disarms. */
+int WINAPI d4rNgxCompletionFired(void)
+{
+    const int fired = ngx_completion_fired;
+    ngx_completion_pointer = 0;
+    ngx_completion_fired = 0;
+    return fired;
+}
+
 CUresult WINAPI cuLaunchKernel(CUfunction function_handle, unsigned int grid_x, unsigned int grid_y,
                                unsigned int grid_z, unsigned int block_x, unsigned int block_y,
                                unsigned int block_z, unsigned int shared_bytes, CUstream stream,
@@ -2439,13 +2542,11 @@ CUresult WINAPI cuLaunchKernel(CUfunction function_handle, unsigned int grid_x, 
     static CULAUNCHKERNEL_FN function;
     if (function == NULL)
         function = (CULAUNCHKERNEL_FN)find_zluda_symbol("cuLaunchKernel");
-    unsigned int sequence = 0;
-    pthread_mutex_lock(&instrumentation_lock);
-    sequence = ++launch_sequence;
-    pthread_mutex_unlock(&instrumentation_lock);
+    stream = d4r_ngx_stream(stream);
+    const unsigned int sequence = __atomic_add_fetch(&launch_sequence, 1, __ATOMIC_RELAXED);
     replay_dump_launch(sequence, function_handle, grid_x, grid_y, grid_z, block_x, block_y, block_z,
                        shared_bytes, extra);
-    note_launch(function_handle);
+    const int output_kind = note_launch(function_handle);
     PendingKernelProfile* profile = function != NULL
         ? begin_kernel_profile(sequence, function_handle, stream) : NULL;
     CUfunction native_function = microcuda_k_lookup(function_handle);
@@ -2468,6 +2569,17 @@ CUresult WINAPI cuLaunchKernel(CUfunction function_handle, unsigned int grid_x, 
         tracef("microcuda-k prep stats runs=%llu skips=%llu", (unsigned long long)prep, (unsigned long long)skips);
     }
     end_kernel_profile(profile, result, stream);
+    if (result == CUDA_SUCCESS && ngx_completion_pointer != 0 && output_kind != 0)
+    {
+        const int native = ((output_kind - 1) & 1) != 0, rgba8 = (output_kind - 1) >= 2;
+        typedef int (*WRITE_FN)(void*, void*, uint32_t, unsigned int);
+        static WRITE_FN write;
+        if (write == NULL)
+            write = (WRITE_FN)hip_symbol("hipStreamWriteValue32");
+        if (native && (!ngx_completion_rgba8 || rgba8) && write != NULL)
+            ngx_completion_fired = write(stream, (void*)(uintptr_t)ngx_completion_pointer, ngx_completion_value, 0) == 0;
+        ngx_completion_pointer = 0; /* one output kernel per evaluate: never fire on a later one */
+    }
     if (result != CUDA_SUCCESS || trace_verbose())
     {
         tracef("cuLaunchKernel[%u] %s", sequence, find_function_name(function_handle));
@@ -2569,6 +2681,7 @@ CUresult WINAPI cuMemcpyHtoDAsync(CUdeviceptr destination, const void* source, s
 {
     CUMEMCPYHTODASYNC_FN function = (CUMEMCPYHTODASYNC_FN)find_zluda_symbol("cuMemcpyHtoDAsync_v2");
     if (microcuda_k_write) microcuda_k_write(destination, bytes);
+    stream = d4r_ngx_stream(stream);
     CUresult result = function != NULL ? function(destination, source, bytes, stream) : missing("cuMemcpyHtoDAsync_v2");
     TRACE_CALL(result, "cuMemcpyHtoDAsync->v2 dst=0x%llx src=%p bytes=%zu stream=%p result=%d",
            (unsigned long long)destination, source, bytes, stream, result);
@@ -2906,7 +3019,6 @@ CUresult WINAPI cuTexObjectGetResourceDesc(void* descriptor, CUtexObject object)
     return result;
 }
 
-
 /* Direct pass-throughs for driver APIs whose arguments are all integers or
    pointers, so the Windows x64 call forwards unchanged to ZLUDA (SysV). Unversioned
    names resolve to the versions the CUDA 12 driver returns for them. */
@@ -2935,8 +3047,8 @@ static int d4r_forward_is_teardown(const char* target)
 D4R_FORWARD(cuEventCreate, cuEventCreate, 2, (D4rArg a0, D4rArg a1), (a0, a1))
 D4R_FORWARD(cuEventDestroy, cuEventDestroy_v2, 1, (D4rArg a0), (a0))
 D4R_FORWARD(cuEventDestroy_v2, cuEventDestroy_v2, 1, (D4rArg a0), (a0))
-D4R_FORWARD(cuEventRecord, cuEventRecord, 2, (D4rArg a0, D4rArg a1), (a0, a1))
-D4R_FORWARD(cuEventRecordWithFlags, cuEventRecordWithFlags, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
+D4R_FORWARD(cuEventRecord, cuEventRecord, 2, (D4rArg a0, D4rArg a1), (a0, (D4rArg)d4r_ngx_stream((CUstream)a1)))
+D4R_FORWARD(cuEventRecordWithFlags, cuEventRecordWithFlags, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, (D4rArg)d4r_ngx_stream((CUstream)a1), a2))
 CUresult WINAPI cuEventSynchronize(D4rArg a0)
 {
     if (before_teardown())
@@ -2995,9 +3107,9 @@ D4R_FORWARD(cuStreamCreate, cuStreamCreate, 2, (D4rArg a0, D4rArg a1), (a0, a1))
 D4R_FORWARD(cuStreamCreateWithPriority, cuStreamCreateWithPriority, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 D4R_FORWARD(cuStreamDestroy, cuStreamDestroy_v2, 1, (D4rArg a0), (a0))
 D4R_FORWARD(cuStreamDestroy_v2, cuStreamDestroy_v2, 1, (D4rArg a0), (a0))
-D4R_FORWARD(cuStreamSynchronize, cuStreamSynchronize, 1, (D4rArg a0), (a0))
-D4R_FORWARD(cuStreamQuery, cuStreamQuery, 1, (D4rArg a0), (a0))
-D4R_FORWARD(cuStreamWaitEvent, cuStreamWaitEvent, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
+D4R_FORWARD(cuStreamSynchronize, cuStreamSynchronize, 1, (D4rArg a0), ((D4rArg)d4r_ngx_stream((CUstream)a0)))
+D4R_FORWARD(cuStreamQuery, cuStreamQuery, 1, (D4rArg a0), ((D4rArg)d4r_ngx_stream((CUstream)a0)))
+D4R_FORWARD(cuStreamWaitEvent, cuStreamWaitEvent, 3, (D4rArg a0, D4rArg a1, D4rArg a2), ((D4rArg)d4r_ngx_stream((CUstream)a0), a1, a2))
 D4R_FORWARD(cuStreamGetFlags, cuStreamGetFlags, 2, (D4rArg a0, D4rArg a1), (a0, a1))
 D4R_FORWARD(cuStreamGetPriority, cuStreamGetPriority, 2, (D4rArg a0, D4rArg a1), (a0, a1))
 D4R_FORWARD(cuCtxGetCurrent, cuCtxGetCurrent, 1, (D4rArg a0), (a0))
@@ -3014,14 +3126,14 @@ D4R_FORWARD(cuMemGetInfo_v2, cuMemGetInfo_v2, 2, (D4rArg a0, D4rArg a1), (a0, a1
 D4R_FORWARD(cuMemcpyHtoD, cuMemcpyHtoD_v2, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 D4R_FORWARD(cuMemcpyHtoD_v2, cuMemcpyHtoD_v2, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 D4R_FORWARD(cuMemcpyDtoD, cuMemcpyDtoD_v2, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
-D4R_FORWARD(cuMemcpyDtoDAsync, cuMemcpyDtoDAsync_v2, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, a3))
-D4R_FORWARD(cuMemcpyDtoHAsync, cuMemcpyDtoHAsync_v2, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, a3))
+D4R_FORWARD(cuMemcpyDtoDAsync, cuMemcpyDtoDAsync_v2, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, (D4rArg)d4r_ngx_stream((CUstream)a3)))
+D4R_FORWARD(cuMemcpyDtoHAsync, cuMemcpyDtoHAsync_v2, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, (D4rArg)d4r_ngx_stream((CUstream)a3)))
 D4R_FORWARD(cuMemsetD8, cuMemsetD8_v2, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 D4R_FORWARD(cuMemsetD16, cuMemsetD16_v2, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
 D4R_FORWARD(cuMemsetD32, cuMemsetD32_v2, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
-D4R_FORWARD(cuMemsetD8Async, cuMemsetD8Async, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, a3))
-D4R_FORWARD(cuMemsetD16Async, cuMemsetD16Async, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, a3))
-D4R_FORWARD(cuMemsetD32Async, cuMemsetD32Async, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, a3))
+D4R_FORWARD(cuMemsetD8Async, cuMemsetD8Async, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, (D4rArg)d4r_ngx_stream((CUstream)a3)))
+D4R_FORWARD(cuMemsetD16Async, cuMemsetD16Async, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, (D4rArg)d4r_ngx_stream((CUstream)a3)))
+D4R_FORWARD(cuMemsetD32Async, cuMemsetD32Async, 4, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3), (a0, a1, a2, (D4rArg)d4r_ngx_stream((CUstream)a3)))
 D4R_FORWARD(cuMemsetD2D8, cuMemsetD2D8_v2, 5, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3, D4rArg a4), (a0, a1, a2, a3, a4))
 D4R_FORWARD(cuMemsetD2D32, cuMemsetD2D32_v2, 5, (D4rArg a0, D4rArg a1, D4rArg a2, D4rArg a3, D4rArg a4), (a0, a1, a2, a3, a4))
 D4R_FORWARD(cuFuncSetAttribute, cuFuncSetAttribute, 3, (D4rArg a0, D4rArg a1, D4rArg a2), (a0, a1, a2))
@@ -3114,6 +3226,59 @@ static void* hip_symbol(const char* name)
     if (hip == NULL)
         hip = dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
     return hip != NULL ? dlsym(hip, name) : NULL;
+}
+
+static CUstream ngx_priority_stream;
+static pthread_once_t ngx_priority_once = PTHREAD_ONCE_INIT;
+
+static void create_ngx_priority_stream(void)
+{
+    const char* setting = getenv("D4R_NGX_STREAM_PRIORITY");
+    const int high = setting != NULL && strcmp(setting, "high") == 0;
+    if (!high && (setting == NULL || strcmp(setting, "normal") != 0))
+        return;
+    typedef int (*STREAM_PRIORITY_RANGE_FN)(int*, int*);
+    typedef int (*STREAM_CREATE_PRIORITY_FN)(void**, unsigned int, int);
+    STREAM_PRIORITY_RANGE_FN range = (STREAM_PRIORITY_RANGE_FN)hip_symbol("hipDeviceGetStreamPriorityRange");
+    STREAM_CREATE_PRIORITY_FN create = (STREAM_CREATE_PRIORITY_FN)hip_symbol("hipStreamCreateWithPriority");
+    int least = 0, greatest = 0;
+    ensure_context();
+    if (context_setup_result != CUDA_SUCCESS || range == NULL || create == NULL || range(&least, &greatest) != 0)
+    {
+        tracef("D4R_NGX_STREAM_PRIORITY=%s: HIP stream priorities unavailable; NGX stays on the null stream", setting);
+        return;
+    }
+    void* stream = NULL;
+    const int priority = high ? greatest : 0;
+    const int result = create(&stream, 0 /* hipStreamDefault: blocking */, priority);
+    tracef("D4R_NGX_STREAM_PRIORITY=%s: NGX stream %p priority %d (range %d..%d) result=%d", setting, stream,
+           priority, least, greatest, result);
+    if (result == 0)
+        ngx_priority_stream = (CUstream)stream;
+}
+
+static CUstream d4r_ngx_stream(CUstream stream)
+{
+    if (stream != NULL)
+        return stream;
+    pthread_once(&ngx_priority_once, create_ngx_priority_stream);
+    return ngx_priority_stream; /* NULL unless D4R_NGX_STREAM_PRIORITY created one */
+}
+
+CUresult WINAPI d4rNgxStreamPriority(int* priority)
+{
+    /* For the shim's log: 1 when NGX runs on the substituted stream, with its HIP priority. */
+    typedef int (*STREAM_GET_PRIORITY_FN)(void*, int*);
+    CUstream stream = d4r_ngx_stream(NULL);
+    STREAM_GET_PRIORITY_FN get = (STREAM_GET_PRIORITY_FN)hip_symbol("hipStreamGetPriority");
+    if (priority == NULL)
+        return CUDA_ERROR_INVALID_VALUE;
+    *priority = 0;
+    if (stream == NULL)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    if (get != NULL)
+        get(stream, priority);
+    return CUDA_SUCCESS;
 }
 
 CUresult WINAPI d4rImportVulkanMemory(void* client_device, uint64_t client_memory, uint64_t bytes, CUdeviceptr* pointer,
@@ -3282,6 +3447,146 @@ typedef int (*VK_SIGNAL_SEMAPHORE_FN)(void*, const D4rVkSemaphoreSignalInfo*);
 typedef int (*VK_GET_SEMAPHORE_COUNTER_FN)(void*, uint64_t, uint64_t*);
 typedef int (*HIP_LAUNCH_HOST_FN)(void*, void (*)(void*), void*);
 
+/* NGX's null-stream completion, independent of Wine scheduling/event polling. CPU cancellations
+   and native callbacks share one timeline lock so a late callback never signals a lower value.
+   No HIP or Wine APIs may run from the callback. The shim queues this only for the completed-prefix
+   head, after every output write; resource retirement waits for its native completion condition. */
+typedef struct
+{
+    void* device;
+    uint64_t semaphore, value, pending;
+    VK_SIGNAL_SEMAPHORE_FN signal;
+    HIP_LAUNCH_HOST_FN launch;
+    pthread_mutex_t lock;
+    pthread_cond_t completed;
+    int busy, cancelled, detached;
+} D4rNgxTimeline;
+
+int WINAPI d4rNgxTimelineSignal(void* handle, uint64_t value)
+{
+    D4rNgxTimeline* timeline = handle;
+    pthread_mutex_lock(&timeline->lock);
+    int result = 0;
+    if (value > timeline->value)
+    {
+        D4rVkSemaphoreSignalInfo info = {1000207005, NULL, timeline->semaphore, value};
+        result = timeline->signal(timeline->device, &info);
+        if (result == 0) timeline->value = value;
+    }
+    pthread_mutex_unlock(&timeline->lock);
+    return result;
+}
+
+static void d4r_ngx_completed(void* data)
+{
+    D4rNgxTimeline* timeline = data;
+    pthread_mutex_lock(&timeline->lock);
+    if (!__atomic_load_n(&timeline->cancelled, __ATOMIC_ACQUIRE) && timeline->pending > timeline->value)
+    {
+        D4rVkSemaphoreSignalInfo info = {1000207005, NULL, timeline->semaphore, timeline->pending};
+        if (timeline->signal(timeline->device, &info) == 0) timeline->value = timeline->pending;
+        /* A failed signal leaves the worker's normal retirement to retry. */
+    }
+    timeline->busy = 0;
+    pthread_cond_signal(&timeline->completed);
+    const int detached = timeline->detached;
+    pthread_mutex_unlock(&timeline->lock);
+    if (detached) { pthread_cond_destroy(&timeline->completed); pthread_mutex_destroy(&timeline->lock); free(timeline); }
+}
+
+CUresult WINAPI d4rNgxTimelineCreate(void* client_device, uint64_t client_semaphore, void** handle)
+{
+    if (client_device == NULL || client_semaphore == 0 || handle == NULL) return CUDA_ERROR_INVALID_VALUE;
+    const uint64_t* device_object = (const uint64_t*)(uintptr_t)((const uint64_t*)client_device)[1];
+    const uint64_t* semaphore_object = (const uint64_t*)(uintptr_t)client_semaphore;
+    if (device_object == NULL || device_object[1] != (uint64_t)(uintptr_t)client_device ||
+        semaphore_object[1] != client_semaphore) return CUDA_ERROR_NOT_SUPPORTED;
+    void* vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+    VK_GET_DEVICE_PROC_ADDR_FN get = vulkan != NULL ? dlsym(vulkan, "vkGetDeviceProcAddr") : NULL;
+    HIP_LAUNCH_HOST_FN launch = (HIP_LAUNCH_HOST_FN)hip_symbol("hipLaunchHostFunc");
+    if (get == NULL || launch == NULL) return CUDA_ERROR_NOT_SUPPORTED;
+    void* device = (void*)(uintptr_t)device_object[0];
+    VK_SIGNAL_SEMAPHORE_FN signal = (VK_SIGNAL_SEMAPHORE_FN)get(device, "vkSignalSemaphore");
+    VK_GET_SEMAPHORE_COUNTER_FN counter = (VK_GET_SEMAPHORE_COUNTER_FN)get(device, "vkGetSemaphoreCounterValue");
+    uint64_t value = 0;
+    if (signal == NULL || counter == NULL || counter(device, semaphore_object[0], &value) != 0)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    D4rNgxTimeline* timeline = calloc(1, sizeof(*timeline));
+    if (timeline == NULL) return CUDA_ERROR_OUT_OF_MEMORY;
+    if (pthread_mutex_init(&timeline->lock, NULL) != 0) { free(timeline); return CUDA_ERROR_UNKNOWN; }
+    pthread_condattr_t attr;
+    if (pthread_condattr_init(&attr) != 0) { pthread_mutex_destroy(&timeline->lock); free(timeline); return CUDA_ERROR_UNKNOWN; }
+    const int condition = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) != 0 ||
+                          pthread_cond_init(&timeline->completed, &attr) != 0;
+    pthread_condattr_destroy(&attr);
+    if (condition) { pthread_mutex_destroy(&timeline->lock); free(timeline); return CUDA_ERROR_UNKNOWN; }
+    timeline->device = device; timeline->semaphore = semaphore_object[0]; timeline->value = value;
+    timeline->signal = signal; timeline->launch = launch; *handle = timeline;
+    return CUDA_SUCCESS;
+}
+
+CUresult WINAPI d4rNgxTimelinePrepare(void* handle)
+{
+    D4rNgxTimeline* timeline = handle;
+    pthread_mutex_lock(&timeline->lock);
+    const int busy = timeline->busy;
+    if (!busy) __atomic_store_n(&timeline->cancelled, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&timeline->lock);
+    return busy ? CUDA_ERROR_NOT_READY : CUDA_SUCCESS;
+}
+
+void WINAPI d4rNgxTimelineCancel(void* handle)
+{
+    /* Called by the independent input watchdog before its coherent release store: no queue calls/locks. */
+    __atomic_store_n(&((D4rNgxTimeline*)handle)->cancelled, 1, __ATOMIC_RELEASE);
+}
+
+CUresult WINAPI d4rNgxTimelineQueue(void* handle, uint64_t value)
+{
+    D4rNgxTimeline* timeline = handle;
+    pthread_mutex_lock(&timeline->lock);
+    if (timeline->busy) { pthread_mutex_unlock(&timeline->lock); return CUDA_ERROR_NOT_READY; }
+    timeline->pending = value; timeline->busy = 1;
+    pthread_mutex_unlock(&timeline->lock);
+    const int result = timeline->launch(d4r_ngx_stream(NULL), d4r_ngx_completed, timeline);
+    if (result != 0)
+    {
+        pthread_mutex_lock(&timeline->lock); timeline->busy = 0; pthread_mutex_unlock(&timeline->lock);
+    }
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+}
+
+void WINAPI d4rNgxTimelineDestroy(void* handle)
+{
+    D4rNgxTimeline* timeline = handle;
+    pthread_mutex_lock(&timeline->lock);
+    __atomic_store_n(&timeline->cancelled, 1, __ATOMIC_RELEASE);
+    const int busy = timeline->busy;
+    timeline->detached = busy;
+    pthread_mutex_unlock(&timeline->lock);
+    /* Normally the native condition drained the callback. If a device error prevented that drain, retain
+       only this self-owned ticket until its cancelled callback returns, never a pointer into Feature. */
+    if (!busy) { pthread_cond_destroy(&timeline->completed); pthread_mutex_destroy(&timeline->lock); free(timeline); }
+}
+
+CUresult WINAPI d4rNgxTimelineWait(void* handle)
+{
+    D4rNgxTimeline* timeline = handle;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return CUDA_ERROR_UNKNOWN;
+    deadline.tv_sec += 5;
+    pthread_mutex_lock(&timeline->lock);
+    int result = 0;
+    while (timeline->busy && result == 0)
+        result = pthread_cond_timedwait(&timeline->completed, &timeline->lock, &deadline);
+    const int busy = timeline->busy;
+    pthread_mutex_unlock(&timeline->lock);
+    /* The callback runs after every output write on the null stream. Its condition is sufficient to
+       retire those resources, without polling/recording another GPU event. A timeout keeps the ticket
+       owned; the caller cancels, disables this mode and falls back to its normal output synchronization. */
+    return !busy ? CUDA_SUCCESS : result == ETIMEDOUT ? CUDA_ERROR_NOT_READY : CUDA_ERROR_UNKNOWN;
+}
+
 typedef struct D4rEngineNet
 {
     int k_preset;  /* D4RKHIP1: the token grid comes from the output dimensions and the cycle has eight graphs */
@@ -3332,7 +3637,6 @@ typedef int (*HIP_STREAM_SYNCHRONIZE_FN)(void*);
 typedef int (*HIP_CAPTURE_BEGIN_FN)(void*, int);
 typedef int (*HIP_CAPTURE_END_FN)(void*, void**);
 typedef int (*HIP_GRAPH_INSTANTIATE_FN)(void**, void*, void**, char*, size_t);
-
 
 CUresult WINAPI d4rEngineNetReleaseInput(void* handle, uint32_t value)
 {
@@ -4175,7 +4479,7 @@ CUresult WINAPI d4rMemcpy2DAsync(const D4rMemcpy2D* copy, CUstream stream)
     D4rMemcpy2D hip = *copy;
     hip.srcMemoryType = (unsigned int)src;
     hip.dstMemoryType = (unsigned int)dst;
-    const int result = function(&hip, NULL);
+    const int result = function(&hip, d4r_ngx_stream(NULL));
     if (result != 0 || trace_verbose())
         tracef("d4rMemcpy2DAsync %zux%zu result=%d", copy->WidthInBytes, copy->Height, result);
     return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
@@ -4194,10 +4498,66 @@ CUresult WINAPI d4rStreamWaitValue32(CUdeviceptr pointer, uint32_t value)
         function = (HIP_STREAM_WAIT_VALUE32_FN)hip_symbol("hipStreamWaitValue32");
     if (function == NULL)
         return CUDA_ERROR_NOT_SUPPORTED;
-    const int result = function(NULL, (void*)(uintptr_t)pointer, value, 0 /* hipStreamWaitValueGte */, 0xffffffffu);
+    const int result = function(d4r_ngx_stream(NULL), (void*)(uintptr_t)pointer, value, 0 /* hipStreamWaitValueGte */,
+                                0xffffffffu);
     if (result != 0 || trace_verbose())
         tracef("d4rStreamWaitValue32 %p >= %u result=%d", (void*)(uintptr_t)pointer, value, result);
     return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+/* Exact per-slot tags, rather than the engine's monotonic Gte word: an old or later frame must never
+   satisfy NGX's wait, including across u32 wrap. ZLUDA uses HIP's null stream for null CUstream kernel
+   launches; d4rMemcpy2DAsync uses that same stream. This export therefore orders both input copies and
+   NGX kernels without adding an unsupported CUDA driver entry point to ZLUDA. The caller owns a coherent
+   CPU mapping and arms its watchdog before entering here, so a blocked HIP call can still be released. */
+CUresult WINAPI d4rStreamWaitValue32Eq(CUdeviceptr pointer, uint32_t value)
+{
+    typedef int (*GET_ATTRIBUTE_FN)(int*, int, int);
+    typedef int (*GET_DEVICE_FN)(int*);
+    ensure_context();
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    HIP_STREAM_WAIT_VALUE32_FN wait = (HIP_STREAM_WAIT_VALUE32_FN)hip_symbol("hipStreamWaitValue32");
+    GET_ATTRIBUTE_FN attribute = (GET_ATTRIBUTE_FN)hip_symbol("hipDeviceGetAttribute");
+    GET_DEVICE_FN device = (GET_DEVICE_FN)hip_symbol("hipGetDevice");
+    int current = 0, supported = 0;
+    if (pointer == 0 || wait == NULL || attribute == NULL || device == NULL || device(&current) != 0 ||
+        attribute(&supported, 10013 /* hipDeviceAttributeCanUseStreamWaitValue */, current) != 0 || !supported)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    const int result = wait(d4r_ngx_stream(NULL), (void*)(uintptr_t)pointer, value, 1 /* hipStreamWaitValueEq */,
+                            0xffffffffu);
+    if (result != 0 || trace_verbose())
+        tracef("d4rStreamWaitValue32Eq %p == %u result=%d", (void*)(uintptr_t)pointer, value, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED; /* failure: no wait queued */
+}
+
+double WINAPI d4rThreadCpuTimeMs(void)
+{
+    struct timespec resolution, now;
+    if (clock_getres(CLOCK_THREAD_CPUTIME_ID, &resolution) != 0 || resolution.tv_sec != 0 ||
+        resolution.tv_nsec > 100000 /* 100 us: too coarse for these sub-ms submission/wait costs */ ||
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0)
+        return -1.0;
+    return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+}
+
+/* D4R_SHIM_GPU_COMPLETION: queues a 32-bit write of `value` to `pointer` on the stream NGX runs on, behind the
+   frame's output writes. The game's queue polls that word (kernels/support/vulkan_wait.comp) instead of waiting
+   for a CPU-signalled timeline value, so DLSS's completion reaches the game without a host round trip. */
+CUresult WINAPI d4rNgxWriteValue32(CUdeviceptr pointer, uint32_t value)
+{
+    static HIP_STREAM_WRITE_VALUE32_FN write;
+    ensure_context();
+    if (context_setup_result != CUDA_SUCCESS)
+        return context_setup_result;
+    if (write == NULL)
+        write = (HIP_STREAM_WRITE_VALUE32_FN)hip_symbol("hipStreamWriteValue32");
+    if (write == NULL || pointer == 0)
+        return CUDA_ERROR_NOT_SUPPORTED;
+    const int result = write(d4r_ngx_stream(NULL), (void*)(uintptr_t)pointer, value, 0);
+    if (result != 0 || trace_verbose())
+        tracef("d4rNgxWriteValue32 %p = %u result=%d", (void*)(uintptr_t)pointer, value, result);
+    return result == 0 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult WINAPI d4rWriteValue32(CUdeviceptr pointer, uint32_t value)

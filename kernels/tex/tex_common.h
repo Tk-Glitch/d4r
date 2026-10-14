@@ -371,14 +371,18 @@ extern "C" __attribute__((device)) int __ockl_image_width_2D(tsharp_t* image);
 extern "C" __attribute__((device)) int __ockl_image_height_2D(tsharp_t* image);
 __attribute__((device)) static inline uint32_t redirect_pitch(uint64_t surface)
 {
-    // 'R2' (RGBA16F texels) or 'R3' (R10G10B10A2_UNORM texels) tag in the high half (other handles may have
+    // 'R2' (RGBA16F), 'R3' (RGB10A2) or 'R4' (RGBA8) tag in the high half (other handles may have
     // data there), row pitch / 8 in the low half
     const uint32_t word = ((const __attribute__((address_space(4))) uint32_t*)surface)[21];
-    return (word >> 16) == 0x5232u || (word >> 16) == 0x5233u ? (word & 0xffffu) << 3 : 0u;
+    return (word >> 16) >= 0x5232u && (word >> 16) <= 0x5234u ? (word & 0xffffu) << 3 : 0u;
 }
 __attribute__((device)) static inline bool redirect_rgb10a2(uint64_t surface)
 {
     return (((const __attribute__((address_space(4))) uint32_t*)surface)[21] >> 16) == 0x5233u;
+}
+__attribute__((device)) static inline bool redirect_rgba8(uint64_t surface)
+{
+    return (((const __attribute__((address_space(4))) uint32_t*)surface)[21] >> 16) == 0x5234u;
 }
 // One channel as the game-side path produces it: the f32 value rounded toward zero to a half (the RGBA16F
 // store), then converted to UNORM by a blit (NaN and negatives 0, clamped at 1, rounded to nearest).
@@ -422,6 +426,10 @@ DEV __attribute__((always_inline)) void d4r_sust_p_v4b32(uint64_t surface, int32
                 *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + 4 * x) =
                     redirect_unorm((uint16_t)lo, 1023.0f) | redirect_unorm((uint16_t)(lo >> 16), 1023.0f) << 10 |
                     redirect_unorm((uint16_t)hi, 1023.0f) << 20 | redirect_unorm((uint16_t)(hi >> 16), 3.0f) << 30;
+            else if (redirect_rgba8(surface))
+                *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + 4 * x) =
+                    redirect_unorm((uint16_t)lo, 255.0f) | redirect_unorm((uint16_t)(lo >> 16), 255.0f) << 8 |
+                    redirect_unorm((uint16_t)hi, 255.0f) << 16 | redirect_unorm((uint16_t)(hi >> 16), 255.0f) << 24;
             else
                 *D4R_REDIRECT_PTR(uint2_t, redirect_row(surface, y) + 8 * x) = (uint2_t){lo, hi};
         }
@@ -526,9 +534,15 @@ DEV __attribute__((always_inline)) void d4r_sust_b32(uint64_t surface, int32_t x
     tsharp_t* image = (tsharp_t*)surface;
     if (redirect_pitch(surface) != 0)
     {
+        // Raw RGBA16F stores carry two half channels at each four-byte offset. Packing those channels
+        // separately keeps the original store ownership (no read-modify-write or cross-thread race).
+        if (redirect_rgba8(surface) && x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
+            *D4R_REDIRECT_PTR(uint16_t, redirect_row(surface, y) + (x >> 1)) =
+                (uint16_t)(redirect_unorm((uint16_t)data, 255.0f) |
+                           redirect_unorm((uint16_t)(data >> 16), 255.0f) << 8);
         // raw bits at byte offset x (RGBA16F rows are 8 bytes per pixel); the shim only asks for packed
-        // RGB10A2 texels from kernels without raw stores
-        if (!redirect_rgb10a2(surface) && x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
+        // RGB10A2 texels from kernels without raw stores; RGBA8 preserves each half-pair store
+        if (!redirect_rgb10a2(surface) && !redirect_rgba8(surface) && x >= 0 && (x & 3) == 0 && redirect_inside(surface, x >> 3, y))
             *D4R_REDIRECT_PTR(uint32_t, redirect_row(surface, y) + x) = data;
         return;
     }

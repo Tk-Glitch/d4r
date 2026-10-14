@@ -1125,9 +1125,9 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "RGB10A2 output cannot be combined with RGBA8 or the quality scene\n");
         return 2;
     }
-    if (rgba8 && (qualityScene || motionScene || jitterScene || replayDir != nullptr))
+    if (rgba8 && (qualityScene || replayDir != nullptr))
     {
-        std::fprintf(stderr, "RGBA8 format probe requires the static synthetic scene\n");
+        std::fprintf(stderr, "RGBA8 format probe supports static, motion and jitter scenes\n");
         return 2;
     }
     const bool temporal = std::getenv("D4R_HARNESS_TEMPORAL") != nullptr || motionScene || jitterScene || qualityScene ||
@@ -1226,6 +1226,8 @@ int main(int argc, char** argv)
         for (size_t index = 0; index < color.size(); ++index)
             color8[index] = static_cast<uint8_t>(std::lround(
                 std::clamp(static_cast<float>(std::bit_cast<_Float16>(color[index])), 0.0f, 1.0f) * 255.0f));
+        if (std::getenv("D4R_HARNESS_RGBA8_RAMP") != nullptr)
+            for (size_t i = 0; i < color8.size(); ++i) color8[i] = static_cast<uint8_t>(i);
         outputInit8.resize(static_cast<size_t>(outWidth) * outHeight * 4);
     }
 
@@ -1421,6 +1423,17 @@ int main(int argc, char** argv)
                                                    : rgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM
                                                            : DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // Moving/jittered RGBA8 fixtures quantize the same canonical half input as the initial upload.
+    // Never upload the half byte layout into an RGBA8 resource: that would make a format test silently
+    // exercise different content instead of checking the conversion/packing route used by the game.
+    const auto update_color = [&] {
+        if (rgba8)
+            for (size_t i = 0; i < color.size(); ++i)
+                color8[i] = static_cast<uint8_t>(std::lround(std::clamp(
+                    static_cast<float>(std::bit_cast<_Float16>(color[i])), 0.0f, 1.0f) * 255.0f));
+        update_texture(colorTexture, rgba8 ? static_cast<const void*>(color8.data())
+                                          : static_cast<const void*>(color.data()), resourceWidth * (rgba8 ? 4 : 8), srv);
+    };
     upload(colorTexture, rgba8 ? static_cast<const void*>(color8.data()) : static_cast<const void*>(color.data()),
            resourceWidth * (rgba8 ? 4 : 8), srv);
     upload(depthTexture, depth.data(), resourceWidth * 4, srv);
@@ -1757,7 +1770,7 @@ int main(int argc, char** argv)
                     color[pixel * 4 + 0] = color[pixel * 4 + 1] = color[pixel * 4 + 2] = half;
                     color[pixel * 4 + 3] = 0x3c00u;
                 }
-            update_texture(colorTexture, color.data(), resourceWidth * 8, srv);
+            update_color();
             if (frame == 1 && (panX != 0 || panY != 0))
             {
                 // Current position -> previous position. Without MVLowRes DLSS
@@ -1800,7 +1813,7 @@ int main(int argc, char** argv)
                 {0.0f, 0.25f, -0.25f, -0.125f, 0.375f, 0.125f, -0.375f, 0.0f};
             const size_t phase = static_cast<size_t>(frame - 1) % jitterX.size();
             render_jittered_background(color, inWidth, inHeight, resourceWidth, jitterX[phase], jitterY[phase]);
-            update_texture(colorTexture, color.data(), resourceWidth * 8, srv);
+            update_color();
             d4r_ngx_set_float(parameters, "Jitter.Offset.X", jitterX[phase]);
             d4r_ngx_set_float(parameters, "Jitter.Offset.Y", jitterY[phase]);
         }
@@ -1823,7 +1836,7 @@ int main(int argc, char** argv)
                     motion[motionPixel * 2 + 0] = 0xc400u; // -4 render pixels: current position -> previous
                     motion[motionPixel * 2 + 1] = 0;
                 }
-            update_texture(colorTexture, color.data(), resourceWidth * 8, srv);
+            update_color();
             update_texture(depthTexture, depth.data(), resourceWidth * 4, srv);
             update_texture(motionTexture, motion_rows(motion.data()), motionRowBytes, srv);
         }
@@ -2054,6 +2067,20 @@ int main(int argc, char** argv)
         LARGE_INTEGER counterStart, counterRecorded, counterEnd, counterFrequency;
         QueryPerformanceFrequency(&counterFrequency);
         QueryPerformanceCounter(&counterStart);
+        // D4R_HARNESS_THRASH_MB=N: copy N MB between two private buffers ahead of the evaluation, as a game's
+        // own rendering does, so DLSS starts with its weights and history evicted from L2 and Infinity Cache
+        // instead of finding them warm from the previous back-to-back frame.
+        static const UINT64 thrashBytes = std::getenv("D4R_HARNESS_THRASH_MB") != nullptr
+            ? std::clamp<UINT64>(std::strtoull(std::getenv("D4R_HARNESS_THRASH_MB"), nullptr, 10), 0, 1024) << 20 : 0;
+        static ID3D12Resource* thrashSource = nullptr;
+        static ID3D12Resource* thrashTarget = nullptr;
+        if (thrashBytes != 0 && thrashSource == nullptr)
+        {
+            thrashSource = create_buffer(D3D12_HEAP_TYPE_DEFAULT, thrashBytes, D3D12_RESOURCE_STATE_COMMON);
+            thrashTarget = create_buffer(D3D12_HEAP_TYPE_DEFAULT, thrashBytes, D3D12_RESOURCE_STATE_COMMON);
+        }
+        if (thrashSource != nullptr && thrashTarget != nullptr)
+            g_list->CopyBufferRegion(thrashTarget, 0, thrashSource, 0, thrashBytes);
         result = evaluate(g_list, feature, parameters, nullptr);
         QueryPerformanceCounter(&counterRecorded);
         if (const char* delay = std::getenv("D4R_HARNESS_DELAY_SUBMIT_MS"))

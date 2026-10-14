@@ -2,7 +2,7 @@
 layout(local_size_x=8, local_size_y=8) in;
 layout(set=0, binding=0) uniform sampler2D sourceImage;
 layout(std430, set=0, binding=1) writeonly buffer Pixels { uint pixels[]; };
-layout(push_constant) uniform Size { uint width; uint height; uint mode; } size;
+layout(push_constant) uniform Size { uint width; uint height; uint mode; uint stride; } size;
 // Match the CPU canonical conversion, including round-to-even and subnormals.
 uint halfBits(float value) {
     uint bits = floatBitsToUint(value);
@@ -26,14 +26,24 @@ uint halfBits(float value) {
     if (remainder > halfway || (remainder == halfway && (m & 1u) != 0u)) ++result;
     return result;
 }
+// Mode 5 is only for RGBA8 UNORM: values are zero or normal positive halves. Preserve
+// the blit's toward-zero conversion; other modes keep the canonical round-to-even path.
+uint halfRtz(float value) {
+    uint b = floatBitsToUint(value);
+    if (value == 0.0) return 0u;
+    return (((b >> 23) - 112u) << 10) | ((b & 0x7fffffu) >> 13);
+}
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
     if (p.x >= size.width || p.y >= size.height) return;
     ivec2 extent = textureSize(sourceImage, 0);
-    uint index = p.y * size.width + p.x;
+    uint index = p.y * size.stride + p.x;
     vec4 value = all(lessThan(ivec2(p), extent))
         ? texelFetch(sourceImage, ivec2(p), 0) : vec4(0.0);
-    if (size.mode == 1u) { // canonical RGBA16F color
+    if (size.mode == 5u) {
+        pixels[index * 2u] = halfRtz(value.x) | (halfRtz(value.y) << 16);
+        pixels[index * 2u + 1u] = halfRtz(value.z) | (halfRtz(value.w) << 16);
+    } else if (size.mode == 1u) { // canonical RGBA16F color
         pixels[index * 2u] = halfBits(value.x) | (halfBits(value.y) << 16);
         pixels[index * 2u + 1u] = halfBits(value.z) | (halfBits(value.w) << 16);
     } else if (size.mode == 3u) { // canonical RG16F motion
