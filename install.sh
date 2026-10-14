@@ -52,15 +52,17 @@ CACHE="${D4R_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/d4r}"
 
 # Questions only on a terminal; otherwise (or with --yes) every default applies.
 interactive() { (( YES == 0 )) && [[ -t 0 && -t 1 ]]; }
-ask() {   # ask "QUESTION" DEFAULT(y|n): 0 for yes
+ask() {   # ask "QUESTION" DEFAULT(y|n): 0 for yes. Enter takes the default; any answer starting with y or n counts.
   local answer
   if ! interactive; then [[ $2 == y ]]; return; fi
   while true; do
-    read -r -p "$1 [$([[ $2 == y ]] && echo Y/n || echo y/N)] " answer || answer=''
+    read -r -p "$1 [$([[ $2 == y ]] && echo Y/n || echo y/N)] " answer || { echo; answer=''; }
+    answer="${answer//[[:space:]]/}"
     case "${answer,,}" in
       '') [[ $2 == y ]]; return ;;
-      y|yes) return 0 ;;
-      n|no) return 1 ;;
+      y*) return 0 ;;
+      n*) return 1 ;;
+      *) echo '  Please answer y or n (or press Enter for the default).' ;;
     esac
   done
 }
@@ -182,6 +184,7 @@ if (( REBUILD == 0 )) && [[ "$DO_ENGINE" != 0 && -f "$STAMP" && "$(cat "$STAMP")
   echo 'The engine models in this folder are up to date.'
   done_msg; exit 0
 fi
+if [[ "$DO_ENGINE" == ask ]] && ! interactive; then DO_ENGINE=1; fi
 if [[ "$DO_ENGINE" == ask ]]; then
   echo
   echo "Set up d4r's own DLSS engine (recommended)?"

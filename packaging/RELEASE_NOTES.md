@@ -1,6 +1,10 @@
 <!-- Modified in this fork for CUDA Ray Reconstruction support and validation (2026). -->
 # Unreleased
 
+- `install.sh` sets up the native engine: after the NVIDIA DLLs (now also DLSS Ray Reconstruction 310.9.1) it offers to build the engine's models on the user's machine (`d4r/tools/build-engine-models.sh`): Ray Reconstruction D, E and F straight from `nvngx_dlssd.dll`, Super Resolution K, M and L (and their LDR variants) from one test frame per model rendered through d4r under GE-Proton. The verified DLLs and the built models are kept in `~/.cache/d4r`, so the next game's install neither downloads nor builds again. Questions replace the old command-line choices (`--help` lists options for scripted installs).
+- `[Engine] Enabled = auto` is the new default: the engine (the faster path) runs whenever `d4r/engine` holds its models, with the fastest model builds; anything it cannot run still uses the CUDA backend.
+- Not in this build: the experimental AMD FSR Ray Regeneration backend for Ray Reconstruction (`[RayReconstruction] Backend = fsr`) that an earlier nightly carried. Its code is not part of d4r's sources; Ray Reconstruction runs on NVIDIA's DLSS denoiser (engine or CUDA backend).
+
 - ASI setup ignores Proton accessibility helpers and other background utilities, and serializes setup per plugin installation. Its D3D12 configuration uses regular Windows library hooks and disables Agility SDK upgrades. Game-specific startup remains a separate runtime check.
 
 - ASI setup now finds the INI beside the active OptiScaler loader, including GE-Proton's `system32/umu` installation. Missing-file errors identify the actual missing path, and INI updates are staged beside their destination even when the game and prefix are on different filesystems.
