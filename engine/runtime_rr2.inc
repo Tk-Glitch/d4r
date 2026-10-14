@@ -521,7 +521,9 @@ struct R2Engine {
         putMat(p, 644, rc); putMat(p, 708, clip); putMat(p, 772, clip); putMat(p, 836, inv);
         putMat(p, 900, mul(toNdc, inv)); putMat(p, 964, mul(rc, toPixels));
         putF(p, 804, settings.jitter[0] * (2.0f / fr)); putF(p, 808, -settings.jitter[1] * (2.0f / fh));
-        put32(p, 1032, f);
+        // byte 1032: NGX's frame index modulo 8 (0 - 7, then 0 again; 12-frame jitter capture, 2026-10-14). The raw
+        // count matched the first eight frames only and made every later frame differ
+        put32(p, 1032, f & 7u);
         for (size_t i = 0; i < postBlocks.size(); ++i) {
             auto& o = postBlocks[i];
             putF(o, 140, settings.jitter[0]); putF(o, 144, settings.jitter[1]);
