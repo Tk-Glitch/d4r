@@ -7610,6 +7610,7 @@ static float get_float_or(void* parameters, const char* name, float fallback)
 }
 
 static bool engine_requested();
+static int start_engine_model_rr(const Feature& feature);
 
 // Called on the game thread with the feature API lock held. All CUDA resources are made on its worker.
 // Vulkan-only K features retain just their creation settings until a frame actually needs CUDA.
@@ -7827,16 +7828,20 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
 
     feature->subrects = subrects;
     std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());
-    // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation. Presets K, L
-    // and M and Ray Reconstruction (the engine's) create the CUDA feature only when a frame falls back: NGX's L kernels
-    // take ZLUDA about 20 s to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch,
-    // 2026-10-11), and the denoiser's are larger still.
-    feature->cudaCreationDeferred = !nativeVulkan && engine_requested() &&
-                                    (rayReconstruction || feature->preset == 11 || feature->preset == 12 ||
-                                     feature->preset == 13);
+    // The engine records D3D12 evaluations only; the native Vulkan frontend keeps eager CUDA creation. With the
+    // engine on, every feature creates its CUDA feature only when a frame falls back: NGX's L kernels take ZLUDA
+    // about 20 s to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch, 2026-10-11),
+    // and the denoiser's 310.9 kernels 44 s (RE Requiem, 2026-10-14). A feature the engine refuses pays that at its
+    // first frame instead.
+    feature->cudaCreationDeferred = !nativeVulkan && engine_requested();
     const NgxResult result = feature->cudaCreationDeferred ? NGX_SUCCESS : create_cuda_feature(*feature);
     if (feature->cudaCreationDeferred)
+    {
         logf("engine backend: CUDA feature creation deferred until fallback is needed");
+        // the denoiser's model loads on a thread of its own: start it now, so it is usually ready by the first frame
+        if (rayReconstruction)
+            start_engine_model_rr(*feature);
+    }
     if (result != NGX_SUCCESS)
     {
         release_feature(feature);
@@ -8926,6 +8931,31 @@ static void init_engine_backend_rr(int slot)
          path.c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 }
 
+// Starts loading the Ray Reconstruction model `feature` runs on (once per preset) and returns its slot. Called at
+// CreateFeature too, so the model is usually ready by the first frame.
+static int start_engine_model_rr(const Feature& feature)
+{
+    // NGX 310.7 runs preset E's kernels for the hint 5 only and preset D's (diamond_wallaby) for every other value:
+    // none, the retired A / B / C (1-3), 6, and values with the top bit set such as Cyberpunk 2077's 0x80000002 or
+    // 0x80000005 (harness captures with D4R_RR_PRESET, 2026-10-12).
+    // NGX 310.9 has preset F (DLSS 4.5, the rr2_* kernels) and runs it for every hint but 4 (D) and 5 (E): none,
+    // 6, Cyberpunk 2077's 0x80000002 (harness runs with D4R_RR_PRESET, 2026-10-13). The shim cannot see which DLL
+    // version the CUDA backend loaded, so that mapping applies when the user built a preset F model (engine\rr-f),
+    // which only a 310.9 DLL yields.
+    static const bool haveF = GetFileAttributesA((rr_model_directory(2) + "\\rr.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const int slot = feature.preset == 5 ? 1 : (haveF && feature.preset != 4) ? 2 : 0;
+    std::call_once(g_engine.vulkanOnce, init_engine_vulkan);
+    std::call_once(g_engineR.once[slot], [slot] {
+        g_engineR.state[slot] = 1;
+        // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
+        if (env_uint("D4R_ENGINE_RR_SYNC", 0) != 0)
+            init_engine_backend_rr(slot);
+        else
+            std::thread([slot] { init_engine_backend_rr(slot); }).detach();
+    });
+    return slot;
+}
+
 // Ray Reconstruction on the engine: d4r's stages in the game's command list, with the denoiser's guides sampled
 // straight from the game's textures. False: the CUDA backend serves the feature (reason logged).
 static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
@@ -8949,28 +8979,21 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         warn_not_f("from this frame on");
         return false;
     };
-    // NGX 310.7 runs preset E's kernels for the hint 5 only and preset D's (diamond_wallaby) for every other value:
-    // none, the retired A / B / C (1-3), 6, and values with the top bit set such as Cyberpunk 2077's 0x80000002 or
-    // 0x80000005 (harness captures with D4R_RR_PRESET, 2026-10-12).
-    // NGX 310.9 has preset F (DLSS 4.5, the rr2_* kernels) and runs it for every hint but 4 (D) and 5 (E): none,
-    // 6, Cyberpunk 2077's 0x80000002 (harness runs with D4R_RR_PRESET, 2026-10-13). The shim cannot see which DLL
-    // version the CUDA backend loaded, so that mapping applies when the user built a preset F model (engine\rr-f),
-    // which only a 310.9 DLL yields.
-    static const bool haveF = GetFileAttributesA((rr_model_directory(2) + "\\rr.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
-    const int slot = feature.preset == 5 ? 1 : (haveF && feature.preset != 4) ? 2 : 0;
-    std::call_once(g_engineR.once[slot], [slot] {
-        g_engineR.state[slot] = 1;
-        // D4R_ENGINE_RR_SYNC=1 (harness comparisons): load in place so the engine serves the first frame
-        if (env_uint("D4R_ENGINE_RR_SYNC", 0) != 0)
-            init_engine_backend_rr(slot);
-        else
-            std::thread([slot] { init_engine_backend_rr(slot); }).detach();
-    });
+    const int slot = start_engine_model_rr(feature);
     cudaLacksF = slot == 2 && !denoiser_has_preset_f();
-    const int state = g_engineR.state[slot].load();
+    int state = g_engineR.state[slot].load();
+    if (state == 1 && feature.cudaCreationDeferred)
+    {
+        // No CUDA feature yet: making one for these frames compiles NGX's kernels (44 s with 310.9 on a cold ZLUDA
+        // cache, RE Requiem 2026-10-14; the model was ready 7 ms after the first frame). Wait for the model instead.
+        logf("engine backend (Ray Reconstruction %c): frame %u waits for the model rather than creating the CUDA "
+             "fallback", g_rrLetter[slot], frame);
+        while ((state = g_engineR.state[slot].load()) == 1)
+            d4r_sleep_us(1000);
+    }
     if (state == 1)
     {
-        // still compiling: the CUDA backend serves this frame, the engine is tried again next frame
+        // still compiling and the CUDA feature exists: it serves this frame, the engine is tried again next frame
         if (!feature.rrCompileWarned)
         {
             feature.rrCompileWarned = true;
