@@ -23,6 +23,8 @@ from pathlib import Path, PurePosixPath
 
 # Files the native engine's tools write from NVIDIA's DLSS (engine/README.md); NOTICE names them.
 MODEL_DATA = {'weights.bin', 'offsets.bin', 'lut.bin', 'hipnet.bin', 'model.json'}
+# ... and the M / L and Ray Reconstruction models' (engine/compile_m.py, compile_rr.py, compile_rr2.py)
+MODEL_DATA_PATTERNS = ('weights8.bin', 'weights16.bin', 'weights-*.bin', '*.args', 'enc0-aux.bin', '*.generated.*')
 # Compiled or extracted NVIDIA GPU code.
 NVIDIA_CODE_SUFFIXES = {'.ptx', '.cubin', '.fatbin', '.nvngx'}
 # Kernels kernels/build.sh builds from NVIDIA's PTX (tex/l families and the PTX-translated hiluma kernels).
@@ -62,7 +64,7 @@ def findings_for(path, read, release=None):
     suffix = PurePosixPath(lower).suffix
     full = release == 'full'
     problems = []
-    if lower in MODEL_DATA:
+    if lower in MODEL_DATA or any(fnmatch.fnmatch(lower, pattern) for pattern in MODEL_DATA_PATTERNS):
         problems.append('engine model data read from NVIDIA\'s DLSS')
     if suffix in NVIDIA_CODE_SUFFIXES:
         problems.append('NVIDIA GPU code')

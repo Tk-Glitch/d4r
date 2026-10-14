@@ -24,8 +24,9 @@ What you need
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.
-@installer - Internet access, Bash, curl, sha256sum and 7-Zip to run the included install.sh.
-@installer   NVIDIA DLLs are downloaded during installation, under NVIDIA's terms.
+@installer - Internet access, Bash, curl, sha256sum and 7-Zip to run the included install.sh, and python3
+@installer   with numpy for the engine models it builds. NVIDIA DLLs are downloaded during installation,
+@installer   under NVIDIA's terms.
 @clean - Two NVIDIA files, which this zip does not include:
 @clean   - nvngx_dlss.dll, the DLSS library, version 310.7 or 310.9 (tested: 310.7.0 and 310.9.1).
 @clean     Many games ship one, but often an older version. The d4r kernels check the DLSS code they
@@ -34,7 +35,7 @@ What you need
 @clean     driver 596.36, file version 32.0.15.9636). Extract the driver installer, for example with
 @clean     7-Zip, and look for _nvngx.dll.
 @full - Nothing from NVIDIA: this zip already contains NVIDIA's DLSS library (nvngx_dlss.dll 310.7.0),
-@full   NVIDIA's NGX runtime (_nvngx.dll 32.0.15.9636) and output kernels built from NVIDIA's DLSS code.
+@full    NVIDIA's NGX runtime (_nvngx.dll 32.0.15.9636) and output kernels built from NVIDIA's DLSS code.
 
 
 Install
@@ -50,11 +51,18 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those
    out of the way first. Also remove PROTON_USE_OPTISCALER from the game's launch options if you
    used GE-Proton's built-in OptiScaler: d4r brings its own.
-@installer 2. Run bash install.sh from a terminal (Bash, curl, sha256sum and 7zz/7z/7za required).
-@installer    It downloads DLSS 310.7.0 and the NGX core from official NVIDIA sources, checks SHA-256,
-@installer    and installs d4r/nvngx_dlss.dll and d4r/ngx/_nvngx.dll. No sudo is needed. The driver
-@installer    archive is about 915 MiB; it is extracted, never executed. Downloads are temporary.
-@installer    Run it again to check the files; differing existing DLLs are backed up before replacement.
+@installer 2. Run bash install.sh from a terminal (Bash, curl, sha256sum, 7zz/7z/7za and python3 with numpy
+@installer    required). It downloads DLSS 310.7.0, DLSS Ray Reconstruction 310.9.1 and the NGX core from
+@installer    official NVIDIA sources, checks SHA-256, and installs d4r/nvngx_dlss.dll, d4r/nvngx_dlssd.dll and
+@installer    d4r/ngx/_nvngx.dll. No sudo is needed. The driver archive is about 915 MiB; it is extracted,
+@installer    never executed. Downloads are temporary. Run it again to check the files; differing existing
+@installer    DLLs are backed up before replacement.
+@installer    It then builds the native engine's models in d4r/engine from those DLLs ([Engine] under
+@installer    Settings): Ray Reconstruction D, E and F straight from nvngx_dlssd.dll, and Super Resolution
+@installer    K, M and L (with their LDR variants) by rendering one test frame per model through d4r under
+@installer    GE-Proton 11, found in Steam's compatibility tools (or set D4R_PROTON=/path/to/GE-Proton11-3).
+@installer    The first time this takes a few minutes while DLSS's kernels compile. --no-engine skips it;
+@installer    bash install.sh --engine-only builds the models later, --rebuild-engine builds them again.
 @clean 2. Copy nvngx_dlss.dll into the d4r folder, and _nvngx.dll into d4r/ngx.
 @installer 3. In Steam, open the game's Properties:
 @clean 3. In Steam, open the game's Properties:
@@ -90,25 +98,28 @@ Settings
   gfx12-fp8 kernel folder; set it to false to use f16 widening. The FP8 path has not been tested
   on a real RDNA4 GPU.
 @full - Ray Reconstruction: this zip includes NVIDIA's CUDA-capable denoiser (d4r/nvngx_dlssd.dll
-@full   310.7.0). [RayReconstruction] Enable defaults to auto: when the game turns Ray
-@full   Reconstruction on, d4r runs it through the denoiser. Model = D or E selects a denoiser
-@full   preset explicitly; auto follows the game. RR presets D/E are validated on RX 9070 XT
-@full   (gfx1201) with [Kernels] NativeFp8 = on, the packaged default on RDNA4. Keep NativeFp8 on:
-@full   the scalar FP8 RR path is not validated.
+@full    310.7.0). [RayReconstruction] Enable defaults to auto: when the game turns Ray
+@full    Reconstruction on, d4r runs it through the denoiser. Model = D or E selects a denoiser
+@full    preset explicitly; auto follows the game. RR presets D/E are validated on RX 9070 XT
+@full    (gfx1201) with [Kernels] NativeFp8 = on, the packaged default on RDNA4. Keep NativeFp8 on:
+@full    the scalar FP8 RR path is not validated.
 - If L/M shows extra trails in motion, try [Kernels] NativeSwinEncoders = false with
   PreferAccuracy = true. This uses original translated enc1/enc2 layers while retaining other
   native acceleration. It reduced trails in a captured Townfall sequence on RX 7700 XT and costs
   some GPU time. Restart after changing it; other scenes and RDNA4 hardware still need testing.
-- [Engine] Enabled = true (experimental, off by default) runs DLSS 4 (K) and 4.5 (M and L) on d4r's own
-  Vulkan inference engine: the upscale is recorded into the game's own frame instead of going through CUDA
-  emulation. It needs Mesa RADV with VK_KHR_cooperative_matrix and the models in d4r/engine/k (K),
-  d4r/engine/k-ldr (K in games without HDR), d4r/engine/m and d4r/engine/m-ldr (M), d4r/engine/l and
-  d4r/engine/l-ldr (L). Games and settings it does not cover (other models, display-resolution motion
-  vectors with L or M) keep using the normal path,
-  and d4r/d4r_nvngx.log says which one ran and why. Tested in one game so far.
-  This zip has only the engine's shaders in d4r/engine/k. The weights (weights.bin, offsets.bin,
-  lut.bin) are read from your own nvngx_dlss.dll with the tools in d4r's source repository
-  (engine/README.md); until they are there, d4r uses the normal path.
+- [Engine] Enabled = true (experimental, off by default) runs DLSS 4 (K), 4.5 (M and L) and Ray
+  Reconstruction (D, E and F) on d4r's own Vulkan inference engine: the work is recorded into the game's
+  own frame instead of going through CUDA emulation. It needs Mesa RADV with VK_KHR_cooperative_matrix
+  and the models in d4r/engine: k (K), k-ldr (K in games without HDR), m and m-ldr (M), l and l-ldr (L),
+  rr-d, rr-e and rr-f (Ray Reconstruction). Games and settings it does not cover (other models,
+  display-resolution motion vectors with L or M) keep using the normal path,
+  and d4r/d4r_nvngx.log says which one ran and why. Tested in a few games so far.
+@installer   install.sh builds the models from your NVIDIA DLLs (d4r/tools/build-engine-models.sh). They hold
+@installer   values read from NVIDIA's DLSS: they stay on your machine and must not be shared.
+@full   Build the models with the tools in d4r's source repository (engine/README.md); until they are
+@full   there, d4r uses the normal path.
+@clean   Build the models with the tools in d4r's source repository (engine/README.md); until they are
+@clean   there, d4r uses the normal path.
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
   [Libraries] NvngxPath=d4r\nvngx.dll explicitly selects d4r's shim; OptiDllPath=d4r is also
@@ -201,6 +212,8 @@ sections 15 and 16).
 @full NVIDIA's code (listed in d4r/source/SOURCES.txt) are NVIDIA's property, are not covered by
 @full d4r's license, and are included by whoever distributes this zip, not by NVIDIA.
 
-@installer NVIDIA DLLs are downloaded by install.sh from NVIDIA/DLSS SDK 310.7.0 and driver 596.36.
+@installer NVIDIA DLLs are downloaded by install.sh from NVIDIA/DLSS SDK 310.7.0 and 310.9.1 and driver
+@installer 596.36. The engine models install.sh builds from them in d4r/engine are NVIDIA's data, for your
+@installer own use. d4r/tools/models/bin/glslangValidator is Khronos' glslang 16.6.0 (d4r/licenses).
 @installer The included kernels compiled from NVIDIA PTX remain NVIDIA's property and are not
 @installer covered by d4r's license. See d4r/source/SOURCES.txt for their provenance.

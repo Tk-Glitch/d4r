@@ -140,6 +140,8 @@ if [[ "$VARIANT" != clean ]]; then
     [[ "$INSTALL_MODE" != asi ]] || installer_dir="$STAGE/d4r"
     cp "$ROOT/install.sh" "$installer_dir/install.sh"
     chmod +x "$installer_dir/install.sh"
+    # install.sh builds the engine's models from the downloaded DLLs (D4R_GLSLANG, D4R_GLSLANG_LICENSE)
+    "$ROOT/scripts/stage_engine_kit.sh" "$STAGE/d4r"
     # The downloader is pinned to DLSS 310.7.0: refuse mismatched release inputs.
     expected=$(sed -n "s/^DLSS_SHA256=//p" "$ROOT/install.sh")
     [[ "$(sha256sum "$D4R_BUNDLE_DLSS" | cut -d' ' -f1)" == "$expected" ]] || {
