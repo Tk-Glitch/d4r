@@ -695,8 +695,25 @@ static void load_portable_config()
     // release cannot ship that kernel, which is built from NVIDIA's PTX.
     portable_set("D4R_SHIM_OUTPUT_DIRECT", ini_flag(ini, "interop", "DirectOutput", nativeOn) ? "1" : "0");
 
-    // [Engine]: d4r's own Vulkan inference for DLSS 4 (K); the model is looked up in d4r\engine\k
-    portable_set("D4R_ENGINE", ini_flag(ini, "engine", "Enabled", 0) ? "1" : "0");
+    // [Engine]: d4r's own Vulkan inference (K, L, M and Ray Reconstruction); the models are looked up in d4r\engine.
+    // Enabled = auto (the default) runs it when install.sh built a model there: it is the faster path, and a model
+    // the device cannot run, or a feature no model covers, still goes to the CUDA backend (d4r_nvngx.log says why).
+    {
+        const std::string enabled = ascii_lower(ini_value(ini, "engine", "Enabled"));
+        bool on = false;
+        if (enabled.empty() || enabled == "auto")
+        {
+            for (const wchar_t* model : {L"k", L"k-ldr", L"m", L"m-ldr", L"l", L"l-ldr", L"rr-d", L"rr-e", L"rr-f"})
+            {
+                const DWORD attributes = GetFileAttributesW((dir + L"\\engine\\" + model).c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
+                    on = true;
+            }
+        }
+        else
+            on = ini_flag(ini, "engine", "Enabled", 0) != 0;
+        portable_set("D4R_ENGINE", on ? "1" : "0");
+    }
     if (const std::string engineModel = ini_value(ini, "engine", "ModelDir"); !engineModel.empty())
         portable_set(L"D4R_ENGINE_MODEL_DIR", portable_path(engineModel));
     // Network: the network on the engine's Vulkan shader ("vulkan", and the default: "auto") or on the native HIP

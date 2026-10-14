@@ -57,13 +57,14 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 @installer    d4r/ngx/_nvngx.dll. No sudo is needed. The driver archive is about 915 MiB; it is extracted,
 @installer    never executed. Downloads are temporary. Run it again to check the files; differing existing
 @installer    DLLs are backed up before replacement.
-@installer    It then builds the native engine's models in d4r/engine from those DLLs ([Engine] under
-@installer    Settings): Ray Reconstruction D, E and F straight from nvngx_dlssd.dll, and Super Resolution
-@installer    K, M and L (with their LDR variants) by rendering one test frame per model through d4r under
-@installer    GE-Proton 11, found in Steam's compatibility tools (or set D4R_PROTON=/path/to/GE-Proton11-3).
-@installer    The first time this takes a few minutes while DLSS's kernels compile. --no-engine skips it;
-@installer    bash install.sh --engine-only builds the models later, --rebuild-engine builds them again.
-@clean 2. Copy nvngx_dlss.dll into the d4r folder, and _nvngx.dll into d4r/ngx.
+@installer    Verified copies are kept in ~/.cache/d4r/nvidia, so installing d4r in the next game needs no
+@installer    download. install.sh then asks whether to set up d4r's own DLSS engine (recommended: faster,
+@installer    lower latency). That builds the engine's models in d4r/engine from the DLLs: Ray Reconstruction
+@installer    D, E and F straight from nvngx_dlssd.dll, and Super Resolution K, M and L (with their LDR
+@installer    variants) by rendering one test frame per model through d4r under GE-Proton 11, found in Steam's
+@installer    compatibility tools (or set D4R_PROTON=/path/to/GE-Proton11-3). It takes a minute or two once;
+@installer    the models are kept in ~/.cache/d4r/engine-models for the next game. bash install.sh --help lists
+@installer    options for scripted installs.
 @installer 3. In Steam, open the game's Properties:
 @clean 3. In Steam, open the game's Properties:
 @full 2. In Steam, open the game's Properties:
@@ -107,9 +108,10 @@ Settings
   PreferAccuracy = true. This uses original translated enc1/enc2 layers while retaining other
   native acceleration. It reduced trails in a captured Townfall sequence on RX 7700 XT and costs
   some GPU time. Restart after changing it; other scenes and RDNA4 hardware still need testing.
-- [Engine] Enabled = true (experimental, off by default) runs DLSS 4 (K), 4.5 (M and L) and Ray
-  Reconstruction (D, E and F) on d4r's own Vulkan inference engine: the work is recorded into the game's
-  own frame instead of going through CUDA emulation. It needs Mesa RADV with VK_KHR_cooperative_matrix
+- [Engine] runs DLSS 4 (K), 4.5 (M and L) and Ray Reconstruction (D, E and F) on d4r's own Vulkan
+  inference engine: the work is recorded into the game's own frame instead of going through CUDA
+  emulation, which is faster. Enabled = auto (the default) uses it whenever its models are in d4r/engine;
+  true / false force it on / off. It needs Mesa RADV with VK_KHR_cooperative_matrix
   and the models in d4r/engine: k (K), k-ldr (K in games without HDR), m and m-ldr (M), l and l-ldr (L),
   rr-d, rr-e and rr-f (Ray Reconstruction). Games and settings it does not cover (other models,
   display-resolution motion vectors with L or M) keep using the normal path,
@@ -197,7 +199,7 @@ Uninstall
 ---------
 Delete dxgi.dll, OptiScaler.ini, OptiScaler.log (if present), d3d12.dll, d3d12core.dll,
 D4R_README.txt, install.sh (if present) and the d4r folder from the game folder, and clear the launch options. The kernel
-cache in ~/.cache/d4r can be deleted too.
+cache in ~/.cache/d4r can be deleted too; it also holds install.sh's copies of the NVIDIA DLLs and the engine models.
 
 
 Licenses

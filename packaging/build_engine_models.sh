@@ -2,7 +2,8 @@
 # Builds the native engine's models ([Engine] in d4r.ini) on this machine, from the NVIDIA DLLs install.sh put in
 # the d4r folder. Shipped as d4r/tools/build-engine-models.sh; install.sh runs it.
 #
-# usage: bash d4r/tools/build-engine-models.sh [--rr-only | --sr-only] [D4R_FOLDER]
+# usage: bash d4r/tools/build-engine-models.sh [--rr-only | --sr-only] [--exact] [D4R_FOLDER]
+#        bash d4r/tools/build-engine-models.sh --find-proton      prints the GE-Proton it would use (or nothing)
 #
 #   Ray Reconstruction  engine/rr-d, rr-e, rr-f   from d4r/nvngx_dlssd.dll 310.9.1 alone (about half a minute)
 #   Super Resolution    engine/k, k-ldr, m, m-ldr, l, l-ldr
@@ -11,19 +12,41 @@
 #                       GE-Proton, and the uploads are saved (a minute or two each; the first run also compiles
 #                       DLSS's kernels and creates a temporary Proton prefix)
 # Needs python3 with numpy, and for Super Resolution a GE-Proton (D4R_PROTON=/path/to/GE-Proton11-3 to choose one).
+# The models are the fastest builds (this GPU's own arithmetic; engine/README.md). --exact builds NVIDIA's roundings
+# instead: bit-identical to the CUDA path, about 20% slower (K is the same either way).
 # Everything written is derived from NVIDIA's DLLs: it stays in this folder and must not be redistributed.
 set -euo pipefail
 
 fail() { printf 'build-engine-models: %s\n' "$*" >&2; exit 1; }
-DO_RR=1 DO_SR=1
+DO_RR=1 DO_SR=1 FIND_PROTON=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rr-only) DO_SR=0; shift ;;
     --sr-only) DO_RR=0; shift ;;
-    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --exact) export D4R_RR_RELAXED=0 M_EXACT=1; shift ;;
+    --find-proton) FIND_PROTON=1; shift ;;
+    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) break ;;
   esac
 done
+find_proton() {
+  # a GE-Proton: D4R_PROTON, else GE-Proton11-3 (the tested one), else the newest stock GE-Proton11-N in Steam's
+  # compatibility tools. Renamed or rebuilt variants (2026-10-14: one with a suffix after the version number) can
+  # fail NGX's CUDA initialisation, so they are only used when named.
+  PROTON="${D4R_PROTON:-}"
+  if [[ -z "$PROTON" ]]; then
+    best=-1
+    for d in "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.steam/steam" \
+             "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+      for p in "$d"/compatibilitytools.d/GE-Proton11-*; do
+        n="${p##*/GE-Proton11-}"
+        [[ -x "$p/proton" && "$n" =~ ^[0-9]+$ ]] || continue
+        if [[ "$n" == 3 ]]; then best=1000; PROTON="$p"; elif (( n > best )); then best=$n; PROTON="$p"; fi
+      done
+    done
+  fi
+}
+if (( FIND_PROTON )); then find_proton; [[ -z "$PROTON" ]] || printf '%s\n' "$PROTON"; exit 0; fi
 TOOLS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 KIT="$TOOLS/models"
 RUNTIME="$(cd -- "${1:-$TOOLS/..}" && pwd)"
@@ -82,21 +105,7 @@ if (( DO_SR )); then
   DLL="$RUNTIME/nvngx_dlss.dll"
   [[ -f "$DLL" && "$(sha "$DLL")" == "$DLSS_SHA256" ]] || fail "Super Resolution models need nvngx_dlss.dll 310.7.0 in $RUNTIME (run install.sh)"
   [[ -f "$RUNTIME/ngx/_nvngx.dll" ]] || fail "missing $RUNTIME/ngx/_nvngx.dll (run install.sh)"
-  # a GE-Proton: D4R_PROTON, else GE-Proton11-3 (the tested one), else the newest stock GE-Proton11-N in Steam's
-  # compatibility tools. Renamed or rebuilt variants (2026-10-14: one with a suffix after the version number) can
-  # fail NGX's CUDA initialisation, so they are only used when named.
-  PROTON="${D4R_PROTON:-}"
-  if [[ -z "$PROTON" ]]; then
-    best=-1
-    for d in "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.steam/steam" \
-             "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
-      for p in "$d"/compatibilitytools.d/GE-Proton11-*; do
-        n="${p##*/GE-Proton11-}"
-        [[ -x "$p/proton" && "$n" =~ ^[0-9]+$ ]] || continue
-        if [[ "$n" == 3 ]]; then best=1000; PROTON="$p"; elif (( n > best )); then best=$n; PROTON="$p"; fi
-      done
-    done
-  fi
+  find_proton
   [[ -n "$PROTON" && -x "$PROTON/proton" ]] ||
     fail 'no GE-Proton found: set D4R_PROTON=/path/to/GE-Proton11-3 (the folder holding the proton script)'
   STEAM_ROOT="$(dirname -- "$(dirname -- "$PROTON")")"
