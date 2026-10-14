@@ -755,8 +755,12 @@ conversion inputs up to the output size. Use a K package with all sixteen recons
 upscaling ratios; older single-table packages cannot match NGX at every ratio.
 
 L and M update the Vulkan network's active token grid, exposure grid and reconstruction tier per frame.
-Their input and history planes reserve the constructor's render capacity; the shim reserves output-sized
-capacity for the Vulkan path. Bilinear reads clamp to the active rectangle. A render-size change resets
+Their input and history planes reserve the constructor's render capacity. The shim reserves the render size the
+feature was created with (or the first frame's, when larger), as NGX does; a later frame beyond that goes to a second,
+output-sized Vulkan engine, and the first is kept until the feature is released. Reserving the output size for every
+feature cost 0.85 GB (M) and 1.08 GB (L) at 1280x720 -> 4K; the images are byte-identical either way (harness,
+2026-10-14: created 1280x720 with 854x480 frames, created 854x480 with 1280x720 frames, and the second engine
+forced). Bilinear reads clamp to the active rectangle. A render-size change resets
 L/M temporal history. Input dimensions must be at least 64 on each axis and cannot exceed the output.
 Standalone callers set `GameFrameM::renderWidth/renderHeight` or `MFrameSettings::renderWidth/renderHeight`;
 zero keeps the constructor size.

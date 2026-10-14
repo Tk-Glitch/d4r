@@ -8736,12 +8736,17 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
                                                    model->hasExternalNetworkStages(), p.renderWidth, p.renderHeight,
                                                    bytes, bytes);
             const d4r::ExternalNetwork external = {feature.engineTokens.buffer, feature.engineHead.buffer};
+            // The Vulkan network of a dynamic-resolution model reserves the render size the feature was created with
+            // (NGX's maximum; at least this frame's), not the output size: at 1280x720 -> 4K that is 1.1 GB less for
+            // M and 1.4 GB for L. A larger frame goes to the output-sized engine below (engineMDynamic).
+            const bool dynamic = !hip && model->hasDynamicResolution();
+            const uint32_t capacityWidth = dynamic ? std::min(feature.outWidth, std::max(feature.width, p.renderWidth)) : p.renderWidth;
+            const uint32_t capacityHeight = dynamic ? std::min(feature.outHeight, std::max(feature.height, p.renderHeight)) : p.renderHeight;
             feature.engineM = std::make_unique<d4r::GameUpscalerM>(*model, g_vk.physical, g_vk.device, feature.outWidth,
-                                                                   feature.outHeight, (hip || !model->hasDynamicResolution()) ? p.renderWidth : feature.outWidth,
-                                                                   (hip || !model->hasDynamicResolution()) ? p.renderHeight : feature.outHeight,
+                                                                   feature.outHeight, capacityWidth, capacityHeight,
                                                                    hip ? &external : nullptr);
-            feature.engineMRenderWidth = p.renderWidth;
-            feature.engineMRenderHeight = p.renderHeight;
+            feature.engineMRenderWidth = capacityWidth;
+            feature.engineMRenderHeight = capacityHeight;
             logf("engine backend (%s): feature %u runs preset %s in the game's command list (%ux%u -> %ux%u), network on %s, RGB10A2 direct output %d",
                  name, feature.handle.Id, name, p.renderWidth, p.renderHeight, feature.outWidth, feature.outHeight,
                  hip ? "the native HIP layers (list split around it)" : "Vulkan",
@@ -8758,9 +8763,12 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
         return refuse("the engine could not be created");
     }
     d4r::GameUpscalerM* adapter = feature.engineM.get();
+    // the HIP network's grid is fixed; the Vulkan engine takes render sizes up to the one it reserved
     const bool resizedHip = feature.engineNet != nullptr &&
         (p.renderWidth != feature.engineMRenderWidth || p.renderHeight != feature.engineMRenderHeight);
-    if (resizedHip)
+    const bool beyondCapacity = feature.engineNet == nullptr &&
+        (p.renderWidth > feature.engineMRenderWidth || p.renderHeight > feature.engineMRenderHeight);
+    if (resizedHip || beyondCapacity)
     {
         try
         {
@@ -8768,7 +8776,9 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
             {
                 feature.engineMDynamic = std::make_unique<d4r::GameUpscalerM>(*model, g_vk.physical, g_vk.device,
                     feature.outWidth, feature.outHeight, feature.outWidth, feature.outHeight);
-                logf("engine backend (%s): dynamic render sizes use the Vulkan network; original HIP resources retained", name);
+                logf("engine backend (%s): render size %ux%u beyond %ux%u: an output-sized Vulkan engine takes such frames; "
+                     "the original engine is retained", name, p.renderWidth, p.renderHeight, feature.engineMRenderWidth,
+                     feature.engineMRenderHeight);
             }
             adapter = feature.engineMDynamic.get();
         }

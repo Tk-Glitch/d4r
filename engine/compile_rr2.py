@@ -147,8 +147,8 @@ def main():
             subprocess.run([sys.executable, str(HERE / 'rr' / 'rr2_pack.py'), stage, a.native, str(out / weights),
                             str(work / 'rr2_stage.h')], check=True, stdout=subprocess.DEVNULL)
             defs = ['-DRR_EXACT_CONVERT'] + (['-DRR_MIX'] if os.environ.get('D4R_RR_MIX') == '1' else []) + FUSE_DEFS + RELAX_DEFS
-            # encoder 0 in two passes (gen_rr2_enc0.py --split): its gather as the stage enc0g, whose record's address
-            # is a word appended to the argument block
+            # encoder 0 in two passes (gen_rr2_enc0.py --split): its gather as the stage enc0g, whose records' place
+            # (three ranges) is six words appended to the argument block
             split = stage == 'enc0' and SPLIT and GROUP == 1
             how = ['--split', 'block', '--xf-word', str((len(launch.args) + 7) // 8 * 2)] if split else ['--group', str(GROUP)]
             if split:
@@ -186,7 +186,7 @@ def main():
             (out / 'enc0-aux.bin').write_bytes(launch.pre(launch.pointer(104).alloc))
         args = stage_params(launch, 24 if network else 9999)[:len(launch.args)]
         if hybrid and split:
-            args = args + bytes(-len(args) % 8) + bytes(8)   # the gather record's address (the runtime's)
+            args = args + bytes(-len(args) % 8) + bytes(24)   # the gather records' three ranges (the runtime's)
         (out / f'{stage}.args').write_bytes(args)
         # the stage's arena regions, in units of 1/3152 of NGX's arena (W0 * H0 / 32 bytes: the regions scale with it)
         arena = launch.arena_alloc
@@ -203,8 +203,8 @@ def main():
         wave = 32 if network else 64
         lines.append(f'stage {stage} {stage}.spv {wave} {weights} {stage}.args {tex} {surf} {buf} {",".join(ptrs) or "-"}' +
                      (f' x{GROUP}' if hybrid and GROUP > 1 else ''))   # windows per workgroup (engine/rr/gen_rr2_enc0.py)
-        if hybrid and split:   # the same block, bindings and regions; "rN": N words per window record
-            lines.append(f'stage enc0g enc0g.spv 32 - {stage}.args {tex} {surf} {buf} {",".join(ptrs) or "-"} r{record}')
+        if hybrid and split:   # the same block, bindings and regions; "rN": N words per window record, "s3": in three ranges
+            lines.append(f'stage enc0g enc0g.spv 32 - {stage}.args {tex} {surf} {buf} {",".join(ptrs) or "-"} r{record} s3')
         print(f'{stage}: {kernel}, {len(launch.args)} argument bytes' + (' (native block)' if hybrid else ''))
     for p in (0, 1):
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', f'-DPASS={p}',

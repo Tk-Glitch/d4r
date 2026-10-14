@@ -81,7 +81,8 @@ struct RModel::Impl {
     // surface argument offsets with their GLSL image format, both ascending
     std::array<std::vector<uint32_t>, RStages> textures;
     std::array<std::vector<std::pair<uint32_t, std::string>>, RStages> surfaces;
-    std::array<Buffer, RStages> weights, uploads;
+    std::array<Buffer, RStages> weights;
+    std::array<std::vector<char>, RStages> weightBytes;   // until recordUpload
     std::array<Pipeline, RStages> stages;
     std::array<Pipeline, 2> exposure;
     std::vector<uint8_t> enc0Template, hkpnTemplate;
@@ -140,8 +141,7 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
             auto blob = read(directory + "/" + weightFile);
             const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             m.weights[stage].create(m.device, blob.size(), usage);
-            m.uploads[stage].create(m.device, blob.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-            std::memcpy(m.uploads[stage].mapped, blob.data(), blob.size());
+            m.weightBytes[stage] = std::move(blob);
             ++stage;
         } else if (key == "template") {
             std::string which, file; f >> which >> file;
@@ -169,8 +169,7 @@ void RModel::recordUpload(VkCommandBuffer cb) {
         return;
     }
     for (unsigned i = 0; i < RStages; ++i) {
-        VkBufferCopy copy{0, 0, m.uploads[i].size};
-        vkCmdCopyBuffer(cb, m.uploads[i].handle, m.weights[i].handle, 1, &copy);
+        recordContents(cb, m.weights[i], m.weightBytes[i]);
     }
     memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     m.uploaded = true;
@@ -188,7 +187,8 @@ struct REngine::Impl {
     std::array<Tex, 5> d112, d120;  // the decoders' surfaces (texture 88 of the next decoder; dec0's 112: output stage)
     std::array<Tex, 2> q, r, h, e;  // ping-pong: enc0's 304 / 224, dec0's 144 / enc0's 488, the output-size history,
                                     // and e: this frame's and the previous frame's exposure (1x1)
-    Tex out;                        // the presented image (the output stage's surface 240)
+    Tex out;                        // the presented image (the output stage's surface 240) when the caller passes none
+    bool outNew = false;            // created by setFrame (first frame without the caller's output)
     // the output stage's second history (surface 384, read back as texture 392), kept only for games that pass
     // DLSSD.ColorBeforeParticles; created on first use
     Tex pb[2];
@@ -316,7 +316,6 @@ REngine::REngine(RModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
         e.h[i].create(d, e.ow, e.oh, half4);
         e.e[i].create(d, 1, 1, VK_FORMAT_R16_SFLOAT);
     }
-    e.out.create(d, e.ow, e.oh, half4);
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; si.maxLod = 0;
     VKCHECK(vkCreateSampler(d.handle, &si, nullptr, &e.nearest));
@@ -367,7 +366,7 @@ std::vector<REngine::DebugImage> REngine::debugImages() const {
         list.push_back({"h" + std::to_string(i), e.h[i].handle, half4, e.ow, e.oh});
         list.push_back({"e" + std::to_string(i), e.e[i].handle, VK_FORMAT_R16_SFLOAT, 1, 1});
     }
-    list.push_back({"out", e.out.handle, half4, e.ow, e.oh});
+    if (e.out.handle) list.push_back({"out", e.out.handle, half4, e.ow, e.oh});
     return list;
 }
 
@@ -378,7 +377,6 @@ void REngine::recordInitialize(VkCommandBuffer cb) {
     for (auto* group : {&e.s112, &e.s120}) for (auto& t : *group) images.push_back(t.handle);
     for (auto* group : {&e.s128, &e.d112, &e.d120}) for (auto& t : *group) images.push_back(t.handle);
     for (auto* group : {&e.q, &e.r, &e.h, &e.e}) for (auto& t : *group) images.push_back(t.handle);
-    images.push_back(e.out.handle);
     images.push_back(e.zero.handle);
     for (auto& [format, t] : e.spare) images.push_back(t.handle);
     VkClearColorValue zero{};
@@ -481,14 +479,19 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
         for (auto& t : e.pb) t.create(d, e.ow, e.oh, VK_FORMAT_R16G16B16A16_SFLOAT);
         e.pbNew = true;
     }
+    if (!finalOutput.view && !e.out.handle) {
+        e.out.create(d, e.ow, e.oh, VK_FORMAT_R16G16B16A16_SFLOAT);
+        e.outNew = true;
+    }
+    const VkImageView frameOutput = finalOutput.view ? finalOutput.view : e.out.view;
     // texture and surface handles of the two stages with optional inputs: 1 where something is bound, 0 where NGX
     // leaves the argument null. The kernels branch on that (enc0 takes its specular hit distance path only when
     // argument 248's handle is not null; capDX, 2026-10-12).
     for (unsigned stage : {static_cast<unsigned>(REnc0), static_cast<unsigned>(RHkpn)}) {
         for (uint32_t offset : e.model.textures[stage])
-            put64(e.blocks[stage], offset, e.resolve(stage, false, offset, 0, images, e.out.view).view ? 1u : 0u);
+            put64(e.blocks[stage], offset, e.resolve(stage, false, offset, 0, images, frameOutput).view ? 1u : 0u);
         for (const auto& [offset, format] : e.model.surfaces[stage])
-            put64(e.blocks[stage], offset, e.resolve(stage, true, offset, 0, images, e.out.view).view ? 1u : 0u);
+            put64(e.blocks[stage], offset, e.resolve(stage, true, offset, 0, images, frameOutput).view ? 1u : 0u);
     }
     auto same = [&](const Impl::Bindings& b) {
         return !std::memcmp(&b.images, &images, sizeof(images)) && b.finalOutput.view == finalOutput.view;
@@ -509,7 +512,7 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pi.maxSets = 2 * RStages + 1; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
         VKCHECK(vkCreateDescriptorPool(d.handle, &pi, nullptr, &b.pool));
-        const VkImageView output = finalOutput.view ? finalOutput.view : e.out.view;
+        const VkImageView output = frameOutput;
         for (unsigned stage = 0; stage < RStages; ++stage) {
             for (uint32_t par = 0; par < 2; ++par) {
                 VkDescriptorSet set = b.stages[stage][par] = descriptorSet(d.handle, b.pool, e.model.stages[stage].descriptors);
@@ -558,17 +561,12 @@ void REngine::recordFrame(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     };
-    if (e.pbNew) {   // the particle history starts from zero, like the rest of the temporal state
-        VkClearColorValue zero{};
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        for (auto& t : e.pb) {
-            imageBarrier(cb, t.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-            vkCmdClearColorImage(cb, t.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
-        }
+    if (e.pbNew || e.outNew) {   // images created by setFrame start from zero, like the rest of the temporal state
+        if (e.pbNew) for (auto& t : e.pb) clearNewImage(cb, t.handle);
+        if (e.outNew) clearNewImage(cb, e.out.handle);
         memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        e.pbNew = false;
+        e.pbNew = e.outNew = false;
     }
     stamp(0);
     // the frame's parameter blocks, then (on a reset) a clean temporal state

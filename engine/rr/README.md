@@ -312,7 +312,7 @@ how the passes were arranged:
 - **Encoder 0 in two passes** (-0.2 ms). One shader ran NVIDIA's 32-lane gather on one of the block's four waves
   while the other three waited: 0.40 ms for the gather, 0.24 ms as a pass of its own in 32-thread groups.
   `gen_rr2_enc0.py --split gather | block` writes both; the gather pass (`stage enc0g`, the same bindings and
-  parameter block as enc0) stores each window's record in the arena after the tile slots: the first product's A
+  parameter block as enc0) stores each window's record in the arena buffer (see Memory below): the first product's A
   fragments (1024 words) and, per lane, the values the tail reads from the gather (six binary16 on the reference
   build; the generator finds them and recomputes the tail's index arithmetic). The record's address is a word
   compile_rr2.py appends to enc0's argument block. Cost: 76 bytes per render pixel of arena.
@@ -353,6 +353,33 @@ scripts/run_rr_engine_compare.sh`, frames aligned by one):
   rounds, a last-bit difference in a few elements. With a non-identity camera, hit distance and mask bound and a
   moving scene that showed as 40 - 50 dB on later frames in a synthetic scene whose affected feature is rounding
   noise around zero in both paths; no other configuration was affected.
+
+### Memory (2026-10-14)
+
+At 1280x720 -> 4K the engine needs about 600 MB for preset F; the two 1.5x output histories (2 x 149 MB, NGX has
+the same) are half of it. NVIDIA's DLL, its allocations traced through the CUDA path and replayed on an RTX PRO 4500
+Blackwell, takes 526 MiB of feature state, 106 MiB of input / output arrays and 2 MiB of code, plus 262 MiB of CUDA
+context. Three cuts, every capture still byte-identical (`verify.sh`, `verify_x.sh`) and the shim's frames
+byte-identical to the previous build, same speed:
+
+- **The tile slots share the arena with the network's regions.** Every arena region is written and read within one
+  frame; in the output stage only the network's output (dec0_1's argument 64) and something after it are read, so
+  the slots that fit before the network's output go there (all 8 at 720p -> 4K) and the rest after the arena. A
+  first try that put the slots right after the network's output broke 360p -> 1080p's output stage.
+- **The gather records' rows of windows fill the gaps between encoder 0's regions**: the two largest (units
+  1216 - 2240 and 2304 - 2560) and then from the end of its last region (unit 2816) on, instead of one piece after
+  the tile slots. The records (76 bytes a render pixel, about 2450 units) are larger than all the gaps, so 46 of 93
+  rows at 720p still reach past the arena (36 MB). Models from compile_rr2.py mark this with "s3" on the enc0g line
+  and append six words to enc0's block (three ranges' addresses, the first two's rows; `gen_rr2_enc0.py`); older
+  models keep the one-piece layout. Same speed as one piece (four alternating runs at 720p -> 4K).
+- **The engine's own output image is created only for frames that do not write the game's texture**, and the
+  weights go into the command buffer with `vkCmdUpdateBuffer` instead of through a host-visible staging copy that
+  stayed allocated.
+
+Through the shim (direct output) the harness process peaks 159 MiB lower (1100 -> 941 MiB). Not exact, so not
+done: the pooled histories as RGB10A2 (`D4R_RR2_POOLED=rgb10_a2`, -70 MB, see above); they hold q / 1023, which
+neither binary16 nor UNORM16 represents exactly. `D4R_ENGINE_RR_ARENA`
+keeps the old separate layout, so that arena dumps show the network's regions as NGX leaves them.
 
 ## Against a real NVIDIA card: `D4R_RR_FUSE` (2026-10-13)
 

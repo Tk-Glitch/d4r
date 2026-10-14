@@ -68,7 +68,8 @@ void bindRange(VkDevice device, VkDescriptorSet set, uint32_t binding, const Buf
 
 struct MModel::Impl {
     Device device;
-    Buffer w8, w16, up8, up16;
+    Buffer w8, w16;
+    std::vector<char> bytes8, bytes16;   // until recordUpload
     uint32_t enc0[3]{}, dec0[2]{};
     std::array<std::array<uint32_t, 74>, MLayers> layers{};
     std::array<Pipeline, MLayers> network;      // one per layer (five distinct shaders)
@@ -115,8 +116,7 @@ MModel::MModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
     for (auto& l : m.layers) inside(l[0], l[1]);
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     m.w8.create(m.device, b8.size(), usage); m.w16.create(m.device, b16.size(), usage);
-    m.up8.create(m.device, b8.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true); m.up16.create(m.device, b16.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    std::memcpy(m.up8.mapped, b8.data(), b8.size()); std::memcpy(m.up16.mapped, b16.data(), b16.size());
+    m.bytes8 = b8; m.bytes16 = b16;
     const auto b = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     for (unsigned i = 0; i < MLayers; ++i) m.network[i].create(device, directory + "/" + MShader[i] + ".spv", {b,b,b,b,b,b,b}, 32, cache);
     // layer_m.comp's L stages: bindings 0-6 of a layer, then the stage's own (layer_m.comp KIND 3 and 4)
@@ -149,8 +149,7 @@ bool MModel::isPresetL() const { return impl->presetL; }
 void MModel::recordUpload(VkCommandBuffer cb) {
     auto& m = *impl;
     if (m.uploaded) throw std::runtime_error("model upload already recorded");
-    VkBufferCopy copy{0, 0, m.up8.size}; vkCmdCopyBuffer(cb, m.up8.handle, m.w8.handle, 1, &copy);
-    copy.size = m.up16.size; vkCmdCopyBuffer(cb, m.up16.handle, m.w16.handle, 1, &copy);
+    recordContents(cb, m.w8, m.bytes8); recordContents(cb, m.w16, m.bytes16);
     memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     m.uploaded = true;
 }
@@ -163,7 +162,9 @@ struct MEngine::Impl {
     Buffer tokens, skip1, merged1, skip2, merged2, tubeA, tubeB, dec2Out, dec1Out;
     Buffer skipL, enc0LP, dec0LP;               // preset L: the input stage's pixel output and the two stages' layer blocks
     std::array<Tex, 2> mvA, feat, hist, half;
-    Tex mvB, mvC, gates, mix, cov, output;
+    Tex mvB, mvC, gates, mix, cov;
+    Tex output;   // the engine's own output: only for frames that do not write the caller's image (created on first use)
+    bool outputNew = false;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, MLayers> layerSets{};
     std::array<VkDescriptorSet, 2> enc0Sets{}, dec0Sets{}, postSets{}, expSets{};
@@ -233,7 +234,6 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     for (auto& t : e.hist) t.create(d, e.hw, e.hh, VK_FORMAT_R16G16B16A16_SFLOAT);
     // The native formatted RGB10 history has RGBA32F backing. UNORM filtering differs by up to three ulps.
     for (auto& t : e.half) t.create(d, e.hw / 2, e.hh / 2, VK_FORMAT_R32G32B32A32_SFLOAT);
-    e.output.create(d, outputWidth, outputHeight, VK_FORMAT_R16G16B16A16_SFLOAT);
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 48}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 24; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
@@ -305,14 +305,14 @@ MEngine::MEngine(MModel& model, uint32_t renderWidth, uint32_t renderHeight, uin
     bindBuffer(dev, e.expSets[1], 1, e.expSums); bindBuffer(dev, e.expSets[1], 2, e.expState);
     bindBuffer(dev, e.expSets[1], 3, e.enc0P); bindBuffer(dev, e.expSets[1], 4, e.postP); bindBuffer(dev, e.expSets[1], 5, e.downP);
     e.downSet = descriptorSet(dev, e.pool, m.down.descriptors);
-    bindBuffer(dev, e.downSet, 0, e.downP); bindImage(dev, e.downSet, 2, e.output.view); bindBuffer(dev, e.downSet, 3, e.packed);
+    bindBuffer(dev, e.downSet, 0, e.downP); bindBuffer(dev, e.downSet, 3, e.packed);   // binding 2, the output: setFrame
 }
 MEngine::~MEngine() = default;
 void MEngine::recordInitialize(VkCommandBuffer cb) {
     auto& e = *impl;
     if (e.initialized) throw std::runtime_error("engine initialization already recorded");
     VkClearColorValue zero{}; VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    for (Tex* t : {&e.mvA[0], &e.mvA[1], &e.mvB, &e.mvC, &e.feat[0], &e.feat[1], &e.gates, &e.mix, &e.cov, &e.hist[0], &e.hist[1], &e.half[0], &e.half[1], &e.output}) {
+    for (Tex* t : {&e.mvA[0], &e.mvA[1], &e.mvB, &e.mvC, &e.feat[0], &e.feat[1], &e.gates, &e.mix, &e.cov, &e.hist[0], &e.hist[1], &e.half[0], &e.half[1]}) {
         imageBarrier(cb, t->handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
         vkCmdClearColorImage(cb, t->handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
     }
@@ -358,6 +358,10 @@ void MEngine::setFrame(const FrameImages& images, const MFrameSettings& s, Frame
     e.prevJitter[0] = s.jitter[0]; e.prevJitter[1] = s.jitter[1];
     auto dev = e.model.device.handle;
     auto& m = e.model;
+    if (!finalOutput.view && !e.output.handle) {
+        e.output.create(e.model.device, e.ow, e.oh, VK_FORMAT_R16G16B16A16_SFLOAT);
+        e.outputNew = true;
+    }
     auto found = std::find_if(e.bindings.begin(), e.bindings.end(), [&](const auto& b) {
         return b.images.color == images.color && b.images.motion == images.motion && b.images.depth == images.depth &&
             b.images.colorLayout == images.colorLayout && b.images.motionLayout == images.motionLayout &&
@@ -446,6 +450,7 @@ void closeStages(VkCommandBuffer cb) { memoryBarrier(cb, compute, VK_PIPELINE_ST
 void MEngine::recordFront(VkCommandBuffer cb, VkQueryPool stamps, uint32_t first) {
     auto& e = *impl; auto& m = e.model;
     if (!e.initialized || !m.uploaded || !e.frameSet || e.frontDone) throw std::runtime_error("initialize/upload/setFrame before recording inference");
+    if (e.outputNew) { clearNewImage(cb, e.output.handle); e.outputNew = false; }
     openStages(cb);
     vkCmdUpdateBuffer(cb, e.enc0P.handle, 0, sizeof(e.enc0), &e.enc0); vkCmdUpdateBuffer(cb, e.dec0P.handle, 0, sizeof(e.dec0), &e.dec0);
     vkCmdUpdateBuffer(cb, e.postP.handle, 0, sizeof(e.post), &e.post); vkCmdUpdateBuffer(cb, e.downP.handle, 0, sizeof(e.down), &e.down);

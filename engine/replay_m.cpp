@@ -127,7 +127,11 @@ int main(int argc, char** argv) try {
             network = std::make_unique<d4r::HipNetwork>(model, rw, rh, tokens.fd, result.fd, tokens.allocation, result.allocation);
         }
 #endif
-        d4r::MEngine engine(m, rw, rh, ow, oh, hip ? &external : nullptr);
+        // D4R_M_CAPACITY=WxH: the engine reserves a larger render size than the frames use (dynamic resolution, as a
+        // shim reserving more than the feature's size would)
+        uint32_t cw = rw, ch = rh;
+        if (const char* capacity = std::getenv("D4R_M_CAPACITY")) std::sscanf(capacity, "%ux%u", &cw, &ch);
+        d4r::MEngine engine(m, cw, ch, ow, oh, hip ? &external : nullptr);
         Image color = image(c, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT), motion = image(c, rw, rh, VK_FORMAT_R16G16_SFLOAT), depth = image(c, rw, rh, VK_FORMAT_R32_SFLOAT);
         const VkDeviceSize sizes[3] = {VkDeviceSize(rw) * rh * 8, VkDeviceSize(rw) * rh * 4, VkDeviceSize(rw) * rh * 4};
         Staging in[3] = {staging(c, sizes[0]), staging(c, sizes[1]), staging(c, sizes[2])}, out = staging(c, VkDeviceSize(ow) * oh * 8);
@@ -162,6 +166,7 @@ int main(int argc, char** argv) try {
                 if (pass == 0 || frames > 1)
                     for (int k = 0; k < 3; ++k) vkCmdCopyBufferToImage(cb, in[k].buffer, images[k]->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
                 d4r::MFrameSettings s; s.jitter[0] = std::atof(a[3]); s.jitter[1] = std::atof(a[4]); s.reset = (pass == 0 && f == 0) || resetAll;
+                s.renderWidth = rw; s.renderHeight = rh;
                 const double t0 = now();
                 engine.setFrame({color.view, motion.view, depth.view}, s);
                 vkCmdResetQueryPool(cb, qp, 0, 7);

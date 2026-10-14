@@ -117,8 +117,15 @@ def split_layout(xf_word, pre, tail, f16vars):
         if not (v in f16vars or re.fullmatch(r'r\d+', v)):
             raise SystemExit(f'the tail reads {v} from the gather: not a 16- or 32-bit register')
     record = 1024 + 32 * len(saved)
+    # the records' rows of windows lie in up to three ranges of the arena (the runtime's choice, where the network's
+    # regions are dead during encoder 0): words XF_WORD, +2, +4 their byte addresses, +1 and +3 the first two's rows
     where = (f'    const uint rr2_gx = (param.w[0] + (param.w[20] & 0xffffu) + 7u) / 8u;\n'
-             f'    const uint rr2_rec = param.w[{xf_word}u] / 4u + {record}u * (gl_WorkGroupID.y * (param.w[0] / 8u + 1u) + gl_WorkGroupID.x);\n')
+             f'    uint rr2_y = gl_WorkGroupID.y, rr2_base = param.w[{xf_word}u];\n'
+             f'    if (rr2_y >= param.w[{xf_word + 1}u]) {{\n'
+             f'        rr2_y -= param.w[{xf_word + 1}u]; rr2_base = param.w[{xf_word + 2}u];\n'
+             f'        if (rr2_y >= param.w[{xf_word + 3}u]) {{ rr2_y -= param.w[{xf_word + 3}u]; rr2_base = param.w[{xf_word + 4}u]; }}\n'
+             f'    }}\n'
+             f'    const uint rr2_rec = rr2_base / 4u + {record}u * (rr2_y * (param.w[0] / 8u + 1u) + gl_WorkGroupID.x);\n')
     return recomputed, saved, record, where
 
 
@@ -128,7 +135,8 @@ def gather_pass(xf_word, head, decls, pre, tail, first, f16vars):
     One shader holding both runs the gather on one of the block's four waves while the other three wait, which
     costs more than the record's trip through memory (RX 9070 XT, 1280x720, 2026-10-13: gather 0.40 -> 0.24 ms).
     The record: 1024 words of A fragments ([token slot][64 FP8 feature slots], as the block's XF), then per lane the
-    gather's values the tail reads. Its address: parameter word XF_WORD (bytes) + 4 * RECORD * (y * (W / 8 + 1) + x)."""
+    gather's values the tail reads. Its address: the byte address of row y's range (parameter words XF_WORD to
+    XF_WORD + 4) + 4 * RECORD * (y' * (W / 8 + 1) + x), y' the row within its range."""
     recomputed, saved, record, where = split_layout(xf_word, pre, tail, f16vars)
     var = lambda r: r.lstrip('%')
     store = ['    if (rr2_valid) {   // the first product\'s A fragments: lane 4g + t, register q -> row, 4 k',

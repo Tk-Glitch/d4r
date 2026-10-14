@@ -29,17 +29,20 @@ uint32_t r2Shift(unsigned stage, uint32_t frame) {
 }
 struct R2Stage {
     Pipeline pipeline;
-    Buffer weights, upload;
+    Buffer weights;
+    std::vector<char> pending;   // the weights until recordUpload puts them in the command buffer
     std::vector<uint8_t> args;
     std::vector<uint32_t> textures, buffers;
     std::vector<std::pair<uint32_t, std::string>> surfaces;
     std::vector<std::pair<uint32_t, double>> pointers;   // argument offset, arena offset in units
     uint32_t group = 1;    // "xN": a workgroup holds N windows along x (the stages generated around translated code)
     uint32_t record = 0;   // R2Gather, "rN": 32-bit words per window in the arena
+    bool ranges = false;   // R2Gather, "s3": the records' rows lie in three ranges (six words end enc0's block; else one address)
 };
 struct R2Model {
     std::array<R2Stage, R2Stages> stages;
-    Buffer aux, auxUpload;        // encoder 0's second table (argument 104)
+    Buffer aux;                   // encoder 0's second table (argument 104)
+    std::vector<char> auxPending;
     std::array<Pipeline, 2> exposure;
     bool particles = false;       // the model has R2DownP
     bool gather = false;          // the model has R2Gather
@@ -53,10 +56,9 @@ struct R2Model {
             return items;
         };
         const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        auto blob = [&](Buffer& buffer, Buffer& upload, const std::vector<char>& bytes) {
+        auto blob = [&](Buffer& buffer, std::vector<char>& pending, std::vector<char> bytes) {
             buffer.create(d, bytes.size(), usage);
-            upload.create(d, bytes.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-            std::memcpy(upload.mapped, bytes.data(), bytes.size());
+            pending = std::move(bytes);
         };
         std::array<bool, R2Stages> seen{};
         std::string line;
@@ -67,15 +69,18 @@ struct R2Model {
             // "stage NAME SHADER.spv SUBGROUP WEIGHTS|- ARGS TEXTURES SURFACES BUFFERS POINTERS": the lists are
             // comma-separated argument offsets ("-": none), surfaces OFFSET:FORMAT, pointers OFFSET:UNITS; an optional "xN"
             std::string name, shader, weightFile, argsFile, textureList, surfaceList, bufferList, pointerList, option; uint32_t subgroup = 32;
-            f >> name >> shader >> subgroup >> weightFile >> argsFile >> textureList >> surfaceList >> bufferList >> pointerList >> option;
+            f >> name >> shader >> subgroup >> weightFile >> argsFile >> textureList >> surfaceList >> bufferList >> pointerList;
             unsigned stage = 0;
             while (stage < R2Stages && name != R2Names[stage]) ++stage;
             if (stage >= R2Stages || seen[stage] || pointerList.empty())
                 throw std::runtime_error("rr.txt: unknown, repeated or invalid stage: " + line);
             seen[stage] = true;
             auto& st = stages[stage];
-            if (option.size() == 2 && option[0] == 'x' && option[1] >= '1' && option[1] <= '4') st.group = static_cast<uint32_t>(option[1] - '0');
-            if (option.size() > 1 && option[0] == 'r') st.record = static_cast<uint32_t>(std::stoul(option.substr(1)));
+            while (f >> option) {
+                if (option.size() == 2 && option[0] == 'x' && option[1] >= '1' && option[1] <= '4') st.group = static_cast<uint32_t>(option[1] - '0');
+                if (option.size() > 1 && option[0] == 'r') st.record = static_cast<uint32_t>(std::stoul(option.substr(1)));
+                if (option == "s3") st.ranges = true;
+            }
             for (const auto& item : split(textureList)) st.textures.push_back(static_cast<uint32_t>(std::stoul(item)));
             for (const auto& item : split(bufferList)) st.buffers.push_back(static_cast<uint32_t>(std::stoul(item)));
             for (const auto& item : split(surfaceList)) {
@@ -92,22 +97,21 @@ struct R2Model {
             types.insert(types.end(), st.buffers.size(), b);
             st.pipeline.create(d.handle, directory + "/" + shader, types, subgroup, cache);
             { const auto bytes = read(directory + "/" + argsFile); st.args.assign(bytes.begin(), bytes.end()); }
-            blob(st.weights, st.upload, weightFile == "-" ? std::vector<char>(16) : read(directory + "/" + weightFile));
+            blob(st.weights, st.pending, weightFile == "-" ? std::vector<char>(16) : read(directory + "/" + weightFile));
         }
         for (unsigned stage = 0; stage < R2DownP; ++stage)
             if (!seen[stage]) throw std::runtime_error("rr.txt: incomplete Ray Reconstruction preset F model");
         particles = seen[R2DownP];
         gather = seen[R2Gather] && stages[R2Gather].record != 0 && stages[R2Enc0].args.size() >= 8;
         for (unsigned stage : {R2DownP, R2Gather})
-            if (!seen[stage]) blob(stages[stage].weights, stages[stage].upload, std::vector<char>(16));
-        blob(aux, auxUpload, read(directory + "/enc0-aux.bin"));
+            if (!seen[stage]) blob(stages[stage].weights, stages[stage].pending, std::vector<char>(16));
+        blob(aux, auxPending, read(directory + "/enc0-aux.bin"));
         exposure[0].create(d.handle, directory + "/exposure_f0.spv", {b, t, b}, 64, cache);
         exposure[1].create(d.handle, directory + "/exposure_f1.spv", {b, b, b, t, s}, 64, cache);
     }
-    void recordUpload(VkCommandBuffer cb) {
-        for (auto& st : stages) { VkBufferCopy copy{0, 0, st.upload.size}; vkCmdCopyBuffer(cb, st.upload.handle, st.weights.handle, 1, &copy); }
-        VkBufferCopy copy{0, 0, auxUpload.size};
-        vkCmdCopyBuffer(cb, auxUpload.handle, aux.handle, 1, &copy);
+    void recordUpload(VkCommandBuffer cb) {   // the weights into the command buffer (recordContents)
+        for (auto& st : stages) recordContents(cb, st.weights, st.pending);
+        recordContents(cb, aux, auxPending);
     }
 };
 struct R2ExposureParams { int32_t last[2]; uint32_t blocksX, blocks; float invCount; uint32_t reset; };
@@ -118,15 +122,17 @@ struct R2Engine {
     uint32_t rw, rh, ow, oh, w0, h0;
     uint32_t iw, ih, cw, ch, qw, qh;          // the intermediate (1.5x output), its half and quarter
     uint32_t nx, ny, maxW, maxH;              // output tiles and the largest tile rectangle (with its overlap)
-    uint64_t unit, tileA, tileB;              // arena unit; the first tile's two regions; a tile slot's bytes
-    uint64_t tileBytes = 0;
+    uint64_t unit, tileB;                     // arena unit; where a tile slot's second region starts in it
+    uint64_t tileBytes = 0;                   // a tile slot's bytes
+    std::vector<uint64_t> slotAt;             // each tile slot's place in the arena buffer
     // Tile slots (a pair of regions each) and tiles per group. The post passes of a group have a slot each and run
     // without waiting for one another, as do the down passes that read them; a group's down passes also overlap the
     // next group's post passes, which write the other half of the slots (NGX overlaps one post with one down the same
     // way, on two slots). Serialising all 32 passes of a 4K frame cost 0.17 ms in the gaps (RX 9070 XT, 2026-10-13).
     static constexpr uint32_t R2TileSlots = 8;
     uint32_t tileGroup = 1;
-    uint64_t gatherAt = 0;                    // the gather pass's records (R2Gather): after the tile regions
+    // the gather pass's records (R2Gather): byte address of range 0, its rows of windows, range 1, its rows, range 2
+    std::array<uint32_t, 5> gatherWords{};
     struct Rect { uint32_t x0, y0, x1, y1; };
     std::vector<Rect> src, dst;               // per tile: intermediate rectangle (with overlap), output rectangle
     std::vector<VkDeviceSize> downPAt;
@@ -134,6 +140,8 @@ struct R2Engine {
     // the particle layer's output-size history (R2DownP's surface 264, read back as texture 256): created on first use
     Tex pb[2];
     bool pbNew = false;
+    // the engine's own output image: only for frames that do not write the caller's texture (created on first use)
+    bool outNew = false;
     Buffer arena, values, sums, dummy;
     // every parameter block of the frame in one buffer (one upload per frame): the network stages', per tile the two
     // output passes', the pooling pass's and the exposure's, each at a 256-byte boundary
@@ -256,7 +264,6 @@ struct R2Engine {
         for (const auto& r : src) { maxW = std::max(maxW, r.x1 - r.x0); maxH = std::max(maxH, r.y1 - r.y0); }
         unit = static_cast<uint64_t>(w0) * h0 / 32;
         const uint64_t tilePixels = static_cast<uint64_t>(maxW + 8) * (maxH + 8);
-        tileA = unit * R2ArenaUnits; tileB = tileA + tilePixels * 4;
         tileBytes = tilePixels * 6;
         const uint32_t tileCount = nx * ny;
         const uint32_t slots = std::min(tileCount, R2TileSlots);
@@ -266,11 +273,61 @@ struct R2Engine {
         // debugging: D4R_ENGINE_RR_ARENA=DIR keeps the arena and the exposure values host-visible and writes them at the
         // next setFrame (DIR/F-arena.bin, F-values.bin), when the caller has waited for frame F
         const bool debug = std::getenv("D4R_ENGINE_RR_ARENA") != nullptr;
+        // Every arena region is written and read within one frame, so the tile slots (live in the output stage only) and
+        // the gather records (live from the gather pass to the end of encoder 0) can share the buffer with the network's
+        // regions where those are dead: the tile slots that fit before the network's output (dec0_1's argument 64; the
+        // output stage also reads the arena after it), the records' rows of windows in the two largest gaps between
+        // encoder 0's regions ("s3" models) and from the end of its last region on (a region ends at the next region's
+        // start). Saves 105 MB at 720p -> 4K. D4R_ENGINE_RR_ARENA keeps the regions apart, so that dumps show the
+        // network's regions as NGX leaves them.
+        std::vector<uint32_t> starts{R2ArenaUnits};
+        for (unsigned stage = 0; stage < R2Network; ++stage)
+            for (const auto& [offset, units] : model.stages[stage].pointers) starts.push_back(static_cast<uint32_t>(std::lround(units)));
+        std::sort(starts.begin(), starts.end());
+        auto regionEnd = [&](uint32_t start) { return *std::upper_bound(starts.begin(), starts.end(), start); };
+        uint32_t netOutStart = 0, enc0End = 0;
+        for (const auto& [offset, units] : model.stages[R2Dec0B].pointers)
+            if (offset == 64) netOutStart = static_cast<uint32_t>(std::lround(units));
+        for (unsigned stage : {R2Enc0, R2Gather})
+            for (const auto& [offset, units] : model.stages[stage].pointers) enc0End = std::max(enc0End, regionEnd(static_cast<uint32_t>(std::lround(units))));
+        const uint64_t arenaBytes = unit * R2ArenaUnits;
+        const uint32_t before = debug ? 0 : static_cast<uint32_t>(std::min<uint64_t>(slots, unit * netOutStart / tileBytes));
+        for (uint32_t k = 0; k < slots; ++k) slotAt.push_back(k < before ? tileBytes * k : arenaBytes + tileBytes * (k - before));
+        tileB = tilePixels * 4;
+        const uint64_t tileEnd = arenaBytes + tileBytes * (slots - before);
+        const uint64_t tail = debug ? (tileEnd + 255) & ~uint64_t(255) : (unit * enc0End + 255) & ~uint64_t(255);
         // the gather pass's records: one per window of level 0, (W0 / 8 + 1) to a row (a shifted level has one more)
-        gatherAt = (tileA + tileBytes * slots + 255) & ~uint64_t(255);
-        const uint64_t gatherBytes = model.gather ? uint64_t(w0 / 8 + 1) * (h0 / 8 + 1) * model.stages[R2Gather].record * 4 : 0;
-        if (gatherAt + gatherBytes > 0xffffffffull) throw std::runtime_error("Ray Reconstruction: the render size is too large for the arena");
-        arena.create(d, gatherAt + gatherBytes, storage, debug);
+        const uint32_t rows = h0 / 8 + 1;
+        const uint64_t rowBytes = model.gather ? uint64_t(w0 / 8 + 1) * model.stages[R2Gather].record * 4 : 1;
+        std::vector<std::pair<uint64_t, uint32_t>> ranges;   // (byte address, rows) of the gaps used
+        if (!debug && model.gather && model.stages[R2Gather].ranges) {
+            std::vector<std::pair<uint32_t, uint32_t>> used;
+            for (unsigned stage : {R2Enc0, R2Gather})
+                for (const auto& [offset, units] : model.stages[stage].pointers) {
+                    const uint32_t start = static_cast<uint32_t>(std::lround(units));
+                    used.push_back({start, regionEnd(start)});
+                }
+            std::sort(used.begin(), used.end());
+            uint32_t at = 0;
+            for (const auto& [start, end] : used) {
+                if (start > at) {
+                    const uint64_t from = (unit * at + 255) & ~uint64_t(255), to = unit * start;
+                    if (to > from && (to - from) / rowBytes > 0) ranges.push_back({from, static_cast<uint32_t>((to - from) / rowBytes)});
+                }
+                at = std::max(at, end);
+            }
+            std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            if (ranges.size() > 2) ranges.resize(2);
+        }
+        uint32_t placed = 0;
+        for (const auto& r : ranges) placed += r.second;
+        ranges.resize(2, {tail, 0});
+        gatherWords = {static_cast<uint32_t>(ranges[0].first), ranges[0].second, static_cast<uint32_t>(ranges[1].first),
+                       ranges[1].second, static_cast<uint32_t>(tail)};
+        const uint64_t gatherTail = placed >= rows ? 0 : (rows - placed) * rowBytes;
+        const uint64_t arenaTotal = std::max({tileEnd, model.gather ? tail + gatherTail : 0});
+        if (arenaTotal > 0xffffffffull) throw std::runtime_error("Ray Reconstruction: the render size is too large for the arena");
+        arena.create(d, arenaTotal, storage, debug);
         values.create(d, 16, storage, debug);
         dummy.create(d, 4096, storage);
         exposure.blocksX = (rw + 15) / 16; exposure.blocks = exposure.blocksX * ((rh + 15) / 16);
@@ -298,7 +355,6 @@ struct R2Engine {
         rec.create(d, rw, rh, VK_FORMAT_R8G8B8A8_SNORM);
         ka.create(d, rw, rh, VK_FORMAT_R8G8B8A8_UNORM); kb.create(d, rw, rh, VK_FORMAT_R8G8B8A8_UNORM); kc.create(d, rw, rh, half4);
         half.create(d, cw, ch, pooledFormat()); quarter.create(d, qw, qh, pooledFormat());
-        out.create(d, ow, oh, half4);
         zero.create(d, 1, 1, half4);
         for (const auto& st : model.stages)
             for (const auto& [offset, format] : st.surfaces)
@@ -320,7 +376,10 @@ struct R2Engine {
         const float fr = static_cast<float>(rw), fh = static_cast<float>(rh), fiw = static_cast<float>(iw), fih = static_cast<float>(ih);
         const float fow = static_cast<float>(ow), foh = static_cast<float>(oh);
         auto& p = blocks[R2Enc0];
-        if (model.gather) put64(p, p.size() - 8, gatherAt);   // the word compile_rr2.py appends to the block
+        if (model.gather && model.stages[R2Gather].ranges)   // the six words compile_rr2.py appends to the block
+            for (unsigned i = 0; i < 5; ++i) put32(p, p.size() - 24 + 4 * i, gatherWords[i]);
+        else if (model.gather)   // an older model: one address, the records in one piece
+            put64(p, p.size() - 8, gatherWords[4]);
         put32(p, 128, rw); put32(p, 132, rh); put32(p, 136, w0); put32(p, 140, h0);
         putF(p, 408, fr / fiw); putF(p, 412, fh / fih); putF(p, 416, fiw / fr); putF(p, 420, fih / fh);
         putF(p, 424, 1.0f / fr); putF(p, 428, 1.0f / fh); putF(p, 432, 1.0f / fiw); putF(p, 436, 1.0f / fih);
@@ -336,7 +395,7 @@ struct R2Engine {
         for (size_t i = 0; i < tiles; ++i) {
             auto& o = postBlocks[i];
             put64(o, 0, netOut); put32(o, 8, w0);   // the row stride of the network's output: the padded width
-            put64(o, 104, tileA + tileBytes * tileSlot(i)); put64(o, 112, tileB + tileBytes * tileSlot(i));
+            put64(o, 104, slotAt[tileSlot(i)]); put64(o, 112, slotAt[tileSlot(i)] + tileB);
             putF(o, 132, fr / fiw); putF(o, 136, fh / fih); put32(o, 148, iw); put32(o, 152, ih);
             putF(o, 160, 1.0f / fiw); putF(o, 164, 1.0f / fih); put32(o, 168, rw); put32(o, 172, rh);
             put32(o, 176, src[i].x0); put32(o, 180, src[i].y0); put32(o, 184, src[i].x1); put32(o, 188, src[i].y1);
@@ -347,7 +406,7 @@ struct R2Engine {
                 if (!wb) continue;
                 auto& w = *wb;
                 put32(w, 0, iw); put32(w, 4, ih); put32(w, 8, ow); put32(w, 12, oh); put32(w, 16, ow); put32(w, 20, oh);
-                put64(w, 24, tileA + tileBytes * tileSlot(i)); put64(w, 32, tileB + tileBytes * tileSlot(i));
+                put64(w, 24, slotAt[tileSlot(i)]); put64(w, 32, slotAt[tileSlot(i)] + tileB);
                 put32(w, 96, rw - 1); put32(w, 100, rh - 1);
                 putF(w, 104, fr / fow); putF(w, 108, fh / foh); putF(w, 112, fow / fiw); putF(w, 116, foh / fih);
                 put32(w, 128, dst[i].x0); put32(w, 132, dst[i].y0); put32(w, 136, dst[i].x1); put32(w, 140, dst[i].y1);
@@ -379,13 +438,13 @@ struct R2Engine {
         list.push_back({"kc", kc.handle, half4, rw, rh});
         list.push_back({"half", half.handle, pooledFormat(), cw, ch});
         list.push_back({"quarter", quarter.handle, pooledFormat(), qw, qh});
-        list.push_back({"out", out.handle, half4, ow, oh});
+        if (out.handle) list.push_back({"out", out.handle, half4, ow, oh});
         return list;
     }
     void recordInitialize(VkCommandBuffer cb) {
         std::vector<VkImage> images;
         for (auto* group : {&feat, &hist, &e, &mv}) for (auto& t : *group) images.push_back(t.handle);
-        for (auto* t : {&rec, &ka, &kb, &kc, &half, &quarter, &out, &zero}) images.push_back(t->handle);
+        for (auto* t : {&rec, &ka, &kb, &kc, &half, &quarter, &zero}) images.push_back(t->handle);
         for (auto& [format, t] : spare) images.push_back(t.handle);
         VkClearColorValue clear{};
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -483,6 +542,10 @@ struct R2Engine {
                 pbNew = true;
             }
         }
+        if (!finalOutput.view && !out.handle) {
+            out.create(d, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT);
+            outNew = true;
+        }
         exposure.reset = rst ? 1u : 0u;
         reset = rst;
         auto same = [&](const Bindings& b) {
@@ -540,10 +603,11 @@ struct R2Engine {
         bound = &*found;
         // texture and surface handles: 1 where something is bound, 0 where NGX leaves the argument null (the kernels
         // test optional inputs' handles); buffer pointers other than the arena's are zero
+        const VkImageView output = finalOutput.view ? finalOutput.view : out.view;
         auto handles = [&](unsigned stage, std::vector<uint8_t>& block) {
             const auto& st = model.stages[stage];
-            for (uint32_t offset : st.textures) put64(block, offset, resolve(stage, false, offset, 0, images, out.view).view ? 1u : 0u);
-            for (const auto& [offset, format] : st.surfaces) put64(block, offset, resolve(stage, true, offset, 0, images, out.view).view ? 1u : 0u);
+            for (uint32_t offset : st.textures) put64(block, offset, resolve(stage, false, offset, 0, images, output).view ? 1u : 0u);
+            for (const auto& [offset, format] : st.surfaces) put64(block, offset, resolve(stage, true, offset, 0, images, output).view ? 1u : 0u);
             for (uint32_t offset : st.buffers) put64(block, offset, 0);
         };
         for (unsigned stage = 0; stage < R2Network; ++stage) handles(stage, blocks[stage]);
@@ -570,17 +634,20 @@ struct R2Engine {
             memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         };
-        if (pbNew) {   // the particle history starts from zero, like the rest of the temporal state
+        if (pbNew || outNew) {   // images created on first use start from zero, like the rest of the temporal state
             VkClearColorValue clear{};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            for (auto& t : pb) {
-                imageBarrier(cb, t.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            std::vector<VkImage> fresh;
+            if (pbNew) for (auto& t : pb) fresh.push_back(t.handle);
+            if (outNew) fresh.push_back(out.handle);
+            for (VkImage image : fresh) {
+                imageBarrier(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-                vkCmdClearColorImage(cb, t.handle, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+                vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
             }
             memoryBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-            pbNew = false;
+            pbNew = outNew = false;
         }
         stamp(0);
         memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
