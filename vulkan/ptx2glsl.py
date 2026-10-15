@@ -667,6 +667,9 @@ class T:
                 if po is None:
                     raise Err('param address ' + a[1])
                 e = f'PARAM{size * 8}({po + i * size}u)'
+            elif 'shared' in mods and size == 2 and vec > 1:
+                # a vector access is aligned to its whole size (PTX ISA): its 16-bit halves have fixed places in words
+                e = f'(sh[({V(base, "u32")} + {off + i * size}u) >> 2] ' + ('& 0xffffu)' if i % 2 == 0 else '>> 16u)')
             elif 'shared' in mods:
                 e = f'SH{size * 8}({V(base, "u32")} + {off + i * size}u)'
             elif 'local' in mods:
