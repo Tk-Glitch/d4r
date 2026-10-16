@@ -5,6 +5,9 @@ OUT="${1:-$ROOT/build/vulkan-staging}"
 mkdir -p "$OUT"
 glslangValidator -V --target-env vulkan1.0 -o "$OUT/read.spv" "$ROOT/kernels/support/vulkan_read.comp" >/dev/null
 glslangValidator -V --target-env vulkan1.0 -o "$OUT/wait.spv" "$ROOT/kernels/support/vulkan_wait.comp" >/dev/null
+# FSR Ray Regeneration backend (tools/d4r_fsr_rr_passes.h)
+glslangValidator -V --target-env vulkan1.0 -o "$OUT/fsr_rr_prepare.spv" "$ROOT/kernels/support/fsr_rr_prepare.comp" >/dev/null
+glslangValidator -V --target-env vulkan1.0 -o "$OUT/fsr_rr_compose.spv" "$ROOT/kernels/support/fsr_rr_compose.comp" >/dev/null
 for format in rgba16f rgba32f r11f_g11f_b10f rgb10_a2 rgba8; do
     glslangValidator -V --target-env vulkan1.0 -DOUTPUT_FORMAT="$format" \
         -o "$OUT/write_$format.spv" "$ROOT/kernels/support/vulkan_write.comp" >/dev/null

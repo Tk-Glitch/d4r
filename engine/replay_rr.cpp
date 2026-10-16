@@ -9,6 +9,7 @@
 //   (RGBA8 UNORM), all at the render size.
 //   OUT_DIR receives F-NAME.bin for every debug image of frame F.
 #include "runtime.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -124,8 +125,16 @@ int main(int argc, char** argv) try {
     VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
     vkGetPhysicalDeviceFeatures2(c.physical, &f2);
-    const char* extensions[] = {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-                                VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
+    uint32_t ne = 0; CK(vkEnumerateDeviceExtensionProperties(c.physical, nullptr, &ne, nullptr));
+    std::vector<VkExtensionProperties> ep(ne); CK(vkEnumerateDeviceExtensionProperties(c.physical, nullptr, &ne, ep.data()));
+    auto hasExtension = [&](const char* name) {
+        return std::any_of(ep.begin(), ep.end(), [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
+    if (!hasExtension(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME))
+        f8.shaderFloat8 = f8.shaderFloat8CooperativeMatrix = VK_FALSE;
+    std::vector<const char*> extensions;
+    if (cm.cooperativeMatrix) extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    if (f8.shaderFloat8) extensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
     uint32_t families = 8; VkQueueFamilyProperties qf[8]; vkGetPhysicalDeviceQueueFamilyProperties(c.physical, &families, qf);
     uint32_t family = 0;
     for (uint32_t i = 0; i < families; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { family = i; break; }
@@ -135,8 +144,16 @@ int main(int argc, char** argv) try {
     // D4R_RR_TEST_ROBUST2=1: robustBufferAccess2 / robustImageAccess2 as vkd3d-proton enables them (out-of-bounds
     // reads return zero)
     const bool robust2 = std::getenv("D4R_RR_TEST_ROBUST2") != nullptr;
-    if (!robust2) { rb2.robustBufferAccess2 = rb2.robustImageAccess2 = rb2.nullDescriptor = VK_FALSE; }
-    di.enabledExtensionCount = robust2 ? 3 : 2; di.ppEnabledExtensionNames = extensions;
+    if (robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    else { rb2.robustBufferAccess2 = rb2.robustImageAccess2 = rb2.nullDescriptor = VK_FALSE; }
+    // Omit unsupported extension feature structures as well as their extension names. gfx11 RR uses f16 matrices.
+    v13.pNext = cm.cooperativeMatrix ? static_cast<void*>(&cm) : nullptr;
+    cm.pNext = f8.shaderFloat8 ? static_cast<void*>(&f8) : nullptr;
+    f8.pNext = robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) ? &rb2 : nullptr;
+    if (robust2 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) && !f8.shaderFloat8) {
+        if (cm.cooperativeMatrix) cm.pNext = &rb2; else v13.pNext = &rb2;
+    }
+    di.enabledExtensionCount = static_cast<uint32_t>(extensions.size()); di.ppEnabledExtensionNames = extensions.data();
     // D4R_RR_TEST_NO_ROBUST=1: no robust buffer or image access (out-of-bounds reads are undefined)
     if (std::getenv("D4R_RR_TEST_NO_ROBUST")) { f2.features.robustBufferAccess = VK_FALSE; v13.robustImageAccess = VK_FALSE; }
     // D4R_RR_TEST_NO_COOPMAT=1: a device like vkd3d-proton's, without the cooperative-matrix and float8 features

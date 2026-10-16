@@ -44,6 +44,24 @@ Enable = auto
 ; auto preserves the game's choice; default = NVIDIA's default, D/E = transformer models.
 ; These presets are independent of [DLSS] Model. E requires a DLL that contains that model.
 Model = auto
+; Which denoiser answers a game's Ray Reconstruction request (D4R_RR_BACKEND):
+;   dlss = NVIDIA's DLSS Ray Reconstruction (Model above), the default.
+;   fsr  = experimental: AMD's FSR Ray Regeneration 1.2 (amd_fidelityfx_denoiser_dx12.dll, unmodified)
+;          denoises at render resolution, then Super Sampling ([DLSS] Model) upscales to the game's
+;          output size. D3D12 only. The game's combined colour is split into diffuse and specular
+;          by its albedos, which is an approximation; see docs/fsr-ray-regeneration.md.
+; Changing it needs a game restart (or the game recreating its Ray Reconstruction feature).
+Backend = dlss
+; The AMD denoiser DLL for Backend = fsr (D4R_FSR_RR_DLL). auto: amd_fidelityfx_denoiser_dx12.dll in
+; the d4r folder.
+FsrDenoiser = auto
+; Backend = fsr tuning. FsrStabilityBias: the AMD denoiser's temporal stability bias; auto = AMD's
+; default (1), which blurs reflections and fine detail; 0 measured sharper and closer to the noise-free
+; truth, moving or still (D4R_FSR_RR_STABILITY_BIAS). FsrDetail: the share (0-1) of the colour that goes
+; around the denoiser, keeping detail it removes as noise (hair, water ripples, foliage) at the cost of some
+; grain; 0 = off (D4R_FSR_RR_DETAIL).
+FsrStabilityBias = auto
+FsrDetail = 0
 
 [Latency]
 ; How many frames old the upscaled image the game presents may be.
@@ -90,6 +108,10 @@ ImplicitMaxBlock = 256
 ; and same-frame linear VRAM inputs; unsupported features retain original vectors.
 ; Default off. May affect disocclusion edges. (D4R_MOTION_DILATION)
 MotionVectorDilation = 0
+; Opt-in sky-fill experiment for equal render/motion grids: borrow only from foreground
+; runs <=3 pixels along either axis. Opaque dilation is unchanged. Restart to change.
+; Unsupported routes retain nearest-foreground fill. (D4R_MOTION_THIN_SKY)
+MotionDilationThinSky = false
 ; Keep DLSS inputs and output in VRAM (vkd3d-proton Vulkan interop) instead of copying through
 ; system memory. Falls back automatically when the game's resources do not qualify.
 VramInterop = true
@@ -177,8 +199,11 @@ MangoHud = false
 MangoHudConfig = fps,frametime,frame_timing=0,gpu_stats=0,cpu_stats=0,position=top-right,font_size=36
 
 [Debug]
-; Per-frame timing lines in the shim log (d4r_nvngx.log)
+; Measure stage timings and write sampled timing lines in the shim log (d4r_nvngx.log)
 Profile = false
+; Log the first 5 frames, then every Nth frame. 1 = every frame. Restart after changing.
+; FSR RR stage summaries average N completed GPU samples. Env: D4R_PROFILE_LOG_EVERY
+ProfileLogEvery = 60
 ; Log directory (auto = ~/.cache/d4r-dlss-captures/game-<exe>-<time>)
 LogDir = auto
 

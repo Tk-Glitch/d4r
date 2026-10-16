@@ -74,10 +74,23 @@ if (( D4R_RR_RELAXED > 0 )); then
 fi
 # D4R_RR_MIX=1: the 32-deep steps round once through v_fma_mix (the shaders' K32): ~5% faster, not provably bit-exact
 [[ "${D4R_RR_MIX:-0}" == 1 ]] && DEFS+=(-DRR_MIX)
-glsl() { # glsl OUT.spv SOURCE INCLUDE_DIR...
+# D4R_RR_GFX11=1: RDNA3 (no FP8 matrices, no VK_EXT_shader_float8): the stages reproduce ZLUDA's gfx11 lowering bit for
+# bit (engine/rr/rr_gfx11.glsl); exact arithmetic only, and each native weight file carries a widened copy (W_WIDE)
+GFX11=0
+if [[ "${D4R_RR_GFX11:-0}" == 1 ]]; then
+    GFX11=1; DEFS=(-DRR_EXACT_CONVERT -DRR_GFX11); [[ "$PRESET" == 4 ]] && DEFS+=(-DRR_PRESET_D)
+    (( D4R_RR_RELAXED == 0 )) && [[ "${D4R_RR_MIX:-0}" != 1 ]] ||
+        echo "D4R_RR_GFX11: relaxed / mix builds do not exist for RDNA3; building the exact model" >&2
+    D4R_RR_RELAXED=0
+fi
+# The gfx11 runtime also reproduces NGX's CPU camera arithmetic, whose residues feed temporal specular motion.
+(( GFX11 == 0 )) || sed -i '/^preset /a arithmetic gfx11' "$OUT/rr.txt"
+# widen WEIGHTS: on RDNA3, append the widened copy and print -DW_WIDE=...; nothing otherwise
+widen() { (( GFX11 )) && printf -- '-DW_WIDE=%su' "$(python3 "$RR/widen_weights.py" "$1")" || true; }
+glsl() { # glsl OUT.spv SOURCE INCLUDE_DIR... [-DEXTRA]
     local out="$1" src="$2"; shift 2
-    local dir inc=(); for dir in "$@"; do inc+=("-I$dir"); done
-    "${CAPPED[@]}" glslangValidator --target-env vulkan1.3 -V "${DEFS[@]}" "${inc[@]}" -o "$out" "$src" > "$WORK/glsl.log" 2>&1 ||
+    local dir inc=() extra=(); for dir in "$@"; do [[ "$dir" == -D* ]] && extra+=("$dir") || inc+=("-I$dir"); done
+    "${CAPPED[@]}" glslangValidator --target-env vulkan1.3 -V "${DEFS[@]}" "${extra[@]}" "${inc[@]}" -o "$out" "$src" > "$WORK/glsl.log" 2>&1 ||
         { grep -E 'ERROR' "$WORK/glsl.log" | head -5; exit 1; }
     # from level 2 on the conversions are left to the driver (as compile_rr2.py does for preset F)
     (( D4R_RR_RELAXED >= 2 )) || python3 "$RR/spv_exact_convert.py" "$out" > /dev/null
@@ -94,7 +107,7 @@ for s in enc1 enc2 enc3 enc4 enc5 dec4 dec3 dec2 dec1; do
     cp "$WORK/dll/$s.npz" "$d/weights.npz"
     [[ -z "$CAP" ]] || python3 "$RR/swin_ref.py" "$CAP" "$s" "$FRAME" "$d/weights.npz" --blocks "$b" 0,0 | tail -2 | sed "s/^/$s: /"
     python3 "$RR/swin_pack.py" "$s" "$d/weights.npz" "$OUT/weights-${s}m.bin" "$d/swin_stage.h" > /dev/null
-    glsl "$OUT/${s}_m.spv" "$RR/swin_m.comp" "$d" "$RR"
+    glsl "$OUT/${s}_m.spv" "$RR/swin_m.comp" "$d" "$RR" $(widen "$OUT/weights-${s}m.bin")
     native "$s" "weights-${s}m.bin"
 done
 
@@ -103,7 +116,7 @@ d="$WORK/dec0"; mkdir -p "$d"
 cp "$WORK/dll/dec0.npz" "$d/weights.npz"
 [[ -z "$CAP" ]] || python3 "$RR/dec0_ref.py" "$CAP" "$FRAME" "$d/weights.npz" --blocks 5,5 0,0 | tail -2 | sed 's/^/dec0: /'
 python3 "$RR/dec0_pack.py" "$d/weights.npz" "$OUT/weights-dec0m.bin" "$d/dec0_m_w.h" > /dev/null
-glsl "$OUT/dec0_m.spv" "$RR/dec0_m.comp" "$d" "$RR"
+glsl "$OUT/dec0_m.spv" "$RR/dec0_m.comp" "$d" "$RR" $(widen "$OUT/weights-dec0m.bin")
 native dec0 weights-dec0m.bin
 
 # encoder 0: the translated feature gather + the native rest
@@ -119,7 +132,7 @@ else
     cp "$d/enc0_m.bin" "$OUT/weights-enc0m.bin"
 fi
 python3 "$RR/gen_enc0_m.py" "$OUT/enc0.generated.comp" "$d/enc0_m.comp" > /dev/null
-glsl "$OUT/enc0_m.spv" "$d/enc0_m.comp" "$d" "$RR"
+glsl "$OUT/enc0_m.spv" "$d/enc0_m.comp" "$d" "$RR" $(widen "$OUT/weights-enc0m.bin")
 native enc0 weights-enc0m.bin
 
 # the translated output stage (preset D; preset E's when engine/rr/hkpn.comp is not used) has no subgroup operations
@@ -127,5 +140,19 @@ if grep -q '"shader": "generated from the DLL"' <(python3 -c "import json,sys; p
     sed -i -E 's/^stage hkpn hkpn\.spv 32 /stage hkpn hkpn.spv 64 /' "$OUT/rr.txt"
 fi
 for s in enc0 enc1 enc2 enc3 enc4 enc5 dec4 dec3 dec2 dec1 dec0; do rm -f "$OUT/weights-$s.bin"; done
+# test_layer.py must bind optional images as well as the ones present in a capture. Keep a sidecar for every used
+# shader, including native stages, so an absent input never shifts the shader's descriptor bindings.
+python3 - "$OUT" <<'PY'
+import json, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+for line in (out / 'rr.txt').read_text().splitlines():
+    fields = line.split()
+    if not fields or fields[0] != 'stage':
+        continue
+    textures = [] if fields[5] == '-' else list(map(int, fields[5].split(',')))
+    surfaces = [] if fields[6] == '-' else [[int(s.split(':')[0]), s.split(':')[1]] for s in fields[6].split(',')]
+    (out / fields[2]).with_suffix('.json').write_text(json.dumps({'textures': textures, 'surfaces': surfaces}) + '\n')
+PY
 printf 'Native Ray Reconstruction model (preset %s) in %s\n' "$([[ "$PRESET" == 4 ]] && echo D || echo E)" "$OUT"
 grep '^stage' "$OUT/rr.txt" | awk '{ printf "  %s %s (%s-wide)\n", $2, $3, $4 }'

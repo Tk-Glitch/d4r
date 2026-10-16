@@ -74,8 +74,18 @@ Initial validation: a gfx1101 fast L build completed two Ultra Performance harne
 **Ray Reconstruction, the denoiser (`kernels/tex` + `cuda_dldn_engine_*`).**
 - **Network:** `nvngx_dlssd.dll` defines the DLSS-D denoiser: six Swin encoders (`cuda_dldn_engine_swin_enc0_kernel` … `enc5`), five decoders (`dec0` … `dec4`), a high-fidelity kernel-prediction network whose output kernel is `cuda_dldn_engine_hkpn_output_kernel_transformer`, and the luma/auto-exposure/`reduce_sum` helpers. It shares no kernel with the Super Resolution libraries.
 - **Native today:** the hkpn output kernel (and its `_diamond_wallaby` twin), built by `kernels/build.sh rr` as a wave64 surface-store replacement. `make_ptx.py` replaces `sust.b.2d.v4.b16.zero` — a whole RGBA16F texel — with `d4r_sust_v4b16`; the neural body and the texture reads are unchanged.
-- **Still translated:** all eleven Swin layers. ZLUDA compiles NVIDIA's PTX at load time; the table below measures the resulting kernels' GPU execution, not JIT latency. A native replacement must preserve each layer's attention, norm and merge stages, as `kernels/m/rrlite_*` does for the upscaler.
+- **CUDA route:** all eleven Swin layers remain translated. ZLUDA compiles NVIDIA's PTX at load time; the table below measures the resulting kernels' GPU execution, not JIT latency. A native replacement must preserve each layer's attention, norm and merge stages, as `kernels/m/rrlite_*` does for the upscaler.
 - **Manifest:** the denoiser DLL is passed to `kernel_manifest.py` as `--rr-dll`, because its hashes may only authorize `cuda_dldn_engine_*` replacements. Without that split, a name both libraries define — `dl4rt_input_kernel` — would let a super-resolution binary be served for the denoiser's different implementation of it.
+
+The separate [Vulkan RR engine](../engine/rr/README.md) also has an exact RDNA3 build: `D4R_RR_GFX11=1
+D4R_RR_RELAXED=0 engine/rr/build_native_model.sh ...`. It runs the eleven native network stages with f16 cooperative
+matrices and reproduces ZLUDA's FP8 lowering, without `VK_EXT_shader_float8`. On an RX 7700 XT, preset D, AW2 town
+replay at 853×480 → 2560×1440, two engine runs and the CUDA reference are byte-identical over all 24 RGBA16F frames.
+Replay GPU time is about 11.4 ms versus 27.9 ms for the current CUDA control; these are replay measurements.
+Live AW2 denoiser GPU time was about 27.3 → 12.0 ms; whole-frame intervals were 42.6 → 24.4 ms in the faster
+sessions and 53.4 → 36.2 ms in the slower sessions (one launch per backend in each state). The slower game state
+remains; these figures are not pooled across states. The model's weights stay local. Select `[RayReconstruction] Backend = dlss` and `[Engine] Enabled = true` with the
+model in `d4r/engine/rr-d`; FSR RR retains its own route. Preset E and other RDNA3 GPUs remain unverified.
 
 Measured on the RX 9070 XT (gfx1201, RDNA4), Ray Reconstruction preset E,
 1280×720 → 3840×2160, with `D4R_CUDA_KERNEL_PROFILE` in the D3D12 harness:
@@ -295,6 +305,166 @@ Runs of the same build vary by about ±3% per kernel. M additionally skips its o
 
 `[Interop] MotionVectorDilation = 1` or `2` (`D4R_MOTION_DILATION`) extends nearby foreground motion into pixels whose depth otherwise belongs to the background. The value selects the opaque-surface radius in render pixels. Both enabled values also fill sky gaps using the nearest foreground pixel within an eight-render-pixel circle (far depth 0 for reversed Z, 1 for normal Z). This is the wider sky fill from the comparison; it can strengthen trails in some frames and remains opt-in through `MotionVectorDilation`. This is a depth-guided approximation to better thin-feature motion coverage, not engine-side conservative rasterization. It improved the captured Townfall rooftop where the earlier native-encoder fallback did not resolve the artifact.
 
-The d4r-owned GPU kernel preserves the original depth/motion buffers and writes a separate RG16F velocity texture. The worker waits for its completion before NGX evaluates. No per-frame CPU readback is needed. It requires same-frame linear VRAM inputs, full-resolution unjittered motion vectors and zero subrect bases. Unsupported features or unavailable kernels keep the original vectors. The default is `0` (off); larger radii can affect disocclusion and unrelated foreground edges. The method does not recreate geometry missing from every input frame or establish RTX parity.
+The d4r-owned GPU kernel preserves the original depth/motion buffers and writes a separate RG16F velocity texture. The input marker precedes dilation, and dilation precedes NGX on the same bridge-selected stream (including the optional priority stream); there is no dilation-specific CPU completion wait. No per-frame CPU readback is needed. It requires same-frame linear VRAM inputs, render- or display-resolution unjittered motion vectors and zero subrect bases. Unsupported features or unavailable kernels keep the original vectors. The default is `0` (off); larger radii can affect disocclusion and unrelated foreground edges. The method does not recreate geometry missing from every input frame or establish RTX parity.
 
 `scripts/build_wine_nvcuda_bridge.sh` embeds the support kernels when `D4R_ROCM_DIR` points to ROCm clang. All six gfx110x/gfx120x targets compile; physical validation is currently gfx1101 only. A bridge built without the support kernels reports the feature unavailable rather than changing inputs. Optional GPU regressions cover forward/reversed depth, two radii, jitter, padded rows and preservation of input buffers; see `tests/test_motion_kernel_gpu.py`.
+
+For equal motion/render grids, zero jitter and radius 1 or 2, the bridge selects
+`d4r_motion_dilate_lds`: 16x16 output tiles use a 32x32 depth halo and wave32 row
+foreground masks. The nearest sky fill preserves the generic kernel's exact
+(distance squared, x, y) tie-break. The additional padded export keeps the original
+72-byte parameter structure and passes allocation height separately; inactive
+rows/columns, including row-pitch padding, copy through from the original motion
+buffer in the same launch. Display-resolution or jitter-mapped grids retain
+`d4r_motion_dilate` and its existing padding-copy fallback.
+
+Deferred CPU marker polling remains enabled with dilation. GPU input waits can
+also run with the LDS path once that slot has successfully allocated its output
+texture and submitted a dilation through the new bridge. Cold slots, changed
+allocation geometry, older bridges and the generic path use CPU marker polling
+so lazy allocation/module loading or synchronous fallback copies cannot block
+behind an unreleased GPU wait. Existing RR auxiliary-upload and staged-input
+synchronizations remain in place.
+
+`motion_dilation_wall` measures host preparation/submission time after this
+change, including allocation on cold slots; it no longer waits for the kernel to
+finish. Compare pipeline/throughput fields for end-to-end cost. On the GPU-wait
+route, the evaluation event precedes the input wait and dilation, so
+`dlss_gpu` includes dilation after subtracting input readiness; on the CPU-polled
+route its start event follows dilation. Those GPU timing scopes are different.
+GPU regression tests compare both kernels byte-for-byte on deterministic random
+inputs and independently check image/block-edge sky ties, both depth directions,
+both radii, padded rows/bottom rows, guards and immutable inputs.
+
+### Opt-in thin-only sky fill
+
+`[Interop] MotionDilationThinSky = true` (`D4R_MOTION_THIN_SKY=1`) selects
+`d4r_motion_dilate_lds_thin` when dilation is enabled and the equal-grid, zero-jitter
+LDS route is available. The default is false and the existing nearest-foreground
+behavior remains unchanged. Opaque radius-1/radius-2 dilation is unchanged.
+
+The sky search accepts foreground runs of at most three pixels along **either**
+axis. This retains long horizontal wires and vertical poles; requiring short runs
+in both axes would discard them. A three-pixel mask halo beyond the search tile
+prevents workgroup boundaries from truncating run classification. Nearest-distance
+and coordinate tie-breaking remain the same among eligible candidates. Mapped-grid
+or older-bridge routes retain nearest fill and report that thin fill is unsupported.
+
+Both sky-fill modes currently assume normalized depth with sky at 0 (reversed) or
+1 (forward). The available Alan Wake 2 RR captures have forward depth greater than
+1 throughout; they contain no foreground according to this existing threshold and
+cannot validate a sky-fill quality benefit. Thin mode is an experimental hypothesis,
+not a measured in-game quality improvement. It stays opt-in; no automatic render-ratio
+policy has been enabled. Restart after changing this setting.
+
+
+### Experimental AW2 native motion coverage
+
+The private AW2 driver prototype can feed output-resolution raster motion to
+NGX with `D4R_NATIVE_MV_LIVE=1`. Its live path also uses a thin-silhouette halo:
+`D4R_NATIVE_MV_THIN_HALO=0` selects the original 3x3 native compositor instead.
+The halo extends only sky pixels toward foreground runs shorter than five output
+pixels on at least one axis. Its radius tracks two render pixels, capped at six
+output pixels. Thick surface interiors do not receive that extra expansion.
+The original compositor and 80-byte parameter ABI remain available; the Wine
+bridge exports the additional `d4rComposeNativeMotionThin` operation.
+
+This requires the private native-raster driver and GPU-ordered owned-input
+validity contract. It is experimental, defaults remain unchanged, and this is not
+a general engine-independent native-velocity feature. A 24-frame AW2 forward-walk
+experiment at 853x480 -> 2560x1440 reduces paired wire dropout by 67.5%, beading by
+22.7%, temporal contrast error by 23.2%, and nearby darkening proxy by 39.9% after
+eight warm-up frames. These are one-scene proxies, without native-color ground
+truth, and do not establish artifact-free rendering. On gfx1101 the complete
+halo compositor takes 1.175 ms kernel-only versus 0.148 ms for the original
+native compositor; no matched live performance gain is claimed.
+
+The private AW2 path also supports `D4R_NATIVE_MV_HYBRID=1`: retain native
+motion within six output pixels of a thin native silhouette and preserve the
+game's nearest-sampled motion elsewhere. This avoids substituting the complete
+native geometry/camera field over distant surfaces. It requires the additive
+`d4rComposeNativeMotionHybrid` bridge operation and matching low-resolution motion
+dimensions; unsupported layouts retain the full native fallback. It defaults off.
+`D4R_NATIVE_MV_WIRE_SKY_ONLY=1` restricts color repair to silhouettes with sky on
+both sides of the thin axis, also default off. Fractional coverage also checks the
+nearest native depth: a different foreground surface or NaN depth is preserved,
+rather than receiving color from an adjacent wire. Depth-matched wire centers and
+sky remain eligible. These are experimental controls,
+not an artifact-free rendering or 2.47 ms performance claim.
+
+Wire-color repair is independent of the extra motion halo. With a matching
+bridge, `D4R_NATIVE_MV_THIN_HALO=0` selects jitter-aligned 3x3 native composition
+while leaving `D4R_NATIVE_MV_WIRE_HISTORY` active. Earlier builds gated both
+operations on the halo flag, which prevented an isolated halo-off comparison.
+All these environment controls belong in the per-game INI's `[Env]` section.
+
+`D4R_NATIVE_MV_SUBSTITUTE=0` decouples wire repair from NGX motion substitution.
+With `D4R_NATIVE_MV_LIVE=1` and `D4R_NATIVE_MV_WIRE_HISTORY=1`, the native field
+is composed only for repair; NGX retains the game's vectors, creation flags and
+MV scale. Dilation still follows its existing setting; use
+`D4R_MOTION_DILATION=0` for an unmodified game-vector comparison. `SUBSTITUTE`
+defaults to 1, preserving the combined path. `LIVE=0` still bypasses both native
+composition and repair. This is an experimental isolation control: repair-only
+can still alter distant thin silhouettes and has not established visual stability.
+Keep CPU input waiting for these comparisons; no GPU-wait safety gate is removed.
+
+Profile lines also identify the feature, native-field readiness, actual native
+substitution, requested repair and requested GPU completion-word path. Use
+`scripts/summarize_d4r_profile.py LOG` to group warm samples by feature instance,
+resolution, model, quality, flags and routing. Missing GPU timings remain missing;
+CPU marker/pipeline times and delayed Vulkan samples are summarized independently.
+
+With profiling enabled, sampled live-native frames also report
+`native_motion_gpu` and `wire_repair_gpu`. These bracket the composition kernel
+and color-repair dispatches on the NGX stream; elapsed times are read after the
+existing publication synchronization. They add no CPU readiness wait and remain
+`-1` when inactive or unavailable. They describe the current frame, while the
+existing game-queue Vulkan timestamps are read from older completed slots.
+
+`D4R_NATIVE_MV_PREPARED=1` selects an exact implementation of the existing full
+native-motion and wire-repair policy. A 32x32-tile preparation kernel builds a
+packed native silhouette mask and per-pixel wire axes once; a wave64 kernel
+composes the same motion field. Sparse repair consumes those axes instead of
+repeating the depth classification. RGB/depth history entries marked age 255
+are left unspecified because the consumer checks age before reading them;
+rendered RGBA and readable history remain unchanged. The additive bridge
+operations are `d4rComposeNativeMotionPrepared` and
+`d4rStabilizeThinWiresPrepared`; missing exports, incompatible flags/layouts or
+allocation failure retain the earlier implementation. The generic default is
+0; enable it under `[Env]` and restart for an A/B test. This is a performance
+implementation switch and does not enable hybrid motion or sky-only repair.
+
+On gfx1101, matched replay tests measured roughly 0.28 ms for native motion plus
+shared preparation and 0.17 ms for sparse repair/apply, excluding NGX. These are
+kernel replay measurements, not a live total or a claim that distant artifacts
+are resolved. The sampled `native_motion_gpu` field includes the shared wire
+preparation when this route is active.
+The prepared compositor also remains available with `WIRE_HISTORY=0`; turning
+color repair off does not require the slower legacy native compositor.
+
+### Optional R11G11B10 interop conversion
+
+`D4R_SHIM_FUSE_R11_INPUT=1` samples an R11G11B10 color image directly into the
+pitched RGBA16F input buffer. `D4R_SHIM_FUSE_R11_OUTPUT=1` writes the RGBA16F result
+buffer directly into an R11G11B10 storage image. Both default off. These reuse the
+Vulkan staging shaders to remove intermediate-image copies and blits; NGX model,
+input readiness, frame age and temporal state are unchanged. Unsupported resource
+usage or descriptor allocation failure retains the original transfer path. Output
+requires `ALLOW_UNORDERED_ACCESS`; input requires shader-resource access.
+Descriptors and owner images remain alive through recorded allocator retirement,
+with bounded retention for changing resources.
+
+On gfx1101, the GPU conversion probe checks every half encoding across RGB output
+channels and every unsigned R11/R10 input encoding, including padded input rows and
+partial workgroups. Finite values and infinities match the original blits exactly;
+NaN payloads may differ, but remain NaNs. Run the opt-in GPU regression with
+`D4R_RUN_GPU_TESTS=1 python3 -m unittest discover -s tests -p test_output_conversion_gpu.py`.
+
+Value 2 is diagnostic: output alternates every 300 frames, input every two such
+blocks. Together they cycle through transfer/transfer, transfer/compute,
+compute/transfer and compute/compute in one launch. Profile fields `vk_input_mode`
+and `vk_output_mode` identify the actual paths of the older Vulkan timestamp slot,
+not the current frame's mode. Set both flags to 1 for normal use after comparison.
+`scripts/summarize_d4r_profile.py LOG --since-clock SECONDS --until-clock SECONDS`
+can isolate a verified gameplay interval. Do not include startup, descriptor warmup,
+concurrent GPU tests, menus or cutscenes in a performance comparison.

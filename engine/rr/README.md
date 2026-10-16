@@ -15,6 +15,37 @@ NVIDIA kernel of the frame; the engine records them in NVIDIA's order:
 The D variants of enc0, dec0 and the output kernel are different code; the other nine kernels are shared and only
 their weights differ between presets.
 
+## RDNA3 exact preset D (2026-10-14)
+
+Build with `D4R_RR_GFX11=1 D4R_RR_RELAXED=0 engine/rr/build_native_model.sh CAPTURE OUT DLL`.
+`rr_gfx11.glsl` reproduces ZLUDA's gfx11 FP8 widening, K positions, scaled f32 accumulators and final binary16
+rounding using f16 cooperative matrices. The weight files include a widened copy. Relaxed and mix arithmetic are
+unavailable in this build; `VK_EXT_shader_float8` is unnecessary. `kvk`, `evk` and `d4r-rr` enable float8 only when
+the driver advertises the extension, because RADV gfx11 may report its feature bits without the extension.
+
+`arithmetic gfx11` in `rr.txt` also selects NGX 310.7's CPU camera operation order. Its inversions, relative camera
+translation and intermediate reprojection products leave small residues that affect specular motion history;
+double-precision equivalents were insufficient for temporal equality. Other model builds keep their existing path.
+
+RX 7700 XT (gfx1101), RADV, preset D, AW2 town at 853×480 → 2560×1440: enc0 and hkpn are byte-identical on all three
+captured launches, joining the ten previously verified stages. Encoder surface 112's undefined alpha is excluded
+from the isolated stage check. The complete presented RGBA16F output, including alpha, is byte-identical over all
+24 replay frames in two engine runs versus the deterministic CUDA control. Engine GPU time is about 11.4 ms versus
+27.9 ms for the current control; warmed samples varied by about 0.1 ms within each engine run. Older CUDA runs
+included timing outliers, so their lower 26.7 ms figure is historical, not the paired control. No frame-age or
+resolution change contributes to the result. Other RDNA3 GPUs, preset E, and other games require validation.
+
+AW2 live at the same setting: CUDA / engine denoiser GPU medians 27.3 / 12.0 ms; frame intervals 42.6 / 24.4 ms
+in the faster sessions and 53.4 / 36.2 ms in the slower sessions. These are separate session states, one launch per
+backend in each state; the engine does not resolve the pre-existing slower game state. Frame intervals use the
+frame-count/time slope over the final 30 seconds, with sampled instantaneous spreads of about 1 ms for CUDA and
+3-4 ms for the engine. The same-frame engine is opt-in; configuration was restored after testing.
+
+Put the local model under `d4r/engine/rr-d`, or set `D4R_ENGINE_MODEL_RR_D_DIR` to its Windows path. The shim runs it
+with `[RayReconstruction] Backend = dlss` and `[Engine] Enabled = true`. `D4R_ENGINE_RR_PROFILE` log lines give
+game-queue GPU time around the complete engine evaluation; `gpu_frame` identifies the earlier frame whose query
+has completed, while `game_interval` is the current call interval. Query readback does not delay the image.
+
 ## Stage contract
 
 Every stage shader reads the same data NVIDIA's kernel reads, in the same layouts, so each one can be checked on

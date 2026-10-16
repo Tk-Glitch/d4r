@@ -256,7 +256,17 @@ uint e4m3_to_h(uint b)
     float f = e == 0u ? ldexp(float(m), -9) : ldexp(float(8u + m), int(max(e, 1u)) - 10);
     return s | HU(float16_t(f));
 }
-#ifdef SOFTWARE_E4M3
+#if defined(RR_GFX11)
+// RDNA3 (engine/rr/rr_gfx11.glsl): ZLUDA's gfx11 conversions exactly. e4m3 -> f16: NaN -> 0x7fff with the sign
+uint g11_e4m3_to_h(uint c)
+{
+    const uint m = c & 0x7fu;
+    uint h = m >= 8u ? (m << 7u) + 0x2000u : uint(float16BitsToUint16(float16_t(float(m & 7u) * 0.001953125)));
+    h = m == 0x7fu ? 0x7fffu : h;
+    return ((c & 0x80u) << 8u) | h;
+}
+f16vec2 e4m3x2_to_f16x2(uint v) { return H2(g11_e4m3_to_h(v & 0xffu) | (g11_e4m3_to_h((v >> 8) & 0xffu) << 16)); }
+#elif defined(SOFTWARE_E4M3)
 f16vec2 e4m3x2_to_f16x2(uint v) { return H2(e4m3_to_h(v & 0xffu) | (e4m3_to_h((v >> 8) & 0xffu) << 16)); }
 #else
 // the hardware conversion: exact for every non-NaN code (2026-10-12); NaN keeps e4m3_to_h's sign | 0x7e00
@@ -284,7 +294,31 @@ uint h2e4m3(float f, bool relu)
     else { int p = findMSB(n); bits = (uint(qe + p + 7) << 3) | ((n >> uint(p - 3)) & 7u); }
     return s | min(bits, 0x7eu);
 }
-#ifdef SOFTWARE_E4M3
+#if defined(RR_GFX11)
+// f16 -> e4m3 as ZLUDA computes it on gfx11 (HIP's satfinite conversion, infinities clamped first): nearest even,
+// |x| > 448 -> 0x7e, NaN -> 0x7f, the sign kept; .relu first zeroes negative non-NaN halves
+uint g11_h2e4m3(uint h)
+{
+    const uint s = (h >> 8u) & 0x80u, a = h & 0x7fffu;
+    if (a > 0x7c00u) return s | 0x7fu;
+    uint c;
+    if (a >= 0x2400u) {
+        const uint t = a - 0x2000u;
+        c = min((t + 0x3fu + ((t >> 7u) & 1u)) >> 7u, 0x7eu);
+    } else {
+        c = uint(roundEven(float(uint16BitsToFloat16(uint16_t(a))) * 512.0));
+    }
+    return s | c;
+}
+#define G11_HAVE_H2E4M3
+uint g11_relu(uint h) { return (h & 0x8000u) != 0u && (h & 0x7fffu) <= 0x7c00u ? 0u : h; }
+uint f16x2_to_e4m3x2(f16vec2 h, bool relu)
+{
+    uint x = HU(h.x), y = HU(h.y);
+    if (relu) { x = g11_relu(x); y = g11_relu(y); }
+    return g11_h2e4m3(x) | (g11_h2e4m3(y) << 8);
+}
+#elif defined(SOFTWARE_E4M3)
 uint f16x2_to_e4m3x2(f16vec2 h, bool relu) { return h2e4m3(float(h.x), relu) | (h2e4m3(float(h.y), relu) << 8); }
 #else
 // cvt.rn.satfinite(.relu).e4m3x2.f16x2 on the hardware conversion: round to nearest even after clamping to +-448
@@ -305,10 +339,38 @@ uint f16x2_to_e4m3x2(f16vec2 h, bool relu) { return h2e4m3_hw(h.x, relu) | (h2e4
 // place (A row-major 16x32, B column-major 32x8 in a 16-column tile, C/D row-major f16 16x16), then loaded as
 // whole matrices. Lane l = 4g + t holds A rows g and g+8 (k 4t.. and 16+4t..), B column g (same k), C/D row g
 // and g+8, columns 2t and 2t+1.
-#define MMA coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define MMB coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define MMF coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define MMH coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#ifdef RR_GFX11
+// RDNA3: f16 operands holding ZLUDA's widening (value * 2^-8, k positions 2q + j <- 4q + j, 8 + 2q + j <- 4q + 2 + j
+// in each K half), C scaled by 2^-16 into the two products and back (engine/rr/rr_gfx11.glsl)
+#define MMA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MMB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+uvec2 g11_sc4(uint packed)
+{
+    uint mag = packed & 0x7f7f7f7fu;
+    mag |= (mag + 0x01010101u) & 0x80808080u;
+    const uint sign = packed & 0x80808080u;
+    return uvec2(((mag & 0xffu) << 7u) | ((mag & 0xff00u) << 15u) | ((sign & 0x80u) << 8u) | ((sign & 0x8000u) << 16u),
+                 (((mag >> 16u) & 0xffu) << 7u) | ((mag >> 24u) << 23u) | ((sign & 0x800000u) >> 8u) | (sign & 0x80000000u));
+}
+#define G11_FILL(m, w0, w1, w2, w3) { \
+    const uvec2 s0_ = g11_sc4(w0), s1_ = g11_sc4(w1), s2_ = g11_sc4(w2), s3_ = g11_sc4(w3); f16vec2 l_; \
+    l_ = unpackFloat2x16(s0_.x); (m)[0] = l_.x; (m)[1] = l_.y; l_ = unpackFloat2x16(s0_.y); (m)[8] = l_.x; (m)[9] = l_.y; \
+    l_ = unpackFloat2x16(s1_.x); (m)[2] = l_.x; (m)[3] = l_.y; l_ = unpackFloat2x16(s1_.y); (m)[10] = l_.x; (m)[11] = l_.y; \
+    l_ = unpackFloat2x16(s2_.x); (m)[4] = l_.x; (m)[5] = l_.y; l_ = unpackFloat2x16(s2_.y); (m)[12] = l_.x; (m)[13] = l_.y; \
+    l_ = unpackFloat2x16(s3_.x); (m)[6] = l_.x; (m)[7] = l_.y; l_ = unpackFloat2x16(s3_.y); (m)[14] = l_.x; (m)[15] = l_.y; }
+#define G11_HAVE_FILL
+#define coopMatLoad8(m, arr, off, stride) { const uint b_ = (off) + (gl_SubgroupInvocationID & 15u) * (stride); \
+    G11_FILL(m, arr[b_], arr[b_ + 1u], arr[b_ + 2u], arr[b_ + 3u]) }
+#define MM8(x1, y1, x0, y0, c) MMF acc_ = MMF(c); for (int i_ = 0; i_ < acc_.length(); ++i_) acc_[i_] *= 1.52587890625e-05; \
+    acc_ = coopMatMulAdd(x1, y1, coopMatMulAdd(x0, y0, acc_)); for (int i_ = 0; i_ < acc_.length(); ++i_) acc_[i_] *= 65536.0;
+#else
+#define MMA coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MMB coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define coopMatLoad8(m, arr, off, stride) coopMatLoad(m, arr, off, stride, gl_CooperativeMatrixLayoutRowMajor)
+#define MM8(x1, y1, x0, y0, c) MMF acc_ = coopMatMulAdd(x1, y1, coopMatMulAdd(x0, y0, MMF(c)));
+#endif
 void mma_e4m3_f16(uint a0, uint a1, uint a2, uint a3, uint b0, uint b1, uint c0, uint c1, out uint d0, out uint d1)
 {
     const uint base = gl_SubgroupID * 384u, A = base, B = base + 128u, C = base + 256u;
@@ -323,6 +385,16 @@ void mma_e4m3_f16(uint a0, uint a1, uint a2, uint a3, uint b0, uint b1, uint c0,
     mms[C + g * 8u + 4u + t] = 0u; mms[C + (g + 8u) * 8u + 4u + t] = 0u;
     memoryBarrierShared(); subgroupBarrier();
     MMA x0, x1; MMB y0, y1; MMH c;
+#ifdef RR_GFX11
+    coopMatLoad8(x0, mms, A, 8u);
+    coopMatLoad8(x1, mms, A + 4u, 8u);
+    coopMatLoad8(y0, mms, B, 8u);
+    coopMatLoad8(y1, mms, B + 4u, 8u);
+    coopMatLoad(c, mms, C, 8u, gl_CooperativeMatrixLayoutRowMajor);
+    MM8(x1, y1, x0, y0, c)
+    memoryBarrierShared(); subgroupBarrier();
+    coopMatStore(MMH(acc_), mms, C, 8u, gl_CooperativeMatrixLayoutRowMajor);
+#else
     coopMatLoad(x0, mms, A, 8u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(x1, mms, A + 4u, 8u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(y0, mms, B, 8u, gl_CooperativeMatrixLayoutColumnMajor);
@@ -331,6 +403,7 @@ void mma_e4m3_f16(uint a0, uint a1, uint a2, uint a3, uint b0, uint b1, uint c0,
     MMF acc = coopMatMulAdd(x1, y1, coopMatMulAdd(x0, y0, MMF(c)));
     memoryBarrierShared(); subgroupBarrier();
     coopMatStore(MMH(acc), mms, C, 8u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
     memoryBarrierShared(); subgroupBarrier();
     d0 = mms[C + g * 8u + t]; d1 = mms[C + (g + 8u) * 8u + t];
 }
@@ -350,6 +423,16 @@ void mma_e4m3_f16_pair(uint a0, uint a1, uint a2, uint a3, uint b0, uint b1, uin
     mms[C + g * 8u + 4u + t] = f0; mms[C + (g + 8u) * 8u + 4u + t] = f1;
     memoryBarrierShared(); subgroupBarrier();
     MMA x0, x1; MMB y0, y1; MMH c;
+#ifdef RR_GFX11
+    coopMatLoad8(x0, mms, A, 8u);
+    coopMatLoad8(x1, mms, A + 4u, 8u);
+    coopMatLoad8(y0, mms, B, 8u);
+    coopMatLoad8(y1, mms, B + 4u, 8u);
+    coopMatLoad(c, mms, C, 8u, gl_CooperativeMatrixLayoutRowMajor);
+    MM8(x1, y1, x0, y0, c)
+    memoryBarrierShared(); subgroupBarrier();
+    coopMatStore(MMH(acc_), mms, C, 8u, gl_CooperativeMatrixLayoutRowMajor);
+#else
     coopMatLoad(x0, mms, A, 8u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(x1, mms, A + 4u, 8u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(y0, mms, B, 8u, gl_CooperativeMatrixLayoutColumnMajor);
@@ -358,6 +441,7 @@ void mma_e4m3_f16_pair(uint a0, uint a1, uint a2, uint a3, uint b0, uint b1, uin
     MMF acc = coopMatMulAdd(x1, y1, coopMatMulAdd(x0, y0, MMF(c)));
     memoryBarrierShared(); subgroupBarrier();
     coopMatStore(MMH(acc), mms, C, 8u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
     memoryBarrierShared(); subgroupBarrier();
     d0 = mms[C + g * 8u + t]; d1 = mms[C + (g + 8u) * 8u + t];
     h0 = mms[C + g * 8u + 4u + t]; h1 = mms[C + (g + 8u) * 8u + 4u + t];
@@ -803,7 +887,9 @@ class RRT(base.T):
         w('#extension GL_KHR_shader_subgroup_ballot : require')
         w('#extension GL_KHR_cooperative_matrix : require')
         w('#extension GL_KHR_memory_scope_semantics : require')
+        w('#ifndef RR_GFX11')
         w('#extension GL_EXT_float_e4m3 : require')
+        w('#endif')
         w('#extension GL_EXT_spirv_intrinsics : require')
         w(f'// Generated by engine/rr/ptx2rr.py from {self.kernel}. Model data derived from the user\'s DLL; do not commit.')
         w(f'layout(local_size_x = {self.bx * self.by * self.bz}, local_size_y = 1, local_size_z = 1) in;')

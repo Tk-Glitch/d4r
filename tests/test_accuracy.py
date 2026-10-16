@@ -174,6 +174,17 @@ int main(int argc, char** argv) {
                          self.config("[Interop]\nMotionVectorDilation = 2\n",
                                      {"D4R_MOTION_DILATION": "0"}).stdout)
 
+    def test_thin_sky_opt_in_and_environment_precedence(self):
+        for value, expected in (("false","0"),("true","1"),("auto","0")):
+            self.assertIn(f"export D4R_MOTION_THIN_SKY={expected}",
+                          self.config(f"[Interop]\nMotionDilationThinSky = {value}\n").stdout)
+        self.config("[Interop]\nMotionDilationThinSky = maybe\n", expected=2)
+        self.assertNotIn("export D4R_MOTION_THIN_SKY",
+                         self.config("[Interop]\nMotionDilationThinSky = true\n",
+                                     {"D4R_MOTION_THIN_SKY":"0"}).stdout)
+        for file in ("config/d4r.ini.default", "packaging/d4r.ini"):
+            self.assertRegex((ROOT/file).read_text(), r"(?m)^MotionDilationThinSky\s*=\s*false$")
+
     def test_shipped_configs_default_off(self):
         for file in ("config/d4r.ini.default", "packaging/d4r.ini"):
             self.assertRegex((ROOT / file).read_text(), r"(?m)^PreferAccuracy\s*=\s*false$")

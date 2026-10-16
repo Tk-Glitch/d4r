@@ -18,7 +18,8 @@
 //   D4R_NGX_FEATURE_DIR directory holding nvngx_dlss.dll (optional, added to
 //                       the feature search paths)
 //   D4R_SHIM_LOG        log file path (default: d4r_nvngx.log next to the DLL)
-//   D4R_PROFILE=1       log per-frame CPU stages and default-stream GPU event time
+//   D4R_PROFILE=1       measure CPU stages and default-stream GPU event time
+//   D4R_PROFILE_LOG_EVERY=N log the first 5 frames, then every Nth frame (default 60; 1 logs all)
 //   D4R_SHIM_OUTPUT_HASH=1 log an FNV-1a hash of every DLSS output as produced
 //   D4R_SHIM_OUTPUT_DUMP_DIR=<Windows path> save selected raw RGBA16F DLSS frames
 //   D4R_SHIM_OUTPUT_DUMP_START / _COUNT / _EVERY select frames (defaults 1/1/1)
@@ -52,6 +53,10 @@
 //                       unaffected.)
 //   D4R_RR_ENABLE=1/0    Ask for Ray Reconstruction / forbid it. Unset (auto) offers it
 //                       exactly when the denoiser loaded and initialised.
+//   D4R_RR_BACKEND=dlss|fsr Which denoiser serves Ray Reconstruction: NVIDIA's (dlss, the default)
+//                       or AMD's FSR Ray Regeneration 1.2 followed by Super Sampling (fsr; see
+//                       d4r_fsr_rr_backend.inl). D4R_FSR_RR_DLL: the AMD denoiser DLL (default:
+//                       amd_fidelityfx_denoiser_dx12.dll in the d4r folder).
 //   D4R_RR_PRESET        Force the Ray Reconstruction render preset
 //                       (NVSDK_NGX_RayReconstruction_Hint_Render_Preset: 4 = D, 5 = E).
 //                       Independent of D4R_DLSS_PRESET, which only affects Super Sampling.
@@ -63,6 +68,8 @@
 #include <dxgi1_4.h>
 #include <vulkan/vulkan_core.h>
 #include "d4r_motion_dilation.h"
+#include "d4r_native_motion.h"
+#include "d4r_wire_history.h"
 #include "d4r_input_wait.h"
 #include "d4r_vulkan_staging.h"
 
@@ -90,6 +97,10 @@
 #include "d4r_render_presets.h"
 #include "d4r_win32_wait.h"
 #include "d4r_vkd3d_interop.h"
+#include <bcrypt.h>
+#include "d4r_fsr_rr.h"
+#include "d4r_fsr_rr_identity.h"
+#include "d4r_fsr_rr_passes.h"
 #include "../engine/game.h"
 #include "../engine/game_m.h"
 #include "../engine/game_rr.h"
@@ -156,6 +167,7 @@ extern "C"
     NgxResult d4r_ngx_get_int(void* parameters, const char* name, int* value);
     NgxResult d4r_ngx_get_void(void* parameters, const char* name, void** value);
     NgxResult d4r_ngx_get_d3d12_resource(void* parameters, const char* name, ID3D12Resource** value);
+    void d4r_ngx_set_d3d12_resource(void* parameters, const char* name, ID3D12Resource* value);
     void* d4r_ngx_parameters_create();
     void d4r_ngx_parameters_destroy(void* parameters);
 }
@@ -297,6 +309,16 @@ struct CudaApi
     // Optional (d4r nvcuda bridge): report a pitch-linear texture to NGX as an array of that size/format.
     int(WINAPI* registerLinearTexture)(CudaObject, size_t, size_t, uint32_t, uint32_t) = nullptr;
     int(WINAPI* dilateMotion)(const D4rMotionDilationParams*) = nullptr;
+    int(WINAPI* dilateMotionPadded)(const D4rMotionDilationParams*, uint32_t) = nullptr;
+    int(WINAPI* dilateMotionThin)(const D4rMotionDilationParams*, uint32_t) = nullptr;
+    int(WINAPI* composeNativeMotion)(const D4rNativeMotionParams*) = nullptr;
+    int(WINAPI* composeNativeMotionThin)(const D4rNativeMotionThinParams*) = nullptr;
+    int(WINAPI* composeNativeMotionAligned)(const D4rNativeMotionThinParams*) = nullptr;
+    int(WINAPI* composeNativeMotionHybrid)(const D4rNativeMotionHybridParams*) = nullptr;
+    int(WINAPI* composeNativeMotionPrepared)(const D4rNativeMotionPreparedParams*) = nullptr;
+    int(WINAPI* stabilizeThinWiresPrepared)(const D4rWireHistoryPreparedParams*) = nullptr;
+    int(WINAPI* stabilizeThinWires)(const D4rWireHistoryParams*) = nullptr;
+    int(WINAPI* stabilizeThinWiresSparse)(const D4rWireHistorySparseParams*) = nullptr;
 };
 
 // --- official NGX core CUDA API --------------------------------------------
@@ -644,6 +666,26 @@ static void load_portable_config()
             g_portable.notes.push_back("d4r.ini: [RayReconstruction] Model must be auto, default, D, E or F, not '" +
                                        rrModel + "'; leaving the model to the game");
     }
+    // Backend: dlss (NVIDIA's denoiser, the default) or fsr (AMD FSR Ray Regeneration, then Super
+    // Sampling; d4r_fsr_rr_backend.inl). FsrDenoiser: the AMD DLL, auto = in the d4r folder.
+    const std::string rrBackend = ascii_lower(ini_value(ini, "rayreconstruction", "Backend"));
+    if (rrBackend == "dlss" || rrBackend == "fsr")
+        portable_set("D4R_RR_BACKEND", rrBackend);
+    else if (!rrBackend.empty() && rrBackend != "auto")
+        g_portable.notes.push_back("d4r.ini: [RayReconstruction] Backend must be dlss or fsr, not '" + rrBackend +
+                                   "'; using dlss");
+    // FSR denoiser tuning (d4r_fsr_rr_backend.inl): FsrStabilityBias = auto (AMD's default) or a number;
+    // FsrDetail = the share (0-1) of the colour kept out of the denoiser, 0 = off.
+    const std::string fsrStability = ini_value(ini, "rayreconstruction", "FsrStabilityBias");
+    if (!fsrStability.empty() && ascii_lower(fsrStability) != "auto")
+        portable_set("D4R_FSR_RR_STABILITY_BIAS", fsrStability);
+    const std::string fsrDetail = ini_value(ini, "rayreconstruction", "FsrDetail");
+    if (!fsrDetail.empty())
+        portable_set("D4R_FSR_RR_DETAIL", fsrDetail);
+    const std::string fsrDenoiser = ini_value(ini, "rayreconstruction", "FsrDenoiser");
+    portable_set(L"D4R_FSR_RR_DLL", fsrDenoiser.empty() || ascii_lower(fsrDenoiser) == "auto"
+                                        ? dir + L"\\amd_fidelityfx_denoiser_dx12.dll"
+                                        : portable_path(fsrDenoiser));
 
     const std::string age = ini_value(ini, "latency", "FrameAge");
     if (age.empty() || age == "0")
@@ -724,6 +766,7 @@ static void load_portable_config()
         g_portable.notes.push_back("[Engine] Network must be auto, hip or vulkan; using auto");
 
     portable_set("D4R_SHIM_WATERMARK", ini_flag(ini, "dlss", "ShowWatermark", 0) ? "1" : "0");
+    portable_set("D4R_MOTION_THIN_SKY", ini_flag(ini, "interop", "MotionDilationThinSky", 0) ? "1" : "0");
     const std::string dilation = ini_value(ini, "interop", "MotionVectorDilation");
     if (dilation.empty() || dilation == "0" || dilation == "1" || dilation == "2")
         portable_set("D4R_MOTION_DILATION", dilation.empty() ? "0" : dilation);
@@ -731,6 +774,17 @@ static void load_portable_config()
         g_portable.notes.push_back("MotionVectorDilation must be 0, 1 or 2; using original motion vectors");
     if (ini_flag(ini, "debug", "Profile", 0))
         portable_set("D4R_PROFILE", "1");
+    if (const std::string every = ini_value(ini, "debug", "ProfileLogEvery");
+        !every.empty() && ascii_lower(every) != "auto")
+    {
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(every.c_str(), &end, 10);
+        if (every[0] >= '0' && every[0] <= '9' && end != every.c_str() && *end == '\0' &&
+            value >= 1 && value <= UINT32_MAX)
+            portable_set("D4R_PROFILE_LOG_EVERY", std::to_string(value));
+        else
+            g_portable.notes.push_back("d4r.ini: [Debug] ProfileLogEvery must be 1-4294967295; using default 60");
+    }
     if (const std::string level = ini_value(ini, "debug", "NgxLogLevel"); !level.empty())
         portable_set("D4R_NGX_LOG_LEVEL", level);
 
@@ -747,7 +801,18 @@ static void load_portable_config()
                                    "into the d4r folder");
     // Only a note: without the denoiser Super Sampling is unaffected and Ray Reconstruction
     // simply reports itself unavailable, which is the same thing the capability answer says.
-    if (ini_flag(ini, "rayreconstruction", "Enable", 1) && !file_exists(dir + L"\\nvngx_dlssd.dll"))
+    char backend[8] = {};
+    const DWORD backendLength = GetEnvironmentVariableA("D4R_RR_BACKEND", backend, sizeof(backend));
+    const bool fsrBackend = backendLength > 0 && backendLength < sizeof(backend) && ascii_lower(backend) == "fsr";
+    if (ini_flag(ini, "rayreconstruction", "Enable", 1) && fsrBackend)
+    {
+        wchar_t fsrPath[MAX_PATH] = {};
+        const DWORD fsrLength = GetEnvironmentVariableW(L"D4R_FSR_RR_DLL", fsrPath, MAX_PATH);
+        if (fsrLength > 0 && fsrLength < MAX_PATH && !file_exists(fsrPath))
+            g_portable.notes.push_back("[RayReconstruction] Backend = fsr, but AMD's amd_fidelityfx_denoiser_dx12.dll "
+                                       "(FidelityFX SDK 2.3, FSR Ray Regeneration 1.2) is missing from the d4r folder");
+    }
+    else if (ini_flag(ini, "rayreconstruction", "Enable", 1) && !file_exists(dir + L"\\nvngx_dlssd.dll"))
         g_portable.notes.push_back("nvngx_dlssd.dll is missing: copy NVIDIA's DLSS-Denoiser library (3.10.7, the "
                                    "build that exports NVSDK_NGX_CUDA_*) into the d4r folder to get Ray "
                                    "Reconstruction");
@@ -820,6 +885,30 @@ static bool profile_enabled()
 {
     static const bool enabled = env_uint("D4R_PROFILE", 0) != 0;
     return enabled;
+}
+
+static bool profile_log_enabled()
+{
+    static const bool enabled = env_uint("D4R_PROFILE_LOG", 1) != 0;
+    return enabled;
+}
+
+static unsigned int profile_log_every()
+{
+    static const unsigned int every = []() {
+        const std::string text = env_string("D4R_PROFILE_LOG_EVERY");
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+        return !text.empty() && text[0] >= '0' && text[0] <= '9' && end != text.c_str() && *end == '\0' &&
+                       value >= 1 && value <= UINT32_MAX
+                   ? static_cast<unsigned int>(value) : 60u;
+    }();
+    return every;
+}
+
+static bool profile_log_frame(uint32_t frame)
+{
+    return profile_log_enabled() && (frame <= 5 || frame % profile_log_every() == 0);
 }
 
 using ProfileClock = std::chrono::steady_clock;
@@ -1605,6 +1694,26 @@ static bool load_libraries()
         g.cu.registerLinearTexture = nullptr;
     g.cu.dilateMotion = reinterpret_cast<decltype(g.cu.dilateMotion)>(
         reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rDilateMotionVectors")));
+    g.cu.dilateMotionPadded = reinterpret_cast<decltype(g.cu.dilateMotionPadded)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rDilateMotionVectorsPadded")));
+    g.cu.dilateMotionThin = reinterpret_cast<decltype(g.cu.dilateMotionThin)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rDilateMotionVectorsThin")));
+    g.cu.composeNativeMotion = reinterpret_cast<decltype(g.cu.composeNativeMotion)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rComposeNativeMotion")));
+    g.cu.composeNativeMotionThin = reinterpret_cast<decltype(g.cu.composeNativeMotionThin)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rComposeNativeMotionThin")));
+    g.cu.composeNativeMotionAligned = reinterpret_cast<decltype(g.cu.composeNativeMotionAligned)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rComposeNativeMotionAligned")));
+    g.cu.composeNativeMotionHybrid = reinterpret_cast<decltype(g.cu.composeNativeMotionHybrid)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rComposeNativeMotionHybrid")));
+    g.cu.composeNativeMotionPrepared = reinterpret_cast<decltype(g.cu.composeNativeMotionPrepared)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rComposeNativeMotionPrepared")));
+    g.cu.stabilizeThinWiresPrepared = reinterpret_cast<decltype(g.cu.stabilizeThinWiresPrepared)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rStabilizeThinWiresPrepared")));
+    g.cu.stabilizeThinWires = reinterpret_cast<decltype(g.cu.stabilizeThinWires)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rStabilizeThinWires")));
+    g.cu.stabilizeThinWiresSparse = reinterpret_cast<decltype(g.cu.stabilizeThinWiresSparse)>(
+        reinterpret_cast<void*>(GetProcAddress(g.cuda, "d4rStabilizeThinWiresSparse")));
     if (profile_enabled() || env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0)
     {
         const bool create = load_export(g.cuda, "cuEventCreate", g.cu.eventCreate);
@@ -1747,10 +1856,29 @@ static DenoiserCapability denoiser_capability()
 // call, and must not be called from inside one.
 static void refresh_denoiser_capability();
 
+// [RayReconstruction] Backend (D4R_RR_BACKEND). Each backend has its own readiness: FSR Ray
+// Regeneration needs AMD's DLL, a provider for the game's device and Super Sampling, not
+// nvngx_dlssd.dll; DLSS Ray Reconstruction needs the CUDA denoiser. See d4r_fsr_rr_backend.inl.
+enum class RrBackend
+{
+    Dlss,
+    Fsr,
+    Invalid
+};
+static RrBackend rr_backend();
+static const char* rr_backend_name(RrBackend backend);
+static bool fsr_rr_ready();
+static bool fsr_rr_present();
+static const char* fsr_rr_denial_reason();
+static void fsr_rr_prepare_runtime();
+
 static bool ray_reconstruction_available()
 {
+    const RrBackend backend = rr_backend();
+    if (backend == RrBackend::Fsr)
+        return rr_enabled() && g.ngxInitialized && fsr_rr_ready();
     const DenoiserCapability capability = denoiser_capability();
-    return rr_enabled() && g.ngxInitialized && g.denoiser.cudaCapable &&
+    return backend == RrBackend::Dlss && rr_enabled() && g.ngxInitialized && g.denoiser.cudaCapable &&
            capability.known && capability.available != 0;
 }
 
@@ -1759,8 +1887,12 @@ static const char* rr_denial_reason()
 {
     if (!rr_enabled())
         return "disabled by D4R_RR_ENABLE=0";
+    if (rr_backend() == RrBackend::Invalid)
+        return "D4R_RR_BACKEND must be dlss or fsr";
     if (!g.ngxInitialized)
-        return "the NGX core is not initialised";
+        return "the NGX core is not initialised (Super Sampling, which every backend needs)";
+    if (rr_backend() == RrBackend::Fsr)
+        return fsr_rr_ready() ? "available (FSR Ray Regeneration)" : fsr_rr_denial_reason();
     if (!g.denoiser.cudaCapable)
         return g.denoiserAttempted ? "nvngx_dlssd.dll has no NVSDK_NGX_CUDA_* entry points (needs a 3.10.7 build)"
                                    : "no nvngx_dlssd.dll was found next to this DLL";
@@ -1907,10 +2039,18 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
     // anything; this only looks for the library and checks it is a build that can serve
     // Ray Reconstruction. Its own NVSDK_NGX_CUDA_Init is a stub that always fails, so
     // calling it would report "unavailable" for a denoiser that is in fact working.
-    if (rr_enabled())
+    if (rr_enabled() && rr_backend() == RrBackend::Fsr)
+    {
+        // nvngx_dlssd.dll plays no part: the denoiser is AMD's, then Super Sampling upscales.
+        if (result == NGX_SUCCESS)
+            fsr_rr_prepare_runtime();
+        logf("Ray Reconstruction: requested backend fsr: %s", rr_denial_reason());
+    }
+    else if (rr_enabled())
     {
         load_denoiser_library();
-        logf("Ray Reconstruction: %s", rr_denial_reason());
+        logf("Ray Reconstruction: requested backend %s: %s",
+             rr_backend() == RrBackend::Dlss ? "dlss" : "invalid (D4R_RR_BACKEND)", rr_denial_reason());
     }
     else
         logf("Ray Reconstruction: disabled by D4R_RR_ENABLE=0");
@@ -1946,6 +2086,7 @@ struct FusedColorInput {
     VkBuffer buffer = VK_NULL_HANDLE;
     D4rVkStagingSet set;
     ID3D12Resource* owner = nullptr;
+    uint32_t inputMode = 5;
 };
 
 // A temporary image for colour or exposure format conversion.
@@ -2432,8 +2573,12 @@ struct FrameTiming
     // starts (input release, DLSS, completion signal), vk_output = second-half commands, vk_total = all of it
     // (what an overlay timing the evaluate call on the game's list reports).
     double vkInput = -1, vkDlssWait = -1, vkOutput = -1, vkTotal = -1;
+    int vkOutputFused = -1, vkInputFused = -1;
     bool inputEventRecorded = false;
     double motionDilationWall = 0;
+    double nativeMotionGpu = -1, wireRepairGpu = -1;
+    bool nativeMotionTimed = false, wireRepairTimed = false;
+    bool nativeFieldReady = false, nativeSubstituted = false, wireRequested = false;
     bool markerDeferred = false; // the worker waits for the input marker (D4R_SHIM_DEFER_MARKER)
     bool gpuInputWait = false; // GPU events span wait enqueue -> NGX completion, including input readiness
     bool gpuEventsRecorded = false;
@@ -2503,6 +2648,41 @@ struct AuxBinding
 struct InputSlot
 {
     Staging color, depth, motion, exposure;
+    Staging nativeMotionCapture; // opt-in geometry sidecar readback; never an NGX input
+    Staging nativeDepthCapture, nativeSceneCapture, nativeOpaqueCapture;
+    Staging nativePrimaryDepthCapture, opaqueSceneCapture, opaqueMatrixCapture, originalPrimaryDepthCapture;
+    Staging materialSceneCapture;
+    bool materialSceneCaptureReady=false;
+    Staging glassMaskCapture;
+    bool glassMaskCaptureReady=false;
+    uint32_t glassMaskFormat=0;
+    Staging originalOpaqueCopyCapture;
+    bool originalOpaqueCopyCaptureReady=false;
+    Staging ownedSceneCapture, ownedMatrixCapture, ownedDepthCapture, ownedValidityCapture, glassValidityCapture;
+    bool ownedValidityCaptureReady=false, glassValidityCaptureReady=false;
+    ID3D12Resource* nativeValidityOwner=nullptr;
+    VramBuffer nativeGpuInputs[4]; // depth, opaque geometry, scene, matrix
+    bool nativeGpuCheckReady=false, nativeGpuStageValid=false;
+    UINT nativeGpuWidth=0,nativeGpuHeight=0;
+    CudaDevicePtr nativeGpuResult=0;
+    size_t nativeGpuResultBytes=0;
+    // D4R_NATIVE_MV_LIVE (default off): the composed field is handed to NGX as its motion input.
+    bool nativeLive=false;              // game thread: this frame recorded live-substitution inputs
+    CudaObject nativeGpuTexture=0;      // worker: pitch-linear texture over nativeGpuResult
+    UINT nativeTexWidth=0,nativeTexHeight=0;
+    size_t nativeTexPitch=0;
+    CudaDevicePtr nativeTexPointer=0;
+    bool ownedDepthCaptureReady=false;
+    bool ownedSceneCaptureReady=false, ownedMatrixCaptureReady=false;
+    bool nativePrimaryDepthCaptureReady=false, opaqueSceneCaptureReady=false;
+    bool opaqueMatrixCaptureReady=false, originalPrimaryDepthCaptureReady=false;
+    bool nativeOpaqueCaptureReady = false;
+    bool nativeGeometryCaptureReady = false;
+    Staging originalGeometryCapture, originalHardwareDepthCapture;
+    bool originalGeometryCaptureReady = false, originalHardwareDepthCaptureReady = false;
+    bool nativeDepthCaptureReady = false, nativeSceneCaptureReady = false;
+    uint32_t nativeMotionCaptureFrame = 0;
+    std::string nativeMotionCapturePath;
     VramBuffer vram[4]; // VRAM interop: the planes in canonical layout
     // D4R_SHIM_LINEAR_INPUTS: pitch-linear texture objects on vram[] handed to NGX (worker only)
     CudaObject linearTexture[4] = {};
@@ -2514,6 +2694,7 @@ struct InputSlot
     CudaObject dilatedTexture = 0;
     UINT dilatedWidth = 0, dilatedHeight = 0;
     size_t dilatedPitch = 0;
+    bool dilationEnqueued = false;
     std::vector<AuxBinding> auxBindings; // this slot's denoiser inputs, for one frame
     // The DLSSD.OutputAlpha texture the caller asked for on this frame, held until the frame
     // retires. Present only on a frame that actually registered it.
@@ -2577,10 +2758,17 @@ struct EngineBorrowedView
     }
 };
 
+struct FsrRrFeature;
+
 struct Feature
 {
     NgxHandle handle = {}; // returned to the caller
     bool nativeVulkan = false; // distinct resource/lifetime contract
+    // [RayReconstruction] Backend = fsr: the feature-13 state of d4r_fsr_rr_backend.inl (owned; freed by
+    // fsr_rr_destroy once the GPU is done). `owner`: set on the internal Super Sampling feature such a feature
+    // drives, which is released with it and never by the game.
+    FsrRrFeature* fsr = nullptr;
+    Feature* owner = nullptr;
     std::atomic<bool> retiring{false};
     IUnknown* resources = nullptr; // main reference plus command-allocator references
     NgxHandle* cudaHandle = nullptr;
@@ -2590,6 +2778,7 @@ struct Feature
     unsigned int cudaWidth = 0, cudaHeight = 0; // render size the NGX feature was created with (worker only)
     unsigned int refusedWidth = 0, refusedHeight = 0; // render size NGX would not create a feature for (worker only)
     int quality = 0, flags = 0, subrects = 0;
+    int cudaFlags = 0; // flags the NGX CUDA feature currently exists with (worker only; live native MV clears MVLowRes)
     std::array<unsigned int, 6> creationPresets{};
     bool cudaCreationDeferred = false;
     unsigned int preset = 0;
@@ -2597,11 +2786,14 @@ struct Feature
     // Output.Subrect origins are read at all, so a replay must create the feature the same way.
     int outputSubrects = 0;
     CudaEvent profileStart = nullptr, profileEnd = nullptr;
+    CudaEvent nativePassEvents[4] = {}; // sampled native compose [0,1], wire repair [2,3]
     CudaEvent profileInputsReleased = nullptr; // D4R_PROFILE only: recorded right behind the GPU-side input wait
     // D4R_PROFILE only: 4 game-queue timestamps per output slot (start, input marker, second half, end)
     ID3D12QueryHeap* timestampHeap = nullptr;
     ID3D12Resource* timestampReadback = nullptr;
     volatile uint64_t* timestampValues = nullptr;
+    uint8_t timestampOutputFused[kOutputSlots] = {}, timestampInputFused[kOutputSlots] = {};
+    bool recordOutputFused = false, recordInputFused = false;
     double timestampTicksPerMs = 0.0;
     bool timestampFailed = false;
     CudaEvent outputReadyEvent = nullptr;
@@ -2625,6 +2817,20 @@ struct Feature
     // target, moved to/from the CUDA arrays with device-to-device copies.
     CudaDevicePtr planeLinear[4] = {}, outputLinear = 0;
     size_t planeLinearBytes[4] = {}, outputLinearBytes = 0;
+    CudaDevicePtr nativeThinMask=0,preparedWireAxes=0;
+    size_t nativeThinMaskBytes=0,preparedWireAxesBytes=0;
+    uint32_t preparedWireFlags=0;
+    bool preparedWireAxesReady=false; // worker only, produced on this frame's NGX stream
+    CudaDevicePtr wirePatchMask=0;
+    CudaDevicePtr wirePublishBuffer=0;
+    bool wirePublishedDirect=false;
+    CudaDevicePtr wireBuffers[8] = {}; // raw, filtered output, observed RGB[2], age[2], depth[2]; worker-owned
+    UINT wireWidth=0,wireHeight=0;
+    uint32_t wireLastFrame=0,wireIndex=0;
+    bool wireValid=false;
+    bool wireOutputReady=false; // filtered linear RGBA16F is this frame's publish source
+    UINT wireRenderWidth=0,wireRenderHeight=0;
+    float wirePreExposure=0,wireExposureScale=0;
     // Frames queued but not yet published (or dropped). evaluate() blocks the
     // game at D4R_SHIM_MAX_IN_FLIGHT (default 3) so a backlog cannot build up
     // between pipeline stages and age the presented result.
@@ -2637,6 +2843,9 @@ struct Feature
     bool fusedColorAllowed = true;
     FusedColorInput fusedColor[kSlots];
     std::vector<FusedColorInput> retiredFusedColor;
+    bool fusedOutputAllowed = true;
+    FusedColorInput fusedOutput[kOutputSlots];
+    std::vector<FusedColorInput> retiredFusedOutput;
     VramImage colorConversion;
     VramImage depthConversion;
     VramImage motionConversion;
@@ -2700,6 +2909,7 @@ struct Feature
     unsigned int engineMLastWidth = 0, engineMLastHeight = 0;
     unsigned int engineMRenderWidth = 0, engineMRenderHeight = 0; // first evaluation's effective extent
     std::unique_ptr<d4r::GameDenoiser> engineR; // Ray Reconstruction (engine/runtime_rr.inc)
+    ProfileClock::time_point engineRProfileAt{};
     // Preset M and preset K with the network on the native HIP layers ([Engine] Network): the buffers shared
     // with HIP and the bridge's network. The game's list is split around the network, as for the CUDA backend's
     // split frames. `engineHead` is the network's result (M's expansion / K's final store reads it).
@@ -2793,6 +3003,7 @@ static bool create_buffer(D3D12_HEAP_TYPE heapType, UINT64 size, ID3D12Resource*
 struct Feature;
 static bool profile_timestamps_ready(Feature& feature);
 static void profile_timestamp(Feature& feature, ID3D12GraphicsCommandList* list, uint32_t frame, int point);
+static void read_profile_timestamps(Feature& feature, uint32_t frame, FrameTiming& timing);
 
 // Ensures staging matches the resource's first subresource; heap selects
 // readback (inputs) or upload (output).
@@ -3170,6 +3381,7 @@ struct VulkanInterop
     PFN_vkUnmapMemory unmap = nullptr;
     PFN_vkCmdPipelineBarrier barrier = nullptr;
     PFN_vkCmdCopyImageToBuffer copyImageToBuffer = nullptr;
+    PFN_vkCmdCopyBuffer copyBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage copyBufferToImage = nullptr;
     PFN_vkCmdBlitImage blit = nullptr;
     PFN_vkCmdFillBuffer fill = nullptr;
@@ -3180,6 +3392,343 @@ struct VulkanInterop
     int(WINAPI* release)(void*) = nullptr;
 };
 static VulkanInterop g_vk;
+
+struct NativeCameraSource
+{
+    uint64_t buffer, offset, bytes, shader;
+    uint32_t width, height;
+};
+static_assert(sizeof(NativeCameraSource) == 40);
+
+static bool record_motion_constants(ID3D12GraphicsCommandList* list, Staging& target,
+        ID3D12Resource* motion,uint32_t frame,uint32_t guidValue,uint64_t shader,uint64_t expectedBytes)
+{
+    const GUID guid = {guidValue,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+    NativeCameraSource source = {};
+    UINT bytes = sizeof(source);
+    if (FAILED(motion->GetPrivateData(guid, &bytes, &source)) || bytes != sizeof(source) ||
+        (source.shader != shader && !(shader==UINT64_C(0xc5d8688e46fd5c66) && source.shader==UINT64_C(0xafe29e382bf4bdb4))) || source.bytes != expectedBytes || !source.buffer)
+    {
+        logf("native motion capture frame %u: composition constants unavailable", frame);
+        return false;
+    }
+    if (target.total && target.total!=source.bytes) target.retire();
+    if (target.buffer == nullptr &&
+        !create_buffer(D3D12_HEAP_TYPE_READBACK, source.bytes, &target.buffer, &target.mapped))
+        return false;
+    UINT64 handle = 0, offset = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    if (g_vk.copyBuffer == nullptr ||
+        FAILED(g_vk.interop->GetVulkanResourceInfo1(target.buffer, &handle, &offset, &format)) || !handle)
+        return false;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list, &cmd)))
+        return false;
+    const VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        1, &before, 0, nullptr, 0, nullptr);
+    const VkBufferCopy region = {source.offset, offset, source.bytes};
+    g_vk.copyBuffer(cmd, reinterpret_cast<VkBuffer>(source.buffer), reinterpret_cast<VkBuffer>(handle), 1, &region);
+    const VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+        1, &after, 0, nullptr, 0, nullptr);
+    const bool recorded = SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+    if (recorded)
+    {
+        target.total = source.bytes;
+        logf("native motion capture frame %u: %llu composition constant bytes for %ux%u", frame,
+            static_cast<unsigned long long>(source.bytes), source.width, source.height);
+    }
+    return recorded;
+}
+
+// Diagnostic of GPU-owned camera storage, captured alongside the old raw-source
+// path to verify the ownership change without changing NGX inputs.
+static bool record_owned_motion_constants(ID3D12GraphicsCommandList* list, Staging& target,
+        ID3D12Resource* motion,uint32_t guidValue,uint64_t expectedBytes)
+{
+    const GUID guid={guidValue,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+    ID3D12Resource* source=nullptr;
+    UINT size=sizeof(source);
+    if(FAILED(motion->GetPrivateData(guid,&size,&source)) || !source) return false;
+    D3D12_RESOURCE_DESC desc;source->GetDesc(&desc);
+    bool recorded=false;
+    if(desc.Dimension==D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width==expectedBytes &&
+        g_vk.lifetime && SUCCEEDED(g_vk.lifetime->RetainExternalResources(list,source)))
+    {
+        if(target.total && target.total!=expectedBytes) target.retire();
+        if(target.buffer || create_buffer(D3D12_HEAP_TYPE_READBACK,expectedBytes,&target.buffer,&target.mapped))
+        {
+            list->CopyBufferRegion(target.buffer,0,source,0,expectedBytes);
+            target.total=expectedBytes;recorded=true;
+        }
+    }
+    source->Release();return recorded;
+}
+
+// These handles describe sources already bound by the composition pass. They are
+// used only for immediate diagnostic copies on this frame's command list; the
+// application's frame fence covers these copies alongside the original reads.
+struct NativeImageSource
+{
+    uint64_t image;
+    uint32_t width, height, layout, aspect;
+    uint64_t shader;
+};
+static_assert(sizeof(NativeImageSource) == 32);
+static bool record_original_motion_source(ID3D12GraphicsCommandList* list, ID3D12Resource* motion,
+                                          Staging& target, bool depth,uint32_t guidValue=0,uint64_t shader=UINT64_C(0xc5d8688e46fd5c66),uint32_t texelBytes=4,uint64_t expectedImage=0)
+{
+    const GUID guid = {guidValue ? guidValue : depth ? 0x7536783au : 0x75367839u,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+    NativeImageSource source = {};
+    UINT bytes = sizeof(source);
+    const uint32_t aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    if (FAILED(motion->GetPrivateData(guid, &bytes, &source)) || bytes != sizeof(source) ||
+        (source.shader != shader && !(shader==UINT64_C(0xc5d8688e46fd5c66) && source.shader==UINT64_C(0xafe29e382bf4bdb4))) || !source.image || source.aspect != aspect ||
+        !source.width || !source.height || source.width > 4096 || source.height > 4096 ||
+        source.layout == VK_IMAGE_LAYOUT_UNDEFINED || !texelBytes || texelBytes>16 || (expectedImage && source.image!=expectedImage))
+        return false;
+    const uint64_t total = static_cast<uint64_t>(source.width) * source.height * texelBytes;
+    if (target.total != total) target.retire();
+    if (target.buffer == nullptr && !create_buffer(D3D12_HEAP_TYPE_READBACK,total,&target.buffer,&target.mapped))
+        return false;
+    target.total = total; target.width = source.width; target.height = source.height;
+    UINT64 handle = 0, offset = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    if (FAILED(g_vk.interop->GetVulkanResourceInfo1(target.buffer,&handle,&offset,&format)) || !handle)
+        return false;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (FAILED(g_vk.interop->BeginVkCommandBufferInterop(list,&cmd))) return false;
+    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = static_cast<VkImageLayout>(source.layout);
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = reinterpret_cast<VkImage>(source.image);
+    barrier.subresourceRange = {aspect,0,1,0,1};
+    g_vk.barrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+    VkBufferImageCopy region = {};
+    region.bufferOffset = offset;
+    region.imageSubresource = {aspect,0,0,1};
+    region.imageExtent = {source.width,source.height,1};
+    g_vk.copyImageToBuffer(cmd,barrier.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,reinterpret_cast<VkBuffer>(handle),1,&region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = static_cast<VkImageLayout>(source.layout);
+    g_vk.barrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+    const VkMemoryBarrier host = {VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT};
+    g_vk.barrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&host,0,nullptr,0,nullptr);
+    return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+}
+
+// The diagnostic driver exposes the geometry sidecar linked by the game's final
+// motion composition pass. This records a separate readback; original inputs stay in use.
+static void arm_native_capture(uint32_t frame);
+static bool dump_frame_selected(uint32_t frame, const char* startName, const char* countName, const char* everyName);
+
+static void record_native_motion_capture(ID3D12GraphicsCommandList* list, InputSlot& slot,
+                                         ID3D12Resource* motion, uint32_t frame)
+{
+    slot.nativeMotionCaptureFrame = 0;
+    slot.nativeDepthCaptureReady = slot.nativeSceneCaptureReady = false;
+    slot.nativeOpaqueCaptureReady = slot.nativeGeometryCaptureReady = false;
+    if(slot.nativeValidityOwner) { slot.nativeValidityOwner->Release();slot.nativeValidityOwner=nullptr; }
+    slot.materialSceneCaptureReady=false;
+    slot.glassMaskCaptureReady=false;
+    slot.originalOpaqueCopyCaptureReady=false;
+    slot.nativeGpuStageValid=false;
+    slot.ownedValidityCaptureReady=slot.glassValidityCaptureReady=false;
+    slot.ownedDepthCaptureReady=false;
+    slot.ownedSceneCaptureReady=slot.ownedMatrixCaptureReady=false;
+    slot.nativePrimaryDepthCaptureReady=slot.opaqueSceneCaptureReady=false;
+    slot.opaqueMatrixCaptureReady=slot.originalPrimaryDepthCaptureReady=false;
+    slot.originalGeometryCaptureReady = slot.originalHardwareDepthCaptureReady = false;
+    char directory[MAX_PATH];
+    const DWORD length = GetEnvironmentVariableA("D4R_NATIVE_MV_CAPTURE_DIR", directory, MAX_PATH);
+    if(!length || length>=MAX_PATH) return;
+    // Freeze native capture selection before recording any per-frame copies.
+    // A worker noticing the trigger later cannot retroactively capture them.
+    arm_native_capture(frame);
+    if(!dump_frame_selected(frame,"D4R_NATIVE_MV_CAPTURE_START",
+        "D4R_NATIVE_MV_CAPTURE_COUNT","D4R_NATIVE_MV_CAPTURE_EVERY")) return;
+    {
+        const GUID maskGuid={0x75367847,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+        const GUID formatGuid={0x75367849,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+        ID3D12Resource* mask=nullptr;UINT size=sizeof(mask),formatSize=sizeof(slot.glassMaskFormat);
+        if(SUCCEEDED(motion->GetPrivateData(maskGuid,&size,&mask)) && mask)
+        {
+            UINT64 handle=0,offset=0;VkFormat format=VK_FORMAT_UNDEFINED;uint32_t bytes=0;
+            D3D12_RESOURCE_DESC maskDesc;mask->GetDesc(&maskDesc);
+            if(SUCCEEDED(motion->GetPrivateData(formatGuid,&formatSize,&slot.glassMaskFormat)))
+                switch(static_cast<DXGI_FORMAT>(slot.glassMaskFormat))
+                {
+                    case DXGI_FORMAT_R8_UNORM:bytes=1;break;
+                    case DXGI_FORMAT_R16_FLOAT:case DXGI_FORMAT_R16_UNORM:bytes=2;break;
+                    case DXGI_FORMAT_R32_FLOAT:case DXGI_FORMAT_D32_FLOAT:case DXGI_FORMAT_R16G16_FLOAT:case DXGI_FORMAT_R8G8B8A8_UNORM:bytes=4;break;
+                    case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R32G32_FLOAT:bytes=8;break;
+                    case DXGI_FORMAT_R32G32B32A32_FLOAT:bytes=16;break;
+                    default:break;
+                }
+            if(bytes && maskDesc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && maskDesc.SampleDesc.Count==1 &&
+                maskDesc.DepthOrArraySize==1 && g_vk.lifetime && SUCCEEDED(g_vk.lifetime->RetainExternalResources(list,mask)) &&
+                SUCCEEDED(g_vk.interop->GetVulkanResourceInfo1(mask,&handle,&offset,&format)))
+                slot.glassMaskCaptureReady=record_original_motion_source(list,motion,slot.glassMaskCapture,
+                    format==VK_FORMAT_D32_SFLOAT,0x75367848,UINT64_C(0xc5d8688e46fd5c66),bytes,handle);
+            logf("native material mask capture frame %u: format=%u ready=%d",frame,slot.glassMaskFormat,slot.glassMaskCaptureReady);
+            mask->Release();
+        }
+    }
+    slot.materialSceneCaptureReady=record_owned_motion_constants(list,slot.materialSceneCapture,motion,0x7536784a,1136);
+    // Opaque capture is independent of whether this scene runs the glass composition pass.
+    static const GUID opaqueGuid = {0x7536783b,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+    ID3D12Resource* opaque = nullptr;
+    UINT bytes = sizeof(opaque);
+    if (SUCCEEDED(motion->GetPrivateData(opaqueGuid,&bytes,&opaque)) && opaque != nullptr)
+    {
+        D3D12_RESOURCE_DESC opaqueDesc;
+        opaque->GetDesc(&opaqueDesc);
+        if (opaqueDesc.Format == DXGI_FORMAT_R16G16_FLOAT && g_vk.lifetime != nullptr &&
+            ensure_staging(slot.nativeOpaqueCapture,opaque,D3D12_HEAP_TYPE_READBACK) &&
+            SUCCEEDED(g_vk.lifetime->RetainExternalResources(list,opaque)))
+        {
+            copy_to_staging(list,opaque,slot.nativeOpaqueCapture,D3D12_RESOURCE_STATE_COMMON);
+            char opaquePath[MAX_PATH];
+            const int size=std::snprintf(opaquePath,MAX_PATH,"%s\\frame-%06u-%ux%u.geometry.rg16f",directory,
+                frame,static_cast<UINT>(opaqueDesc.Width),opaqueDesc.Height);
+            if (size>0 && size<MAX_PATH)
+            {
+                slot.nativeMotionCapturePath=opaquePath;
+                slot.nativeMotionCaptureFrame=frame;
+                slot.nativeOpaqueCaptureReady = true;
+            }
+            static const GUID primaryGuid={0x7536783c,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+            ID3D12Resource* primary=nullptr;
+            bytes=sizeof(primary);
+            if(SUCCEEDED(motion->GetPrivateData(primaryGuid,&bytes,&primary)) && primary)
+            {
+                D3D12_RESOURCE_DESC pd;primary->GetDesc(&pd);
+                if((pd.Format==DXGI_FORMAT_R32_TYPELESS || pd.Format==DXGI_FORMAT_D32_FLOAT) &&
+                    pd.Width==opaqueDesc.Width && pd.Height==opaqueDesc.Height &&
+                    ensure_staging(slot.nativePrimaryDepthCapture,primary,D3D12_HEAP_TYPE_READBACK) &&
+                    SUCCEEDED(g_vk.lifetime->RetainExternalResources(list,primary)))
+                {
+                    copy_to_staging(list,primary,slot.nativePrimaryDepthCapture,D3D12_RESOURCE_STATE_COMMON);
+                    slot.nativePrimaryDepthCaptureReady=true;
+                }
+                primary->Release();
+            }
+            const GUID ownedDepthGuid={0x75367842,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+            ID3D12Resource* ownedDepth=nullptr;bytes=sizeof(ownedDepth);
+            if(SUCCEEDED(motion->GetPrivateData(ownedDepthGuid,&bytes,&ownedDepth)) && ownedDepth)
+            {
+                D3D12_RESOURCE_DESC pd;ownedDepth->GetDesc(&pd);
+                if((pd.Format==DXGI_FORMAT_R32_TYPELESS || pd.Format==DXGI_FORMAT_D32_FLOAT) &&
+                    pd.Width==opaqueDesc.Width && pd.Height==opaqueDesc.Height &&
+                    ensure_staging(slot.ownedDepthCapture,ownedDepth,D3D12_HEAP_TYPE_READBACK) &&
+                    SUCCEEDED(g_vk.lifetime->RetainExternalResources(list,ownedDepth)))
+                {
+                    copy_to_staging(list,ownedDepth,slot.ownedDepthCapture,D3D12_RESOURCE_STATE_COMMON);
+                    slot.ownedDepthCaptureReady=true;
+                }
+                ownedDepth->Release();
+            }
+            slot.opaqueSceneCaptureReady=record_motion_constants(list,slot.opaqueSceneCapture,motion,frame,
+                0x7536783e,UINT64_C(0xc539803a4bac94ac),71*16);
+            slot.opaqueMatrixCaptureReady=record_motion_constants(list,slot.opaqueMatrixCapture,motion,frame,
+                0x7536783d,UINT64_C(0xc539803a4bac94ac),4*16);
+            {
+                const GUID originalGuid={0x75367846,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+                ID3D12Resource* original=nullptr;UINT originalBytes=sizeof(original);
+                if(SUCCEEDED(motion->GetPrivateData(originalGuid,&originalBytes,&original)) && original)
+                {
+                    D3D12_RESOURCE_DESC od;original->GetDesc(&od);
+                    if(od.Format==DXGI_FORMAT_R16G16_FLOAT && ensure_staging(slot.originalOpaqueCopyCapture,original,D3D12_HEAP_TYPE_READBACK) &&
+                        SUCCEEDED(g_vk.lifetime->RetainExternalResources(list,original)))
+                    {
+                        copy_to_staging(list,original,slot.originalOpaqueCopyCapture,D3D12_RESOURCE_STATE_COMMON);
+                        slot.originalOpaqueCopyCaptureReady=true;
+                    }
+                    original->Release();
+                }
+            }
+            slot.ownedValidityCaptureReady=record_owned_motion_constants(list,slot.ownedValidityCapture,motion,0x75367843,8);
+            if(slot.ownedValidityCaptureReady) { slot.nativeValidityOwner=motion;motion->AddRef(); }
+            slot.ownedSceneCaptureReady=record_owned_motion_constants(list,slot.ownedSceneCapture,motion,0x75367840,1136);
+            slot.ownedMatrixCaptureReady=record_owned_motion_constants(list,slot.ownedMatrixCapture,motion,0x75367841,64);
+            logf("native motion capture frame %u: owned scene/matrix %d/%d",frame,
+                slot.ownedSceneCaptureReady,slot.ownedMatrixCaptureReady);
+            slot.originalPrimaryDepthCaptureReady=record_original_motion_source(list,motion,slot.originalPrimaryDepthCapture,
+                true,0x7536783f,UINT64_C(0xc539803a4bac94ac));
+            logf("native motion capture frame %u: primary depth/scene/matrix/original %d/%d/%d/%d",frame,
+                slot.nativePrimaryDepthCaptureReady,slot.opaqueSceneCaptureReady,slot.opaqueMatrixCaptureReady,
+                slot.originalPrimaryDepthCaptureReady);
+            logf("native motion capture frame %u: opaque per-object source %p %llux%u",frame,opaque,
+                static_cast<unsigned long long>(opaqueDesc.Width),opaqueDesc.Height);
+        }
+        opaque->Release();
+    }
+    static const GUID guid = {0x75367836,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+    ID3D12Resource* native = nullptr;
+    bytes = sizeof(native);
+    if (FAILED(motion->GetPrivateData(guid, &bytes, &native)) || native == nullptr)
+    {
+        logf("native motion capture frame %u: no geometry sidecar linked", frame);
+        return;
+    }
+    D3D12_RESOURCE_DESC desc;
+    native->GetDesc(&desc);
+    const bool ready = desc.Format == DXGI_FORMAT_R16G16_FLOAT &&
+        ensure_staging(slot.nativeMotionCapture, native, D3D12_HEAP_TYPE_READBACK) &&
+        g_vk.lifetime != nullptr && SUCCEEDED(g_vk.lifetime->RetainExternalResources(list, native));
+    if (ready)
+    {
+        copy_to_staging(list, native, slot.nativeMotionCapture, D3D12_RESOURCE_STATE_COMMON);
+        char path[MAX_PATH];
+        const int size = std::snprintf(path, MAX_PATH, "%s\\frame-%06u-%ux%u.geometry.rg16f", directory,
+            frame, static_cast<UINT>(desc.Width), desc.Height);
+        if (size > 0 && size < MAX_PATH)
+        {
+            slot.nativeMotionCapturePath = path;
+            slot.nativeMotionCaptureFrame = frame;
+            slot.nativeGeometryCaptureReady = true;
+            logf("native motion capture frame %u: geometry sidecar %p %llux%u (original NGX input retained)",
+                frame, native, static_cast<unsigned long long>(desc.Width), desc.Height);
+        }
+    }
+    if (slot.nativeMotionCaptureFrame == frame)
+    {
+        static const GUID depthGuid = {0x75367837,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+        ID3D12Resource* nativeDepth = nullptr;
+        bytes = sizeof(nativeDepth);
+        if (SUCCEEDED(motion->GetPrivateData(depthGuid, &bytes, &nativeDepth)) && nativeDepth != nullptr)
+        {
+            D3D12_RESOURCE_DESC depthDesc;
+            nativeDepth->GetDesc(&depthDesc);
+            if ((depthDesc.Format == DXGI_FORMAT_R32_TYPELESS || depthDesc.Format == DXGI_FORMAT_D32_FLOAT) &&
+                depthDesc.Width == desc.Width && depthDesc.Height == desc.Height &&
+                ensure_staging(slot.nativeDepthCapture, nativeDepth, D3D12_HEAP_TYPE_READBACK) &&
+                SUCCEEDED(g_vk.lifetime->RetainExternalResources(list, nativeDepth)))
+            {
+                copy_to_staging(list, nativeDepth, slot.nativeDepthCapture, D3D12_RESOURCE_STATE_COMMON);
+                slot.glassValidityCaptureReady=record_owned_motion_constants(list,slot.glassValidityCapture,nativeDepth,0x75367845,4);
+                slot.nativeDepthCaptureReady = true;
+            }
+            nativeDepth->Release();
+        }
+        slot.nativeSceneCaptureReady = record_motion_constants(list,slot.nativeSceneCapture,motion,frame,0x75367838,UINT64_C(0xc5d8688e46fd5c66),71*16);
+        slot.originalGeometryCaptureReady = record_original_motion_source(list,motion,slot.originalGeometryCapture,false);
+        slot.originalHardwareDepthCaptureReady = record_original_motion_source(list,motion,slot.originalHardwareDepthCapture,true);
+        logf("native motion capture frame %u: original geometry/depth readbacks %d/%d",frame,
+            slot.originalGeometryCaptureReady,slot.originalHardwareDepthCaptureReady);
+    }
+    native->Release(); // the allocator retains it through completion
+}
+
+
 static D4rVkStaging g_fusedColorStage;
 // D4R_SHIM_GPU_COMPLETION: the bounded completion-word wait (kernels/support/vulkan_wait.comp)
 static D4rVkStaging g_waitStage;
@@ -3261,6 +3810,7 @@ static void init_vram_interop()
     load(g_vk.unmap, "vkUnmapMemory");
     load(g_vk.barrier, "vkCmdPipelineBarrier");
     load(g_vk.copyImageToBuffer, "vkCmdCopyImageToBuffer");
+    load(g_vk.copyBuffer, "vkCmdCopyBuffer");
     load(g_vk.copyBufferToImage, "vkCmdCopyBufferToImage");
     load(g_vk.blit, "vkCmdBlitImage");
     g_vk.fill = reinterpret_cast<PFN_vkCmdFillBuffer>(deviceProc(g_vk.device, "vkCmdFillBuffer"));
@@ -3275,7 +3825,8 @@ static void init_vram_interop()
         FAILED(g.device->QueryInterface(__uuidof(ID3D12DXVKInteropDeviceD4R3), reinterpret_cast<void**>(&g_vk.linear))))
         g_vk.linear = nullptr;
     g_vk.ready = ok;
-    if (ok && env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 0) != 0)
+    if (ok && (env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 0) != 0 ||
+               env_uint("D4R_SHIM_FUSE_R11_OUTPUT", 0) != 0 || env_uint("D4R_SHIM_FUSE_R11_INPUT", 0) != 0))
     {
         g_fusedColorReady = g_fusedColorStage.init(g_vk.device, deviceProc);
         if (!g_fusedColorReady) g_fusedColorStage.destroy();
@@ -3691,10 +4242,15 @@ static VkBufferImageCopy full_region(const VramCopy& copy)
     return region;
 }
 
-static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* source, const VramCopy& copy)
+static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* source, const VramCopy& copy, uint32_t frame=0)
 {
-    if (!g_fusedColorReady || !feature.fusedColorAllowed || env_uint("D4R_SHIM_FUSE_RGBA8_INPUT", 0) == 0 || source->GetDesc().Format != DXGI_FORMAT_R8G8B8A8_UNORM ||
-        (source->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return false;
+    const auto desc=source->GetDesc();
+    const bool rgba8=desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM && env_uint("D4R_SHIM_FUSE_RGBA8_INPUT",0)!=0;
+    const unsigned requested=env_uint("D4R_SHIM_FUSE_R11_INPUT",0);
+    const bool r11=desc.Format==DXGI_FORMAT_R11G11B10_FLOAT &&
+        (requested==1 || (requested==2 && (frame/300)%4>=2));
+    if (!g_fusedColorReady || !feature.fusedColorAllowed || (!rgba8 && !r11) ||
+        (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) return false;
     // Descriptor/image lifetimes extend through allocator retirement, including discarded lists.
     // Bound that retention if a game creates a new transient input resource every frame; fallback
     // to the original blit/copy path without invalidating descriptors already recorded on the GPU.
@@ -3710,7 +4266,8 @@ static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* 
     if (slot.owner != nullptr) feature.retiredFusedColor.push_back(slot);
     slot = {};
     VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = copy.image; view.viewType = VK_IMAGE_VIEW_TYPE_2D; view.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view.image = copy.image; view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = rgba8 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (g_vk.createView(g_vk.device, &view, nullptr, &slot.view) != VK_SUCCESS) return false;
     if (!g_fusedColorStage.set(slot.set, slot.view, view.format, target.buffer, feature.inputs[slotIndex].host[0].size(), false))
@@ -3718,7 +4275,8 @@ static bool ensure_fused_color(Feature& feature, int slotIndex, ID3D12Resource* 
         g_fusedColorStage.free(slot.set); g_vk.destroyView(g_vk.device, slot.view, nullptr); slot = {}; return false;
     }
     slot.image = copy.image; slot.buffer = target.buffer; slot.owner = source; source->AddRef();
-    logf("fused RGBA8 input conversion active for slot %d", slotIndex);
+    slot.inputMode=rgba8 ? 5 : 1;
+    logf("fused %s input conversion active for slot %d", rgba8 ? "RGBA8" : "R11G11B10", slotIndex);
     return true;
 }
 
@@ -3751,7 +4309,7 @@ static bool record_vram_inputs(Feature& feature, ID3D12GraphicsCommandList* list
             g_vk.barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &sampled);
             auto& stage = feature.fusedColor[&slot - feature.inputs];
-            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, 5, slot.host[0].rowBytes / 8);
+            g_fusedColorStage.record(cmd, stage.set, copy.width, copy.height, stage.inputMode, slot.host[0].rowBytes / 8);
             sampled.srcAccessMask = VK_ACCESS_SHADER_READ_BIT; sampled.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             sampled.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; sampled.newLayout = layout;
             g_vk.barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3857,6 +4415,78 @@ static bool record_vram_output(ID3D12GraphicsCommandList* list, const VramBuffer
     g_vk.barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &kAfterTransfer, 0,
                  nullptr, 0, nullptr);
     return SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+}
+
+// Reuse the storage-output shader to combine half decoding and the game's
+// R11G11B10 conversion. Descriptors retain their images through allocator retirement.
+static bool record_feature_vram_output(Feature& feature, unsigned slotIndex, ID3D12GraphicsCommandList* list,
+                                      ID3D12Resource* output, D3D12_RESOURCE_STATES outputState,
+                                      const VramCopy& copy, uint32_t frame=0)
+{
+    feature.recordOutputFused=false;
+    const auto& buffer=feature.outputs[slotIndex].vram;
+    const auto desc=output->GetDesc();
+    const unsigned requested=env_uint("D4R_SHIM_FUSE_R11_OUTPUT",0);
+    // Mode 2 alternates warmed 300-frame blocks for same-launch total-cost comparisons.
+    const bool selected=requested==1 || (requested==2 && (frame/300)%2==1);
+    bool fused=g_fusedColorReady && feature.fusedOutputAllowed && copy.convert &&
+        selected && desc.Format==DXGI_FORMAT_R11G11B10_FLOAT &&
+        (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)!=0 &&
+        buffer.bytes>=size_t(copy.width)*copy.height*8;
+    auto& slot=feature.fusedOutput[slotIndex];
+    if(fused && (slot.owner!=output || slot.image!=copy.image || slot.buffer!=buffer.buffer))
+    {
+        if(feature.retiredFusedOutput.size()>=64)
+            feature.fusedOutputAllowed=fused=false;
+        else
+        {
+            if(slot.owner) feature.retiredFusedOutput.push_back(slot);
+            slot={};
+            VkImageViewCreateInfo view={VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view.image=copy.image;view.viewType=VK_IMAGE_VIEW_TYPE_2D;view.format=VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+            fused=g_vk.createView(g_vk.device,&view,nullptr,&slot.view)==VK_SUCCESS;
+            if(fused) fused=g_fusedColorStage.set(slot.set,slot.view,view.format,buffer.buffer,
+                                                size_t(copy.width)*copy.height*8,true);
+            if(fused)
+            {
+                slot.owner=output;output->AddRef();slot.image=copy.image;slot.buffer=buffer.buffer;
+                logf("fused R11G11B10 output conversion active for slot %u",slotIndex);
+            }
+            else
+            {
+                g_fusedColorStage.free(slot.set);
+                if(slot.view) g_vk.destroyView(g_vk.device,slot.view,nullptr);
+                slot={};feature.fusedOutputAllowed=false;
+            }
+        }
+    }
+    if(fused)
+    {
+        transition(list,output,outputState,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        VkCommandBuffer cmd=VK_NULL_HANDLE;
+        bool recorded=SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list,&cmd));
+        if(recorded)
+        {
+            const VkMemoryBarrier before={VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,VK_ACCESS_MEMORY_WRITE_BIT,
+                                          VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
+            g_vk.barrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,
+                         1,&before,0,nullptr,0,nullptr);
+            g_fusedColorStage.record(cmd,slot.set,copy.width,copy.height);
+            const VkMemoryBarrier after={VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT};
+            g_vk.barrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,
+                         1,&after,0,nullptr,0,nullptr);
+            recorded=SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+        }
+        transition(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,outputState);
+        if(recorded) {feature.recordOutputFused=true;return true;}
+        feature.fusedOutputAllowed=false;
+    }
+    transition(list,output,outputState,D3D12_RESOURCE_STATE_COPY_DEST);
+    const bool recorded=record_vram_output(list,buffer,copy,feature.outputConversion);
+    transition(list,output,D3D12_RESOURCE_STATE_COPY_DEST,outputState);
+    return recorded;
 }
 
 // --- Split frames -------------------------------------------------------------------
@@ -4020,8 +4650,100 @@ static bool ensure_conversion_image(Feature& feature, VramImage& image, UINT wid
     return create_vram_image(image, width, height, format);
 }
 
+// Diagnostic first: native inputs travel GPU image/buffer -> per-slot imported
+// VRAM -> HIP. Only selected capture frames pay for readback/reference checks.
+// This composes opaque+camera motion; it does not substitute live NGX inputs.
+static void record_native_gpu_check(Feature& feature, ID3D12GraphicsCommandList* list,
+        InputSlot& slot, ID3D12Resource* motion)
+{
+    slot.nativeGpuCheckReady=false;
+    slot.nativeLive=false;
+    const bool live=env_uint("D4R_NATIVE_MV_LIVE",0)==1 && !feature.rayReconstruction && (feature.flags&2)!=0;
+    const bool check=env_uint("D4R_NATIVE_MV_GPU_COMPOSE_CHECK",0)==1 && slot.nativeOpaqueCaptureReady &&
+        slot.ownedSceneCaptureReady && slot.ownedMatrixCaptureReady && slot.ownedDepthCaptureReady &&
+        slot.ownedValidityCaptureReady;
+    if((!live && !check) || !g.cu.composeNativeMotion || !g_vk.lifetime) return;
+    if(!slot.ownedValidityCaptureReady)
+    {
+        // Live frames have no diagnostic capture; the GPU validity words are read after the input marker.
+        slot.ownedValidityCaptureReady=record_owned_motion_constants(list,slot.ownedValidityCapture,motion,0x75367843,8);
+        if(!slot.ownedValidityCaptureReady) return;
+        if(slot.nativeValidityOwner) slot.nativeValidityOwner->Release();
+        slot.nativeValidityOwner=motion;motion->AddRef();
+    }
+    ID3D12Resource* sources[4]={};
+    const uint32_t ids[4]={0x75367842,0x7536783b,0x75367840,0x75367841};
+    D3D12_RESOURCE_DESC desc[4]={};
+    VramCopy copies[2]={};UINT64 handles[2]={},offsets[2]={};
+    bool ready=true;
+    for(int i=0;i<4;i++)
+    {
+        const GUID guid={ids[i],0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+        UINT size=sizeof(sources[i]);
+        if(FAILED(motion->GetPrivateData(guid,&size,&sources[i])) || size!=sizeof(sources[i]) || !sources[i]) { ready=false;break; }
+        sources[i]->GetDesc(&desc[i]);
+        if(FAILED(g_vk.lifetime->RetainExternalResources(list,sources[i]))) { ready=false;break; }
+    }
+    if(ready)
+    {
+        ready=(desc[0].Format==DXGI_FORMAT_R32_TYPELESS || desc[0].Format==DXGI_FORMAT_D32_FLOAT) &&
+            desc[1].Format==DXGI_FORMAT_R16G16_FLOAT && desc[0].Width==desc[1].Width && desc[0].Height==desc[1].Height &&
+            desc[0].Width==feature.outputWidth && desc[0].Height==feature.outputHeight && desc[0].Width<=4096 && desc[0].Height<=4096 &&
+            desc[2].Dimension==D3D12_RESOURCE_DIMENSION_BUFFER && desc[2].Width==1136 &&
+            desc[3].Dimension==D3D12_RESOURCE_DIMENSION_BUFFER && desc[3].Width==64;
+        for(int i=0;i<2 && ready;i++)
+            ready=desc[i].Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc[i].SampleDesc.Count==1 &&
+                desc[i].MipLevels==1 && desc[i].DepthOrArraySize==1 &&
+                describe_vram_copy(sources[i],i==0 ? Plane::Depth : Plane::Motion,copies[i]) && !copies[i].convert;
+        for(int i=0;i<2 && ready;i++)
+        {
+            VkFormat format=VK_FORMAT_UNDEFINED;
+            ready=SUCCEEDED(g_vk.interop->GetVulkanResourceInfo1(sources[i+2],&handles[i],&offsets[i],&format)) && handles[i];
+        }
+        const size_t pixels=static_cast<size_t>(desc[0].Width)*desc[0].Height;
+        for(int i=0;i<4 && ready;i++)
+            ready=ensure_vram_buffer(feature,slot.nativeGpuInputs[i],i<2 ? pixels*4 : i==2 ? 1136 : 64);
+    }
+    if(ready)
+    {
+        for(int i=0;i<2;i++) transition(list,sources[i],D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        VkCommandBuffer cmd=VK_NULL_HANDLE;
+        ready=SUCCEEDED(g_vk.interop->BeginVkCommandBufferInterop(list,&cmd));
+        if(ready)
+        {
+            g_vk.barrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&kBeforeTransfer,0,nullptr,0,nullptr);
+            for(int i=0;i<2;i++)
+            {
+                VkImageLayout layout=VK_IMAGE_LAYOUT_GENERAL;
+                g_vk.interop->GetVulkanImageLayout(sources[i],D3D12_RESOURCE_STATE_COPY_SOURCE,&layout);
+                const VkBufferImageCopy region=full_region(copies[i]);
+                g_vk.copyImageToBuffer(cmd,copies[i].image,layout,slot.nativeGpuInputs[i].buffer,1,&region);
+                const VkBufferCopy regionBuffer={offsets[i],0,i==0 ? 1136u : 64u};
+                g_vk.copyBuffer(cmd,reinterpret_cast<VkBuffer>(handles[i]),slot.nativeGpuInputs[i+2].buffer,1,&regionBuffer);
+            }
+            g_vk.barrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&kAfterTransfer,0,nullptr,0,nullptr);
+            ready=SUCCEEDED(g_vk.interop->EndVkCommandBufferInterop(list));
+        }
+        for(int i=0;i<2;i++) transition(list,sources[i],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    }
+    if(ready) { slot.nativeGpuWidth=static_cast<UINT>(desc[0].Width);slot.nativeGpuHeight=desc[0].Height;slot.nativeGpuCheckReady=true;slot.nativeLive=live; }
+    for(auto* source : sources) if(source) source->Release();
+    {
+        static std::atomic<unsigned> logged{0};
+        if(!live || logged.fetch_add(1)<16) logf("native GPU composition inputs recorded=%d live=%d",ready,live);
+    }
+}
+
 static void release_vram(Feature& feature)
 {
+    for (auto& stage : feature.fusedOutput) feature.retiredFusedOutput.push_back(stage);
+    for (auto& stage : feature.retiredFusedOutput)
+    {
+        g_fusedColorStage.free(stage.set);
+        if (stage.view != VK_NULL_HANDLE) g_vk.destroyView(g_vk.device, stage.view, nullptr);
+        if (stage.owner != nullptr) stage.owner->Release();
+    }
+    feature.retiredFusedOutput.clear();
     for (auto& stage : feature.fusedColor) feature.retiredFusedColor.push_back(stage);
     for (auto& stage : feature.retiredFusedColor)
     {
@@ -4041,6 +4763,8 @@ static void release_vram(Feature& feature)
     for (InputSlot& slot : feature.inputs)
         for (VramBuffer& buffer : slot.vram)
             recycle_vram_buffer(buffer);
+    for (InputSlot& slot : feature.inputs)
+        for (VramBuffer& buffer : slot.nativeGpuInputs) recycle_vram_buffer(buffer);
     for (OutputSlot& slot : feature.outputs)
         recycle_vram_buffer(slot.vram);
     for (AlphaSlot& slot : feature.alpha)
@@ -4258,6 +4982,17 @@ static void log_output_hash(const HostPlane& host, uint32_t frame)
 }
 
 static std::atomic<uint32_t> g_captureFirst{0}; // first frame of a triggered capture
+static void arm_native_capture(uint32_t frame)
+{
+    char trigger[MAX_PATH];
+    const DWORD length=GetEnvironmentVariableA("D4R_SHIM_CAPTURE_TRIGGER",trigger,MAX_PATH);
+    if(length && length<MAX_PATH && GetFileAttributesA(trigger)!=INVALID_FILE_ATTRIBUTES)
+    {
+        uint32_t expected=0;
+        if(g_captureFirst.compare_exchange_strong(expected,frame))
+            logf("native capture armed before frame %u input copies",frame);
+    }
+}
 
 static bool dump_frame_selected(uint32_t frame, const char* startName, const char* countName, const char* everyName)
 {
@@ -4266,7 +5001,10 @@ static bool dump_frame_selected(uint32_t frame, const char* startName, const cha
     if (triggerLength > 0 && triggerLength < MAX_PATH)
     {
         uint32_t captured = g_captureFirst.load();
-        if (captured == 0 && GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
+        // Native D3D12 captures arm only on the recording thread, before its
+        // copies. Preserve the existing trigger behavior for other captures.
+        const bool nativeCapture=GetEnvironmentVariableA("D4R_NATIVE_MV_CAPTURE_DIR",nullptr,0)!=0;
+        if (captured == 0 && !nativeCapture && GetFileAttributesA(trigger) != INVALID_FILE_ATTRIBUTES)
         {
             uint32_t expected = 0;
             if (g_captureFirst.compare_exchange_strong(expected, frame))
@@ -6132,23 +6870,46 @@ static bool ensure_linear_inputs(InputSlot& slot, bool hasExposure)
 // VRAM interop, worker thread: moves the planes from the imported buffers
 // Opt-in thin-feature motion coverage. Keep the original imported velocity buffer
 // immutable; the new texture is owned by this input slot until its GPU work retires.
+static bool motion_dilation_parameters(Feature& feature, const InputSlot& slot, const FrameParams& p,
+                                       D4rMotionDilationParams& args)
+{
+    const unsigned radius = env_uint("D4R_MOTION_DILATION", 0);
+    const auto& depth = slot.host[1];
+    const auto& motion = slot.host[2];
+    args = {slot.vram[1].device, slot.vram[2].device, slot.dilatedMotion,
+        depth.rowBytes, motion.rowBytes, p.renderWidth, p.renderHeight, motion.width, motion.height,
+        p.jitterX, p.jitterY, radius, (feature.flags & 8u) != 0};
+    const bool geometry = d4r_motion_dilation_geometry(&args, feature.flags, feature.outWidth, feature.outHeight);
+    return radius >= 1 && radius <= 2 && p.vram && feature.linearInputs && g.cu.dilateMotion != nullptr &&
+        geometry && p.colorBaseX == 0 && p.colorBaseY == 0 && p.depthBaseX == 0 &&
+        p.depthBaseY == 0 && p.mvBaseX == 0 && p.mvBaseY == 0 && p.outputBaseX == 0 && p.outputBaseY == 0 &&
+        p.renderWidth > 0 && p.renderHeight > 0 && std::isfinite(p.jitterX) && std::isfinite(p.jitterY) &&
+        p.renderWidth <= depth.width && p.renderHeight <= depth.height;
+}
+
+// All lazy allocations/module initialization must precede a GPU-side input wait.
+// Warm each slot through CPU marker polling first; geometry changes return it to
+// that route. The generic fallback can copy synchronously, so keep it CPU-polled.
+static bool motion_dilation_gpu_wait_ready(Feature& feature, const InputSlot& slot, const FrameParams& p)
+{
+    if (env_uint("D4R_MOTION_DILATION", 0) == 0)
+        return true;
+    D4rMotionDilationParams args = {};
+    const auto& motion = slot.host[2];
+    return g.cu.dilateMotionPadded != nullptr && slot.dilationEnqueued && slot.dilatedTexture != 0 &&
+        slot.dilatedBytes >= motion.size() && slot.dilatedWidth == motion.width &&
+        slot.dilatedHeight == motion.height && slot.dilatedPitch == motion.rowBytes &&
+        motion_dilation_parameters(feature, slot, p, args) && d4r_motion_dilation_lds_eligible(&args);
+}
+
 static CudaObject prepare_dilated_motion(Feature& feature, InputSlot& slot, const FrameParams& p)
 {
     const unsigned radius = env_uint("D4R_MOTION_DILATION", 0);
     if (radius == 0)
         return 0;
-    const auto& depth = slot.host[1];
     const auto& motion = slot.host[2];
-    D4rMotionDilationParams args = {slot.vram[1].device, slot.vram[2].device, slot.dilatedMotion,
-        depth.rowBytes, motion.rowBytes, p.renderWidth, p.renderHeight, motion.width, motion.height,
-        p.jitterX, p.jitterY, radius, (feature.flags & 8u) != 0};
-    const bool motionGeometry = d4r_motion_dilation_geometry(&args, feature.flags,
-                                                            feature.outWidth, feature.outHeight);
-    const bool supported = radius <= 2 && p.vram && feature.linearInputs && g.cu.dilateMotion != nullptr &&
-        motionGeometry && p.colorBaseX == 0 && p.colorBaseY == 0 && p.depthBaseX == 0 &&
-        p.depthBaseY == 0 && p.mvBaseX == 0 && p.mvBaseY == 0 && p.outputBaseX == 0 && p.outputBaseY == 0 &&
-        p.renderWidth > 0 && p.renderHeight > 0 && std::isfinite(p.jitterX) && std::isfinite(p.jitterY) &&
-        p.renderWidth <= depth.width && p.renderHeight <= depth.height;
+    D4rMotionDilationParams args = {};
+    const bool supported = motion_dilation_parameters(feature, slot, p, args);
     if (!supported)
     {
         if (!feature.dilationReported)
@@ -6161,6 +6922,7 @@ static CudaObject prepare_dilated_motion(Feature& feature, InputSlot& slot, cons
         slot.dilatedHeight != motion.height || slot.dilatedPitch != motion.rowBytes;
     if (recreate)
     {
+        slot.dilationEnqueued = false;
         if (slot.dilatedTexture != 0)
             g.cu.texObjectDestroy(slot.dilatedTexture), slot.dilatedTexture = 0;
         if (slot.dilatedMotion != 0)
@@ -6190,9 +6952,10 @@ static CudaObject prepare_dilated_motion(Feature& feature, InputSlot& slot, cons
     if (slot.dilatedTexture == 0)
         return 0;
     args.output = slot.dilatedMotion;
-    // Preserve allocation padding, which DLSS may sample at the active edge.
-    // The dilation kernel only writes the active render grid for low-res MVs.
-    if (args.motion_width != motion.width || args.motion_height != motion.height)
+    // LDS copies padding in the same launch. Older bridges and the display-res
+    // fallback retain the full-plane copy when their active grid is smaller.
+    const bool paddedLds = g.cu.dilateMotionPadded != nullptr && d4r_motion_dilation_lds_eligible(&args);
+    if (!paddedLds && (args.motion_width != motion.width || args.motion_height != motion.height))
     {
         CudaMemcpy2D copy = {};
         copy.srcMemoryType = copy.dstMemoryType = CUDA_MEMORY_DEVICE;
@@ -6204,10 +6967,15 @@ static CudaObject prepare_dilated_motion(Feature& feature, InputSlot& slot, cons
         if (copy_2d(copy) != 0)
             return 0;
     }
-    const int result = g.cu.dilateMotion(&args);
+    const bool thinRequested = env_uint("D4R_MOTION_THIN_SKY", 0) != 0;
+    const bool thin = thinRequested && paddedLds && g.cu.dilateMotionThin != nullptr;
+    const int result = thin ? g.cu.dilateMotionThin(&args, motion.height) :
+        paddedLds ? g.cu.dilateMotionPadded(&args, motion.height) : g.cu.dilateMotion(&args);
+    slot.dilationEnqueued = paddedLds && result == 0;
     if (!feature.dilationReported)
-        logf("motion-vector dilation %s: radius=%u render pixels, GPU status=%d, %s active=%ux%u allocation=%ux%u",
+        logf("motion-vector dilation %s: radius=%u render pixels, GPU status=%d, sky_fill=%s, %s active=%ux%u allocation=%ux%u",
              result == 0 ? "enabled" : "unavailable", radius, result,
+             thin ? "thin" : thinRequested ? "nearest (thin unsupported)" : "nearest",
              (feature.flags & 2u) != 0 ? "low-resolution" : "display-resolution",
              args.motion_width, args.motion_height, motion.width, motion.height);
     feature.dilationReported = true;
@@ -6475,6 +7243,13 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
     copy.dstPitch = rowBytes;
     copy.WidthInBytes = rowBytes;
     copy.Height = feature->output.height;
+    if(feature->wireOutputReady)
+    {
+        copy.srcMemoryType=CUDA_MEMORY_DEVICE;
+        copy.srcArray=nullptr;
+        copy.srcDevice=feature->wirePublishBuffer;
+        copy.srcPitch=rowBytes;
+    }
     if (params.outputInPlace != 0)
     {
         // no game-side copy was recorded: a result the output kernel did not redirect goes to the texture here
@@ -6483,7 +7258,7 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
         buffer.bytes = static_cast<size_t>(params.outputInPlacePitch) * feature->output.height;
     }
     int result = rowBytes / (params.packedOutput ? 2 : 1) * feature->output.height > buffer.bytes ? -1
-                 : feature->outputRedirected ? 0
+                 : feature->outputRedirected || feature->wirePublishedDirect ? 0
                  : params.packedOutput ? pack_output_on_host(*feature, copy, params.outputInPlace != 0 ? copy.dstPitch
                                                                                : rowBytes / 2, frame, params.packedRgba8)
                  : copy_2d(copy);
@@ -6567,6 +7342,14 @@ static void publish_vram(Feature* feature, uint32_t frame, const FrameParams& pa
             timing.dlssGpu = timing.gpuEval;
             timing.inputGpuWait = 0.0;
         }
+    }
+    if(result==0)
+    {
+        float ms=-1;
+        if(timing.nativeMotionTimed && g.cu.eventElapsedTime(&ms,feature->nativePassEvents[0],feature->nativePassEvents[1])==0)
+            timing.nativeMotionGpu=ms;
+        if(timing.wireRepairTimed && g.cu.eventElapsedTime(&ms,feature->nativePassEvents[2],feature->nativePassEvents[3])==0)
+            timing.wireRepairGpu=ms;
     }
     if (result != 0)
     {
@@ -6689,16 +7472,250 @@ static bool recreate_for_render_size(Feature& feature, FrameParams& params, uint
 
 static bool wait_for_input_marker(Feature* feature, int slotIndex, uint32_t frame);
 
-static bool ngx_gpu_wait_eligible(Feature& feature, const FrameParams& params, uint32_t frame)
+static bool ngx_gpu_wait_eligible(Feature& feature, const InputSlot& slot, const FrameParams& params, uint32_t frame)
 {
     char directory[MAX_PATH];
     // The denoiser can mix GPU guides with CPU-transcoded auxiliary guides and alpha readbacks. Keep
     // that mixed route on the CPU readiness contract; never infer that main-plane VRAM means all guides
-    // are GPU-only. Likewise verification, captures, dilation and host staging must see real input first.
+    // are GPU-only. Likewise verification, captures and host staging must see real input first.
     return feature.ngxGpuWait.load() && params.gpuInputMarker && params.vram && params.split && !feature.rayReconstruction &&
+           !slot.nativeLive &&
            env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0 && env_uint("D4R_SHIM_VRAM_ARRAY_VERIFY", 0) == 0 &&
-           env_uint("D4R_MOTION_DILATION", 0) == 0 && !input_dump_directory(frame, directory) &&
+           motion_dilation_gpu_wait_ready(feature, slot, params) && !input_dump_directory(frame, directory) &&
            (feature.linearInputs || (env_uint("D4R_SHIM_ASYNC_2D", 1) != 0 && g.cu.memcpy2DAsync != nullptr));
+}
+
+static void run_native_gpu_check(InputSlot& slot, const FrameParams& p, uint32_t frame)
+{
+    if(!slot.nativeGpuCheckReady || !slot.nativeGpuStageValid) return;
+    for(auto& buffer : slot.nativeGpuInputs)
+    {
+        // Pooled kind-0 buffers can originate from a guide that never needed
+        // a CUDA import. Import on the context-owning worker before use.
+        if(!buffer.external)
+        {
+            VkMemoryRequirements requirements={};g_vk.bufferRequirements(g_vk.device,buffer.buffer,&requirements);
+            const int imported=g_vk.import(g_vk.device,reinterpret_cast<uint64_t>(buffer.memory),requirements.size,&buffer.device,&buffer.external);
+            if(imported!=0) { logf("native GPU check frame %u: pooled buffer import failed %d",frame,imported);return; }
+        }
+        if(!buffer.device) { logf("native GPU check frame %u: missing input device address",frame);return; }
+    }
+    const size_t row=static_cast<size_t>(slot.nativeGpuWidth)*4;
+    const size_t bytes=row*slot.nativeGpuHeight;
+    if(slot.nativeGpuResultBytes!=bytes)
+    {
+        if(slot.nativeGpuResult) g.cu.memFree(slot.nativeGpuResult),slot.nativeGpuResult=0;
+        slot.nativeGpuResultBytes=0;
+        if(g.cu.memAlloc(&slot.nativeGpuResult,bytes)!=0) { logf("native GPU check frame %u: allocation failed",frame);return; }
+        slot.nativeGpuResultBytes=bytes;
+    }
+    const D4rNativeMotionParams args={slot.nativeGpuInputs[0].device,slot.nativeGpuInputs[1].device,
+        slot.nativeGpuInputs[2].device,slot.nativeGpuInputs[3].device,slot.nativeGpuResult,
+        row,row,row,slot.nativeGpuWidth,slot.nativeGpuHeight,p.renderWidth,p.renderHeight};
+    int result=g.cu.composeNativeMotion(&args);
+    if(result==0) result=g.cu.ctxSynchronize(); // diagnostic readback only; not a live pipeline timing path
+    std::vector<uint8_t> output(bytes);
+    CudaMemcpy2D copy={};copy.srcMemoryType=CUDA_MEMORY_DEVICE;copy.srcDevice=slot.nativeGpuResult;copy.srcPitch=row;
+    copy.dstMemoryType=CUDA_MEMORY_HOST;copy.dstHost=output.data();copy.dstPitch=row;copy.WidthInBytes=row;copy.Height=slot.nativeGpuHeight;
+    if(result==0) result=g.cu.memcpy2D(&copy);
+    const std::string base=slot.nativeMotionCapturePath.substr(0,slot.nativeMotionCapturePath.find(".geometry.rg16f"));
+    if(result==0) write_capture_file(frame,"GPU-only imported native composition",(base+".gpu-owned-dilated.rg16f").c_str(),output.data(),output.size());
+    logf("native GPU check frame %u: compose/sync/readback=%d size=%ux%u",frame,result,slot.nativeGpuWidth,slot.nativeGpuHeight);
+}
+
+// These events only bracket sampled live-native dispatches. Elapsed times are
+// read after the existing publication synchronization; no extra wait is added.
+static bool begin_native_pass_profile(Feature& feature,unsigned pair,uint32_t frame,const FrameTiming* timing)
+{
+    return timing && timing->enabled && profile_log_frame(frame) && feature.nativePassEvents[pair] &&
+        feature.nativePassEvents[pair+1] && g.cu.eventRecord(feature.nativePassEvents[pair],nullptr)==0;
+}
+
+static uint32_t wire_history_flags()
+{
+    return (env_uint("D4R_NATIVE_MV_WIRE_CONSERVATIVE",0)==1 ? D4R_WIRE_HISTORY_CONSERVATIVE : 0u) |
+        (env_uint("D4R_NATIVE_MV_WIRE_SKY_ONLY",0)==1 ? D4R_WIRE_HISTORY_SKY_ONLY : 0u);
+}
+
+// D4R_NATIVE_MV_LIVE, worker: composes the owned native inputs into an output-resolution field and exposes it as a
+// pitch-linear texture on the NGX stream. No CPU wait: the inputs were complete at the observed input marker and
+// the kernel runs on the same stream as NGX. Returns the texture, or 0 to keep the game's own vectors.
+static CudaObject compose_native_live(Feature& feature, InputSlot& slot, const FrameParams& p, uint32_t frame, FrameTiming* timing)
+{
+    feature.preparedWireAxesReady=false;
+    if(!slot.nativeLive || !slot.nativeGpuCheckReady || !slot.nativeGpuStageValid || !feature.linearInputs ||
+        !p.vram || p.colorBaseX || p.colorBaseY || p.depthBaseX || p.depthBaseY || p.mvBaseX || p.mvBaseY ||
+        p.outputBaseX || p.outputBaseY || p.renderWidth==0 || p.renderHeight==0 ||
+        slot.nativeGpuWidth!=feature.outWidth || slot.nativeGpuHeight!=feature.outHeight ||
+        !g.cu.composeNativeMotion || !g.cu.texObjectCreate || !g.cu.registerLinearTexture) return 0;
+    for(auto& buffer : slot.nativeGpuInputs)
+    {
+        if(!buffer.external)
+        {
+            VkMemoryRequirements requirements={};g_vk.bufferRequirements(g_vk.device,buffer.buffer,&requirements);
+            const int imported=g_vk.import(g_vk.device,reinterpret_cast<uint64_t>(buffer.memory),requirements.size,&buffer.device,&buffer.external);
+            if(imported!=0) { logf("native live frame %u: pooled buffer import failed %d",frame,imported);return 0; }
+        }
+        if(!buffer.device) { logf("native live frame %u: missing input device address",frame);return 0; }
+    }
+    const size_t rowIn=static_cast<size_t>(slot.nativeGpuWidth)*4;
+    const size_t rowOut=(rowIn+255)&~size_t(255);
+    const size_t bytes=rowOut*slot.nativeGpuHeight;
+    if(slot.nativeGpuResultBytes!=bytes)
+    {
+        if(slot.nativeGpuTexture) g.cu.texObjectDestroy(slot.nativeGpuTexture),slot.nativeGpuTexture=0;
+        if(slot.nativeGpuResult) g.cu.memFree(slot.nativeGpuResult),slot.nativeGpuResult=0;
+        slot.nativeGpuResultBytes=0;
+        if(g.cu.memAlloc(&slot.nativeGpuResult,bytes)!=0) { logf("native live frame %u: allocation failed",frame);return 0; }
+        slot.nativeGpuResultBytes=bytes;
+    }
+    if(slot.nativeGpuTexture==0 || slot.nativeTexPointer!=slot.nativeGpuResult || slot.nativeTexWidth!=slot.nativeGpuWidth ||
+        slot.nativeTexHeight!=slot.nativeGpuHeight || slot.nativeTexPitch!=rowOut)
+    {
+        if(slot.nativeGpuTexture) g.cu.texObjectDestroy(slot.nativeGpuTexture),slot.nativeGpuTexture=0;
+        struct Pitch2D { CudaDevicePtr pointer; uint32_t format, channels; size_t width, height, pitch; };
+        const Pitch2D pitch={slot.nativeGpuResult,plane_format(Plane::Motion),2,slot.nativeGpuWidth,slot.nativeGpuHeight,rowOut};
+        static_assert(sizeof(Pitch2D)==40);
+        CudaResourceDesc resource={};resource.resType=3;std::memcpy(&resource.res,&pitch,sizeof(pitch));
+        const CudaTextureDesc sampler=input_sampler(slot.nativeGpuWidth,2,false);
+        int result=g.cu.texObjectCreate(&slot.nativeGpuTexture,&resource,&sampler,nullptr);
+        if(result==0) result=g.cu.registerLinearTexture(slot.nativeGpuTexture,slot.nativeGpuWidth,slot.nativeGpuHeight,pitch.format,2);
+        if(result!=0)
+        {
+            logf("native live frame %u: motion texture failed %d",frame,result);
+            if(slot.nativeGpuTexture) g.cu.texObjectDestroy(slot.nativeGpuTexture),slot.nativeGpuTexture=0;
+            return 0;
+        }
+        slot.nativeTexPointer=slot.nativeGpuResult;slot.nativeTexWidth=slot.nativeGpuWidth;
+        slot.nativeTexHeight=slot.nativeGpuHeight;slot.nativeTexPitch=rowOut;
+    }
+    const D4rNativeMotionParams args={slot.nativeGpuInputs[0].device,slot.nativeGpuInputs[1].device,
+        slot.nativeGpuInputs[2].device,slot.nativeGpuInputs[3].device,slot.nativeGpuResult,
+        rowIn,rowIn,rowOut,slot.nativeGpuWidth,slot.nativeGpuHeight,p.renderWidth,p.renderHeight};
+    const bool thinHalo=env_uint("D4R_NATIVE_MV_THIN_HALO",1)==1;
+    if(thinHalo && !g.cu.composeNativeMotionThin) return 0;
+    const D4rNativeMotionThinParams thinArgs={args,p.jitterX,p.jitterY};
+    const bool hybrid=thinHalo && env_uint("D4R_NATIVE_MV_HYBRID",0)==1 && g.cu.composeNativeMotionHybrid &&
+        slot.linearPointer[2] && slot.host[2].width==p.renderWidth && slot.host[2].height==p.renderHeight;
+    const D4rNativeMotionHybridParams hybridArgs={thinArgs,slot.linearPointer[2],slot.linearPitch[2]};
+    const bool prepared=thinHalo && !hybrid && env_uint("D4R_NATIVE_MV_PREPARED",0)==1 &&
+        g.cu.composeNativeMotionPrepared && g.cu.stabilizeThinWiresPrepared &&
+        ensure_linear(feature.nativeThinMask,feature.nativeThinMaskBytes,size_t((feature.outWidth+31)/32)*feature.outHeight*4) &&
+        ensure_linear(feature.preparedWireAxes,feature.preparedWireAxesBytes,size_t(feature.outWidth)*feature.outHeight);
+    const D4rNativeMotionPreparedParams preparedArgs={thinArgs,feature.nativeThinMask,feature.preparedWireAxes,wire_history_flags(),0};
+    const bool measured=begin_native_pass_profile(feature,0,frame,timing);
+    const int result=prepared ? g.cu.composeNativeMotionPrepared(&preparedArgs) : hybrid ? g.cu.composeNativeMotionHybrid(&hybridArgs) : thinHalo ? g.cu.composeNativeMotionThin(&thinArgs) :
+        g.cu.composeNativeMotionAligned ? g.cu.composeNativeMotionAligned(&thinArgs) : g.cu.composeNativeMotion(&args);
+    if(result!=0) { logf("native live frame %u: compose failed %d",frame,result);return 0; }
+    feature.preparedWireAxesReady=prepared;feature.preparedWireFlags=preparedArgs.wire_flags;
+    if(measured && g.cu.eventRecord(feature.nativePassEvents[1],nullptr)==0) timing->nativeMotionTimed=true;
+    if(frame<=3 || frame%300==1) logf("frame %u: native motion field=%s",frame,prepared ? "prepared full with halo" : hybrid ? "wire-local hybrid" : thinHalo ? "full with halo" : "aligned 3x3");
+    return slot.nativeGpuTexture;
+}
+
+// Worker-only output history. Copies and full kernel share NGX's stream. Only
+// current native sky silhouettes with recent depth-matched color can be repaired.
+static bool ensure_wire_buffers(Feature& feature)
+{
+    const uint64_t pixels=uint64_t(feature.outWidth)*feature.outHeight;
+    const size_t sizes[8]={size_t(pixels*8),size_t(pixels*8),size_t(pixels*8),size_t(pixels*8),size_t(pixels),size_t(pixels),size_t(pixels*4),size_t(pixels*4)};
+    if(feature.wireWidth!=feature.outWidth || feature.wireHeight!=feature.outHeight)
+    {
+        if(synchronize_default_stream(feature)!=0) return false;
+        for(auto& buffer:feature.wireBuffers) { if(buffer) g.cu.memFree(buffer);buffer=0; }
+        if(feature.wirePatchMask) g.cu.memFree(feature.wirePatchMask),feature.wirePatchMask=0;
+        feature.wireWidth=feature.outWidth;feature.wireHeight=feature.outHeight;feature.wireValid=false;
+    }
+    for(unsigned i=0;i<8;i++) if(!feature.wireBuffers[i] && g.cu.memAlloc(&feature.wireBuffers[i],sizes[i])!=0)
+    { feature.wireValid=false;return false; }
+    return true;
+}
+
+// Split-slot reuse is already ordered behind this frame's input marker.
+// Different pitches and packed outputs use the ordinary filtered-buffer path.
+static CudaDevicePtr wire_direct_target(Feature& feature,const FrameParams& p,uint32_t frame)
+{
+    const size_t pitch=size_t(feature.outWidth)*8,bytes=pitch*feature.outHeight;
+    if(!p.vram || !p.split || p.packedOutput) return 0;
+    if(p.outputInPlace) return p.outputInPlacePitch==pitch ? p.outputInPlace : 0;
+    const VramBuffer& target=feature.outputs[frame%kOutputSlots].vram;
+    return target.bytes>=bytes ? target.device : 0;
+}
+
+static bool stabilize_wire_output(Feature& feature, InputSlot& slot, const FrameParams& p, uint32_t frame, bool inputRedirected, CudaDevicePtr sparseTarget, FrameTiming* timing)
+{
+    if(!g.cu.stabilizeThinWires || !slot.linearPointer[0] || !slot.nativeGpuInputs[0].device ||
+        !slot.nativeGpuResult || feature.outWidth<33 || feature.outHeight<33) return false;
+    if(!ensure_wire_buffers(feature)) return false;
+    const unsigned current=feature.wireIndex,previous=1-current;
+    const size_t pitch=size_t(feature.outWidth)*8;
+    CudaMemcpy2D copy={};copy.srcMemoryType=CUDA_MEMORY_ARRAY;copy.srcArray=feature.output.array;
+    copy.dstMemoryType=CUDA_MEMORY_DEVICE;copy.dstDevice=feature.wireBuffers[0];copy.dstPitch=pitch;
+    copy.WidthInBytes=pitch;copy.Height=feature.outHeight;
+    if(!inputRedirected && copy_2d(copy)!=0) { feature.wireValid=false;return false; }
+    const D4rWireHistoryParams args={sparseTarget ? sparseTarget : feature.wireBuffers[0],slot.linearPointer[0],slot.nativeGpuInputs[0].device,slot.nativeGpuResult,
+        feature.wireBuffers[2+previous],feature.wireBuffers[4+previous],feature.wireBuffers[6+previous],
+        feature.wireBuffers[1],feature.wireBuffers[4+current],feature.wireBuffers[6+current],slot.linearPointer[1],feature.wireBuffers[2+current],
+        slot.linearPitch[0],uint64_t(feature.outWidth)*4,slot.nativeTexPitch,pitch,slot.linearPitch[1],
+        feature.outWidth,feature.outHeight,p.renderWidth,p.renderHeight,
+        feature.wireValid && feature.wireLastFrame+1==frame && !p.reset && feature.wireRenderWidth==p.renderWidth &&
+        feature.wireRenderHeight==p.renderHeight && feature.wirePreExposure==p.preExposure && feature.wireExposureScale==p.exposureScale ? 1u : 0u,p.jitterX,p.jitterY,wire_history_flags()};
+    const D4rWireHistorySparseParams sparse={args,feature.wirePatchMask};
+    const D4rWireHistoryPreparedParams cached={sparse,feature.preparedWireAxes};
+    const bool preclassified=sparseTarget && feature.preparedWireAxesReady && feature.preparedWireFlags==args.reserved && g.cu.stabilizeThinWiresPrepared;
+    const bool measured=begin_native_pass_profile(feature,2,frame,timing);
+    const int status=preclassified ? g.cu.stabilizeThinWiresPrepared(&cached) : sparseTarget ? g.cu.stabilizeThinWiresSparse(&sparse) : g.cu.stabilizeThinWires(&args);
+    if(status!=0) { feature.wireValid=false;return false; }
+    if(measured && g.cu.eventRecord(feature.nativePassEvents[3],nullptr)==0) timing->wireRepairTimed=true;
+    feature.wirePublishedDirect=sparseTarget!=0;
+    feature.wirePublishBuffer=sparseTarget ? sparseTarget : feature.wireBuffers[1];
+    if(p.vram && !p.packedOutput && env_uint("D4R_NATIVE_MV_WIRE_DIRECT",1)==1)
+        feature.wireOutputReady=true; // publish directly, without copying through the NGX array
+    else
+    {
+        copy={};copy.srcMemoryType=CUDA_MEMORY_DEVICE;copy.srcDevice=feature.wireBuffers[1];copy.srcPitch=pitch;
+        copy.dstMemoryType=CUDA_MEMORY_ARRAY;copy.dstArray=feature.output.array;copy.WidthInBytes=pitch;copy.Height=feature.outHeight;
+        if(copy_2d(copy)!=0) { feature.wireValid=false;return false; }
+    }
+    feature.wireValid=true;feature.wireLastFrame=frame;feature.wireIndex=previous;
+    feature.wireRenderWidth=p.renderWidth;feature.wireRenderHeight=p.renderHeight;
+    feature.wirePreExposure=p.preExposure;feature.wireExposureScale=p.exposureScale;
+    if(frame<=3 || frame%300==1) logf("frame %u: native wire color history applied, valid=%u input=%s publish=%s geometry=%s",
+        frame,args.history_valid,inputRedirected ? "direct" : "array-copy",feature.wirePublishedDirect ? "sparse-direct" : feature.wireOutputReady ? "linear" : "array-copy",preclassified ? "prepared" : "recomputed");
+    return true;
+}
+
+// Worker. MVLowRes (flag 2) describes the motion plane's resolution, and NGX fixes it at creation. A live native
+// field is output-sized, so the feature is recreated without the flag (history is lost: reset) and recreated with
+// the game's own flags when the game's vectors are used again. Returns true if the feature now matches the request.
+static bool set_native_motion_flags(Feature& feature, FrameParams& params, bool native, uint32_t frame)
+{
+    const int desired=native ? (feature.flags & ~2) : feature.flags;
+    if(desired==feature.cudaFlags) return feature.cudaHandle!=nullptr;
+    logf("frame %u: native motion %s: recreating the NGX feature, flags 0x%x -> 0x%x",frame,native ? "active" : "unavailable",
+         feature.cudaFlags,desired);
+    synchronize_default_stream(feature);
+    if(feature.cudaHandle!=nullptr) g.ngx.releaseFeature(feature.cudaHandle);
+    feature.cudaHandle=nullptr;
+    void* p=feature.cudaParams;
+    d4r_ngx_set_uint(p,"Width",feature.cudaWidth);
+    d4r_ngx_set_uint(p,"Height",feature.cudaHeight);
+    d4r_ngx_set_int(p,"DLSS.Feature.Create.Flags",desired);
+    NgxResult created=g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING,p,&feature.cudaHandle);
+    if(created!=NGX_SUCCESS)
+    {
+        logf("frame %u: recreating the NGX feature with flags 0x%x failed (0x%08x); restoring 0x%x",frame,desired,created,feature.cudaFlags);
+        feature.cudaHandle=nullptr;
+        d4r_ngx_set_int(p,"DLSS.Feature.Create.Flags",feature.cudaFlags);
+        created=g.ngx.createFeature(NGX_FEATURE_SUPER_SAMPLING,p,&feature.cudaHandle);
+        if(created!=NGX_SUCCESS) { feature.cudaHandle=nullptr;logf("frame %u: restoring the NGX feature failed (0x%08x)",frame,created);return false; }
+        params.reset=1;d4r_ngx_set_int(p,"Reset",1);
+        return false; // the previous flags are back; this frame cannot use the new field
+    }
+    feature.cudaFlags=desired;
+    params.reset=1;
+    d4r_ngx_set_int(p,"Reset",1);
+    return true;
 }
 
 static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, FrameParams params, FrameTiming timing)
@@ -6718,7 +7735,7 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     if (timing.markerDeferred)
     {
         const auto markerStart = ProfileClock::now();
-        if (ngx_gpu_wait_eligible(*feature, params, frame))
+        if (ngx_gpu_wait_eligible(*feature, slot, params, frame))
         {
             complete_pending_download(); // earlier host staging must not synchronize against our new wait
             // Mint textures/arrays before blocking the null stream. Lazy allocation can synchronize
@@ -6800,6 +7817,143 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
                 timing.markerWait = profile_ms(markerStart, ProfileClock::now());
         }
     }
+    if (slot.nativeMotionCaptureFrame == frame)
+    {
+        // A CPU diagnostic readback needs an observed marker even when NGX uses a GPU wait.
+        if (!wait_for_input_marker(feature, slotIndex, frame))
+            return;
+        if (slot.nativeGeometryCaptureReady)
+        {
+            const Staging& staging = slot.nativeMotionCapture;
+            const size_t rowBytes = static_cast<size_t>(staging.width) * 4;
+            std::vector<uint8_t> tight(rowBytes * staging.height);
+            for (UINT row = 0; row < staging.height; ++row)
+                std::memcpy(tight.data() + row * rowBytes,
+                    staging.mapped + staging.layout.Offset + row * staging.layout.Footprint.RowPitch, rowBytes);
+            write_capture_file(frame, "native geometry motion", slot.nativeMotionCapturePath.c_str(), tight.data(), tight.size());
+        }
+        const std::string base = slot.nativeMotionCapturePath.substr(0, slot.nativeMotionCapturePath.find(".geometry.rg16f"));
+        if(slot.nativePrimaryDepthCaptureReady)
+        {
+            const Staging& z=slot.nativePrimaryDepthCapture;
+            std::vector<uint8_t> data(static_cast<size_t>(z.width)*z.height*4);
+            for(UINT y=0;y<z.height;y++) std::memcpy(data.data()+static_cast<size_t>(y)*z.width*4,
+                z.mapped+z.layout.Offset+y*z.layout.Footprint.RowPitch,z.width*4);
+            write_capture_file(frame,"native primary hardware depth",(base+".primary-depth.r32f").c_str(),data.data(),data.size());
+        }
+        if(slot.opaqueSceneCaptureReady)
+            write_capture_file(frame,"opaque scene constants",(base+".opaque-scene.f32").c_str(),
+                slot.opaqueSceneCapture.mapped,static_cast<size_t>(slot.opaqueSceneCapture.total));
+        if(slot.opaqueMatrixCaptureReady)
+            write_capture_file(frame,"opaque pixel reprojection matrix",(base+".opaque-matrix.f32").c_str(),
+                slot.opaqueMatrixCapture.mapped,static_cast<size_t>(slot.opaqueMatrixCapture.total));
+        if(slot.materialSceneCaptureReady)
+            write_capture_file(frame,"owned material scene at its draw",(base+".material-owned-scene.f32").c_str(),slot.materialSceneCapture.mapped,1136);
+        if(slot.glassMaskCaptureReady)
+        {
+            const Staging& mask=slot.glassMaskCapture;
+            write_capture_file(frame,"material motion branch mask",(base+".glass-mask.raw").c_str(),mask.mapped,static_cast<size_t>(mask.total));
+            char metadata[128];const int size=std::snprintf(metadata,sizeof(metadata),"%u %u %u\n",mask.width,mask.height,slot.glassMaskFormat);
+            if(size>0 && size<static_cast<int>(sizeof(metadata))) write_capture_file(frame,"material mask geometry/format",(base+".glass-mask.txt").c_str(),metadata,size);
+        }
+        if(slot.originalOpaqueCopyCaptureReady)
+        {
+            const Staging& st=slot.originalOpaqueCopyCapture;
+            std::vector<uint8_t> data(static_cast<size_t>(st.width)*st.height*4);
+            for(UINT y=0;y<st.height;y++) std::memcpy(data.data()+static_cast<size_t>(y)*st.width*4,
+                st.mapped+st.layout.Offset+y*st.layout.Footprint.RowPitch,st.width*4);
+            write_capture_file(frame,"original opaque copy before material overlay",(base+".original-opaque-copy.rg16f").c_str(),data.data(),data.size());
+        }
+        if(slot.ownedValidityCaptureReady)
+        {
+            const GUID availableGuid={0x75367844,0x817a,0x4c96,{0x97,0x35,0x2c,0xa1,0x7a,0x99,0x48,0x32}};
+            uint32_t available=0;UINT bytes=sizeof(available);
+            if(!slot.nativeValidityOwner || FAILED(slot.nativeValidityOwner->GetPrivateData(availableGuid,&bytes,&available)) || bytes!=sizeof(available)) available=0;
+            write_capture_file(frame,"GPU-owned validity",(base+".owned-validity.u32").c_str(),slot.ownedValidityCapture.mapped,8);
+            write_capture_file(frame,"validity availability after input marker",(base+".owned-validity-status.u32").c_str(),&available,4);
+            const uint32_t* words=reinterpret_cast<const uint32_t*>(slot.ownedValidityCapture.mapped);
+            slot.nativeGpuStageValid=available==1 && words[0]==1 && words[1]==1;
+            logf("native motion capture frame %u: GPU validity opaque/depth=%u/%u post-marker availability=%u",frame,words[0],words[1],available);
+        }
+        if(slot.nativeValidityOwner) { slot.nativeValidityOwner->Release();slot.nativeValidityOwner=nullptr; }
+        if(slot.glassValidityCaptureReady)
+            write_capture_file(frame,"glass depth GPU validity",(base+".glass-depth-validity.u32").c_str(),slot.glassValidityCapture.mapped,4);
+        if(slot.ownedDepthCaptureReady)
+        {
+            const Staging& z=slot.ownedDepthCapture;
+            std::vector<uint8_t> data(static_cast<size_t>(z.width)*z.height*4);
+            for(UINT y=0;y<z.height;y++) std::memcpy(data.data()+static_cast<size_t>(y)*z.width*4,
+                z.mapped+z.layout.Offset+y*z.layout.Footprint.RowPitch,z.width*4);
+            write_capture_file(frame,"owned primary depth",(base+".owned-depth.r32f").c_str(),data.data(),data.size());
+        }
+        if(slot.ownedSceneCaptureReady)
+            write_capture_file(frame,"owned opaque scene",(base+".owned-scene.f32").c_str(),
+                slot.ownedSceneCapture.mapped,static_cast<size_t>(slot.ownedSceneCapture.total));
+        if(slot.ownedMatrixCaptureReady)
+            write_capture_file(frame,"owned opaque matrix",(base+".owned-matrix.f32").c_str(),
+                slot.ownedMatrixCapture.mapped,static_cast<size_t>(slot.ownedMatrixCapture.total));
+        if(slot.originalPrimaryDepthCaptureReady)
+            write_capture_file(frame,"original primary hardware depth",(base+".original-primary-depth.r32f").c_str(),
+                slot.originalPrimaryDepthCapture.mapped,static_cast<size_t>(slot.originalPrimaryDepthCapture.total));
+        if (slot.nativeDepthCaptureReady)
+        {
+            const Staging& depth = slot.nativeDepthCapture;
+            std::vector<uint8_t> z(static_cast<size_t>(depth.width) * depth.height * 4);
+            for (UINT row = 0; row < depth.height; ++row)
+                std::memcpy(z.data() + static_cast<size_t>(row) * depth.width * 4,
+                    depth.mapped + depth.layout.Offset + row * depth.layout.Footprint.RowPitch, depth.width * 4);
+            write_capture_file(frame, "native hardware depth", (base + ".depth.r32f").c_str(), z.data(), z.size());
+        }
+        if (slot.nativeSceneCaptureReady)
+            write_capture_file(frame, "motion composition constants", (base + ".scene.f32").c_str(),
+                slot.nativeSceneCapture.mapped, static_cast<size_t>(slot.nativeSceneCapture.total));
+
+        if (slot.nativeOpaqueCaptureReady)
+        {
+            const Staging& opaque = slot.nativeOpaqueCapture;
+            const size_t row = static_cast<size_t>(opaque.width) * 4;
+            std::vector<uint8_t> data(row * opaque.height);
+            for (UINT y = 0; y < opaque.height; ++y)
+                std::memcpy(data.data() + y * row,opaque.mapped + opaque.layout.Offset + y * opaque.layout.Footprint.RowPitch,row);
+            write_capture_file(frame,"native opaque per-object motion",(base+".opaque-geometry.rg16f").c_str(),data.data(),data.size());
+        }
+        if (slot.originalGeometryCaptureReady)
+            write_capture_file(frame,"original geometry motion",(base+".original-geometry.rg16f").c_str(),
+                slot.originalGeometryCapture.mapped,static_cast<size_t>(slot.originalGeometryCapture.total));
+        if (slot.originalHardwareDepthCaptureReady)
+            write_capture_file(frame,"original hardware depth",(base+".original-hardware-depth.r32f").c_str(),
+                slot.originalHardwareDepthCapture.mapped,static_cast<size_t>(slot.originalHardwareDepthCapture.total));
+    }
+    if (slot.nativeMotionCaptureFrame != frame && slot.ownedValidityCaptureReady && slot.nativeValidityOwner)
+    {
+        // Live frame (no diagnostic capture): the validity words and the post-marker availability are only
+        // meaningful once this frame's own input marker has been observed.
+        bool markerSeen = true;
+        if (slot.nativeLive)
+        {
+            markerSeen = wait_for_input_marker(feature, slotIndex, frame);
+            if (markerSeen)
+            {
+                const GUID availableGuid = {0x75367844, 0x817a, 0x4c96, {0x97, 0x35, 0x2c, 0xa1, 0x7a, 0x99, 0x48, 0x32}};
+                uint32_t available = 0;
+                UINT bytes = sizeof(available);
+                if (FAILED(slot.nativeValidityOwner->GetPrivateData(availableGuid, &bytes, &available)) || bytes != sizeof(available))
+                    available = 0;
+                const uint32_t* words = reinterpret_cast<const uint32_t*>(slot.nativeValidityOwner ? slot.ownedValidityCapture.mapped : nullptr);
+                slot.nativeGpuStageValid = words != nullptr && available == 1 && words[0] == 1 && words[1] == 1;
+                if (!slot.nativeGpuStageValid && frame % 300 == 1)
+                    logf("native motion validity frame %u: available=%u opaque=%u depth=%u", frame, available, words ? words[0] : 0, words ? words[1] : 0);
+            }
+        }
+        slot.nativeValidityOwner->Release();
+        slot.nativeValidityOwner = nullptr;
+        if (!markerSeen)
+            return;
+    }
+    if (slot.nativeLive)
+        ; // composed below, after any feature flag change, on NGX's stream
+    else
+        run_native_gpu_check(slot,params,frame);
     if (!timing.gpuInputWait && params.vram && env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
         dump_vram_inputs(slot, frame, params, params.hasExposure ? 4 : 3);
     const bool linearInputs = params.vram && feature->linearInputs;
@@ -6815,7 +7969,37 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     ok = ok && ensure_cuda_image(feature->output, feature->outputWidth, feature->outputHeight, CUDA_FORMAT_HALF, 4,
                                  true, false);
     const auto dilationStart = timing.enabled ? ProfileClock::now() : ProfileClock::time_point{};
-    const CudaObject dilatedMotion = ok && !timing.gpuInputWait ? prepare_dilated_motion(*feature, slot, params) : 0;
+    // Keep the native field available to repair independently of the field fed
+    // to NGX. The opt-in repair-only mode retains the game's flags and MV scale.
+    CudaObject nativeMotion = 0;
+    CudaObject liveMotion = 0;
+    if (ok && (slot.nativeLive || feature->cudaFlags != feature->flags))
+    {
+        nativeMotion = compose_native_live(*feature, slot, params, frame, stages);
+        liveMotion = env_uint("D4R_NATIVE_MV_SUBSTITUTE",1)==1 ? nativeMotion : 0;
+        const bool matched = set_native_motion_flags(*feature, params, liveMotion != 0, frame);
+        if (liveMotion != 0 && !matched)
+        {
+            liveMotion = 0;
+            nativeMotion = 0; // preserve the existing raw-output fallback when substitution fails
+        }
+        if (feature->cudaHandle == nullptr || (liveMotion == 0 && feature->cudaFlags != feature->flags))
+            ok = false; // Never evaluate low-res vectors using a restored high-res-only feature.
+        if (liveMotion != 0)
+        {
+            // The field is in output pixels: MV.Scale (render pixels) follows it.
+            params.mvScaleX = static_cast<float>(static_cast<double>(params.mvScaleX) * feature->outWidth / params.renderWidth);
+            params.mvScaleY = static_cast<float>(static_cast<double>(params.mvScaleY) * feature->outHeight / params.renderHeight);
+        }
+        static std::atomic<unsigned> liveFrames{0}, fallbackFrames{0};
+        const unsigned live = liveMotion != 0 ? ++liveFrames : liveFrames.load();
+        const unsigned fallback = liveMotion == 0 ? ++fallbackFrames : fallbackFrames.load();
+        if (frame <= 3 || (liveMotion != 0 ? live : fallback) <= 4 || (live + fallback) % 300 == 0)
+            logf("frame %u: native motion %s (live %u, fallback %u, mvScale %.3f,%.3f, flags 0x%x)", frame,
+                 liveMotion != 0 ? "SUBSTITUTED" : "not used", live, fallback, params.mvScaleX, params.mvScaleY,
+                 feature->cudaFlags);
+    }
+    const CudaObject dilatedMotion = ok && liveMotion == 0 ? prepare_dilated_motion(*feature, slot, params) : 0;
     // Ray Reconstruction: the auxiliary surfaces are copied in the same window as the four
     // main planes, so the one synchronize below covers them as well. The lock is taken only
     // around the copies and, later, around the evaluate - never across the synchronize, which
@@ -6845,7 +8029,9 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
     static const bool inputSync = env_uint("D4R_SHIM_INPUT_SYNC", 1) != 0;
     // Linear inputs are ready after the marker. The GPU-wait route orders all copies and NGX on
     // the null stream itself, so its input-sync CPU wait would only put readiness back on the critical path.
-    if (ok && !timing.gpuInputWait && (dilatedMotion != 0 || auxUploaded || (inputSync && !linearInputs)))
+    // Dilation is submitted after the CPU marker or GPU input wait and before
+    // NGX, on the same bridge-selected stream. It needs no CPU completion wait.
+    if (ok && !timing.gpuInputWait && (auxUploaded || (inputSync && !linearInputs)))
     {
         const int syncResult = synchronize_default_stream(*feature);
         if (syncResult != 0)
@@ -6897,15 +8083,28 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         // the parameters point at these variables
         feature->colorHandle = slot.linearTexture[0];
         feature->depthHandle = slot.linearTexture[1];
-        feature->motionHandle = dilatedMotion != 0 ? dilatedMotion : slot.linearTexture[2];
+        feature->motionHandle = liveMotion != 0 ? liveMotion : dilatedMotion != 0 ? dilatedMotion : slot.linearTexture[2];
         feature->exposureHandle = params.hasExposure ? slot.linearTexture[3] : feature->exposureHandle;
     }
+    const bool wireHistoryRequested=nativeMotion!=0 && g.cu.stabilizeThinWires &&
+        env_uint("D4R_NATIVE_MV_WIRE_HISTORY",1)==1;
+    timing.nativeFieldReady=nativeMotion!=0;
+    timing.nativeSubstituted=liveMotion!=0;
+    timing.wireRequested=wireHistoryRequested;
+    feature->wireOutputReady=false;feature->wirePublishedDirect=false;feature->wirePublishBuffer=0;
+    if(frame<=3 || frame%300==1)
+        logf("frame %u: motion routing native_ready=%u ngx=%s wire_requested=%u halo=%u",
+             frame,nativeMotion!=0,liveMotion!=0 ? "native" : "game",wireHistoryRequested,
+             env_uint("D4R_NATIVE_MV_THIN_HALO",1)==1);
+    if(!wireHistoryRequested) feature->wireValid=false;
+    if(wireHistoryRequested && feature->outputRedirected)
+    { g.cu.setArrayRedirect(feature->output.array,0,0);feature->outputRedirected=false; }
     static const bool outputDirect = env_uint("D4R_SHIM_OUTPUT_DIRECT", 0) != 0;
     // The redirect is carried out by the native output kernel's stores (ZLUDA's compile of NVIDIA's kernel
     // writes the array), so it is set while the previous frame's output kernel was the native one and
     // undone below when this frame's was not.
     const bool nativeOutput = g.cu.outputKernelNative == nullptr || g.cu.outputKernelNative() == 1;
-    if (outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr && feature->output.array != nullptr &&
+    if (!wireHistoryRequested && outputDirect && feature->outputDirectAllowed && g.cu.setArrayRedirect != nullptr && feature->output.array != nullptr &&
         (nativeOutput || feature->outputRedirected))
     {
         // split frames write their own slot; the staged path downloads from outputLinear
@@ -6937,6 +8136,21 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         }
         feature->outputRedirected = redirect;
     }
+    // Keep full RGBA16F for the repair pass. Completion is signalled by publish_vram,
+    // after the repair and final copy, never by NGX's earlier raw-output write.
+    CudaDevicePtr wireSparseTarget=0;
+    if(wireHistoryRequested && g.cu.stabilizeThinWiresSparse && env_uint("D4R_NATIVE_MV_WIRE_SPARSE",1)==1 &&
+        env_uint("D4R_NATIVE_MV_WIRE_DIRECT",1)==1 && ensure_wire_buffers(*feature))
+    {
+        if(!feature->wirePatchMask && g.cu.memAlloc(&feature->wirePatchMask,size_t(feature->outWidth)*feature->outHeight)!=0)
+            feature->wirePatchMask=0;
+        if(feature->wirePatchMask) wireSparseTarget=wire_direct_target(*feature,params,frame);
+    }
+    const bool wireInputRedirected=wireHistoryRequested && env_uint("D4R_NATIVE_MV_WIRE_DIRECT",1)==1 &&
+        params.vram && !params.packedOutput &&
+        outputDirect && feature->outputDirectAllowed && g.cu.outputKernelNative && nativeOutput && g.cu.setArrayRedirect &&
+        ensure_wire_buffers(*feature) &&
+        g.cu.setArrayRedirect(feature->output.array,wireSparseTarget ? wireSparseTarget : feature->wireBuffers[0],feature->outWidth*8)==0;
     if (!timing.gpuInputWait)
         eventStartResult = timing.enabled && feature->profileEventsReady
                               ? g.cu.eventRecord(feature->profileStart, nullptr) : -1;
@@ -6953,7 +8167,9 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         result = g.ngx.evaluateFeature(feature->cudaHandle, feature->cudaParams, nullptr);
     if (auxLock.owns_lock())
         auxLock.unlock();
-    feature->completionFired = g.cu.ngxCompletionFired != nullptr && g.cu.ngxCompletionFired() == 1;
+    const bool wireInputWritten=wireInputRedirected && g.cu.outputKernelNative && g.cu.outputKernelNative()==1;
+    if(wireInputRedirected) g.cu.setArrayRedirect(feature->output.array,0,0);
+    feature->completionFired = !wireHistoryRequested && g.cu.ngxCompletionFired != nullptr && g.cu.ngxCompletionFired() == 1;
     if (feature->outputRedirected && ((g.cu.outputKernelNative != nullptr && g.cu.outputKernelNative() != 1) ||
         (params.packedRgba8 && (g.cu.outputKernelRgba8 == nullptr || g.cu.outputKernelRgba8() != 1))))
     {
@@ -6984,6 +8200,30 @@ static void run_evaluation(Feature* feature, int slotIndex, uint32_t frame, Fram
         slot.busy = false;
         frame_retired(feature, frame);
         return;
+    }
+    if(wireHistoryRequested && !stabilize_wire_output(*feature,slot,params,frame,wireInputWritten,wireInputWritten ? wireSparseTarget : 0,stages))
+    {
+        feature->wireValid=false;
+        // A redirected raw frame left the NGX array untouched. Restore the raw output
+        // if repair could not be queued, so fallback never exposes an older array.
+        feature->wireOutputReady=false;
+        if(wireInputWritten && wireSparseTarget)
+        {
+            // Both sparse dispatches preserve raw current until apply; an apply
+            // enqueue failure therefore leaves a valid raw frame in the game slot.
+            feature->wireOutputReady=true;feature->wirePublishedDirect=true;feature->wirePublishBuffer=wireSparseTarget;
+        }
+        else if(wireInputWritten)
+        {
+            CudaMemcpy2D raw={};raw.srcMemoryType=CUDA_MEMORY_DEVICE;raw.srcDevice=feature->wireBuffers[0];
+            raw.srcPitch=feature->outWidth*8;raw.dstMemoryType=CUDA_MEMORY_ARRAY;raw.dstArray=feature->output.array;
+            raw.WidthInBytes=raw.srcPitch;raw.Height=feature->outHeight;
+            if(copy_2d(raw)!=0)
+            {
+                complete_ngx_input_wait(*feature,frame,true);slot.busy=false;frame_retired(feature,frame);return;
+            }
+        }
+        logf("frame %u: native wire history unavailable; original NGX output retained",frame);
     }
     // The alpha surface is complete once the synchronize above has passed. A failure here drops
     // the whole frame, exactly as a failed synchronize does: an accepted frame with an unwritten
@@ -7102,9 +8342,8 @@ static void prepare_inputs(Feature* feature, int slotIndex, uint32_t frame, Fram
     // D4R_SHIM_DEFER_MARKER (default on): the worker waits for the game's copies itself, avoiding a thread
     // wake-up between readiness and evaluation. The wait must precede every input read, including CUDA
     // uploads and diagnostic readbacks; waiting only before NGX would copy stale data into its arrays.
-    static const bool deferMarker = env_uint("D4R_SHIM_DEFER_MARKER", 1) != 0 &&
-                                    env_uint("D4R_MOTION_DILATION", 0) == 0;
-    if (params.vram && (deferMarker || ngx_gpu_wait_eligible(*feature, params, frame)) &&
+    static const bool deferMarker = env_uint("D4R_SHIM_DEFER_MARKER", 1) != 0;
+    if (params.vram && (deferMarker || ngx_gpu_wait_eligible(*feature, slot, params, frame)) &&
         env_uint("D4R_SHIM_VRAM_VERIFY", 0) == 0)
     {
         timing.markerDeferred = true;
@@ -7204,49 +8443,58 @@ static void finish_publish(Feature* feature, int target, uint32_t frame, const F
     const uint32_t completed = ++feature->completedFrames;
     frame_retired(feature, frame);
     const auto finished = ProfileClock::now();
-    static const bool profileLog = env_uint("D4R_PROFILE_LOG", 1) != 0; // 0: time everything, write no lines
-    if (timing.enabled && profileLog)
+    if (timing.enabled && profile_log_enabled())
     {
         static thread_local ProfileClock::time_point lastFinished;
         const double interval = lastFinished.time_since_epoch().count() != 0
                                     ? profile_ms(lastFinished, finished) : -1.0;
         lastFinished = finished;
-        const InputSlot& slot = feature->inputs[frame % kSlots];
-        logf("D4R_PROFILE frame=%u render=%ux%u output=%ux%u color=%ux%u depth=%ux%u "
-             "motion=%ux%u exposure=%d quality=%d flags=0x%x preset=%u "
-             "jitter=%.6f,%.6f mv_scale=%.3f,%.3f reset=%d pre_exposure=%.6f exposure_scale=%.6f "
-             "frame_dt=%.3f game_interval=%.3f "
-             "queue_depth=%zu queue_wait=%.3f marker_wait=%.3f slot_wait=%.3f "
-             "d3d_input_record=%.3f d3d_output_record=%.3f game_call=%.3f "
-             "color_convert=%.3f depth_convert=%.3f motion_convert=%.3f exposure_convert=%.3f "
-             "color_h2d=%.3f depth_h2d=%.3f motion_h2d=%.3f exposure_h2d=%.3f "
-             "ngx_host=%.3f ctx_sync=%.3f gpu_eval=%.3f gpu_eval_scope=%s input_wait=%s output_sync_wall=%.3f "
-             "output_sync_cpu=%.3f output_sync_blocking=%d output_sync_method=%s d2h=%.3f output_convert=%.3f "
-             "h2d_total=%.3f d2h_issue=%.3f d2h_wait=%.3f "
-             "prep=%.3f worker_wait=%.3f worker=%.3f finish_wait=%.3f finish=%.3f pipeline=%.3f "
-             "throughput_interval=%.3f presented=%u age=%d motion_dilation=%u motion_dilation_wall=%.3f "
-             "dlss_gpu=%.3f input_gpu_wait=%.3f vk_input=%.3f vk_dlss_wait=%.3f vk_output=%.3f vk_total=%.3f",
-             frame, params.renderWidth, params.renderHeight, feature->outWidth, feature->outHeight,
-             slot.host[0].width, slot.host[0].height, slot.host[1].width, slot.host[1].height,
-             slot.host[2].width, slot.host[2].height, params.hasExposure, feature->quality, feature->flags,
-             feature->preset, params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY,
-             params.reset, params.preExposure, params.exposureScale, params.frameTime, timing.gameInterval,
-             timing.queueDepth, profile_ms(timing.queuedAt, timing.prepStart), timing.markerWait, timing.slotWait,
-             timing.inputRecord, timing.outputRecord, timing.gameCall,
-             timing.convert[0], timing.convert[1], timing.convert[2], timing.convert[3],
-             timing.upload[0], timing.upload[1], timing.upload[2], timing.upload[3],
-             timing.ngxHost, timing.ctxSync, timing.gpuEval,
-             timing.gpuInputWait ? "launch_to_completion" : "evaluation", timing.gpuInputWait ? "gpu" : "cpu",
-             timing.outputSyncWall, timing.outputSyncCpu,
-             timing.outputSyncBlocking, timing.outputSyncNative ? "native_callback_wait" :
-                                        timing.outputSyncBlocking ? "event_query_sleep" : "context",
-             timing.download, timing.outputConvert,
-             timing.h2dTotal, timing.d2hIssue, timing.d2hWait,
-             timing.prep, timing.workerWait, timing.worker, timing.finishWait, profile_ms(start, finished),
-             profile_ms(timing.prepStart, finished), interval,
-             timing.presentedFrame, timing.presentedFrame != 0 ? static_cast<int>(frame - timing.presentedFrame) : -1,
-             params.motionDilation, timing.motionDilationWall, timing.dlssGpu, timing.inputGpuWait,
-             timing.vkInput, timing.vkDlssWait, timing.vkOutput, timing.vkTotal);
+        // Update lastFinished on every measured frame: a sampled row still reports the
+        // interval from the previous frame, not the span since the previous logged row.
+        if (profile_log_frame(frame))
+        {
+            const InputSlot& slot = feature->inputs[frame % kSlots];
+            logf("D4R_PROFILE frame=%u render=%ux%u output=%ux%u color=%ux%u depth=%ux%u "
+                 "motion=%ux%u exposure=%d quality=%d flags=0x%x preset=%u "
+                 "jitter=%.6f,%.6f mv_scale=%.3f,%.3f reset=%d pre_exposure=%.6f exposure_scale=%.6f "
+                 "frame_dt=%.3f game_interval=%.3f "
+                 "queue_depth=%zu queue_wait=%.3f marker_wait=%.3f slot_wait=%.3f "
+                 "d3d_input_record=%.3f d3d_output_record=%.3f game_call=%.3f "
+                 "color_convert=%.3f depth_convert=%.3f motion_convert=%.3f exposure_convert=%.3f "
+                 "color_h2d=%.3f depth_h2d=%.3f motion_h2d=%.3f exposure_h2d=%.3f "
+                 "ngx_host=%.3f ctx_sync=%.3f gpu_eval=%.3f gpu_eval_scope=%s input_wait=%s output_sync_wall=%.3f "
+                 "output_sync_cpu=%.3f output_sync_blocking=%d output_sync_method=%s d2h=%.3f output_convert=%.3f "
+                 "h2d_total=%.3f d2h_issue=%.3f d2h_wait=%.3f "
+                 "prep=%.3f worker_wait=%.3f worker=%.3f finish_wait=%.3f finish=%.3f pipeline=%.3f "
+                 "throughput_interval=%.3f presented=%u age=%d motion_dilation=%u motion_dilation_wall=%.3f "
+                 "dlss_gpu=%.3f input_gpu_wait=%.3f vk_input=%.3f vk_dlss_wait=%.3f vk_output=%.3f vk_total=%.3f "
+                 "native_motion_gpu=%.3f wire_repair_gpu=%.3f "
+                 "feature=%u native_field=%u native_substitute=%u wire_requested=%u gpu_completion=%u vk_output_mode=%s vk_input_mode=%s",
+                 frame, params.renderWidth, params.renderHeight, feature->outWidth, feature->outHeight,
+                 slot.host[0].width, slot.host[0].height, slot.host[1].width, slot.host[1].height,
+                 slot.host[2].width, slot.host[2].height, params.hasExposure, feature->quality, feature->flags,
+                 feature->preset, params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY,
+                 params.reset, params.preExposure, params.exposureScale, params.frameTime, timing.gameInterval,
+                 timing.queueDepth, profile_ms(timing.queuedAt, timing.prepStart), timing.markerWait, timing.slotWait,
+                 timing.inputRecord, timing.outputRecord, timing.gameCall,
+                 timing.convert[0], timing.convert[1], timing.convert[2], timing.convert[3],
+                 timing.upload[0], timing.upload[1], timing.upload[2], timing.upload[3],
+                 timing.ngxHost, timing.ctxSync, timing.gpuEval,
+                 timing.gpuInputWait ? "launch_to_completion" : "evaluation", timing.gpuInputWait ? "gpu" : "cpu",
+                 timing.outputSyncWall, timing.outputSyncCpu,
+                 timing.outputSyncBlocking, timing.outputSyncNative ? "native_callback_wait" :
+                                            timing.outputSyncBlocking ? "event_query_sleep" : "context",
+                 timing.download, timing.outputConvert,
+                 timing.h2dTotal, timing.d2hIssue, timing.d2hWait,
+                 timing.prep, timing.workerWait, timing.worker, timing.finishWait, profile_ms(start, finished),
+                 profile_ms(timing.prepStart, finished), interval,
+                 timing.presentedFrame, timing.presentedFrame != 0 ? static_cast<int>(frame - timing.presentedFrame) : -1,
+                 params.motionDilation, timing.motionDilationWall, timing.dlssGpu, timing.inputGpuWait,
+                 timing.vkInput, timing.vkDlssWait, timing.vkOutput, timing.vkTotal, timing.nativeMotionGpu, timing.wireRepairGpu,
+                 feature->handle.Id, timing.nativeFieldReady, timing.nativeSubstituted, timing.wireRequested, params.gpuCompletion,
+                 timing.vkOutputFused<0 ? "unknown" : timing.vkOutputFused ? "compute" : "transfer",
+                 timing.vkInputFused<0 ? "unknown" : timing.vkInputFused ? "compute" : "transfer");
+        }
     }
     if (completed <= 5 || completed % 120 == 0)
         logf("frame %u done (slot %d)", frame, target);
@@ -7443,10 +8691,31 @@ static NgxResult fill_capabilities(void* parameters)
             if (d4r_ngx_get_uint(official, name, &value) == NGX_SUCCESS)
                 d4r_ngx_set_uint(parameters, name, value);
         }
+        // Backend = fsr: the core's account of nvngx_dlssd.dll does not apply (that library is
+        // not used, and need not exist). Availability is this process's FSR Ray Regeneration
+        // provider plus Super Sampling. Without nvngx_dlssd.dll the core offers no DLSSD helper
+        // callbacks; feature 13's optimal render sizes are Super Sampling's (same parameter
+        // names, same quality modes), so its callbacks answer them.
+        if (rr_enabled() && rr_backend() == RrBackend::Fsr)
+        {
+            const bool ready = ray_reconstruction_available();
+            d4r_ngx_set_int(parameters, "SuperSamplingDenoising.Available", ready ? 1 : 0);
+            d4r_ngx_set_int(parameters, "SuperSamplingDenoising.NeedsUpdatedDriver", 0);
+            d4r_ngx_set_int(parameters, "SuperSamplingDenoising.FeatureInitResult",
+                            static_cast<int>(ready ? NGX_SUCCESS : NGX_FAIL_FEATURE_NOT_SUPPORTED));
+            const char* pairs[2][2] = {{"DLSSDOptimalSettingsCallback", "DLSSOptimalSettingsCallback"},
+                                       {"DLSSDGetStatsCallback", "DLSSGetStatsCallback"}};
+            for (const auto& pair : pairs)
+            {
+                void* superSampling = nullptr;
+                d4r_ngx_get_void(official, pair[1], &superSampling);
+                d4r_ngx_set_void(parameters, pair[0], ready ? superSampling : nullptr);
+            }
+        }
         // D4R_RR_ENABLE=0 is this file's decision and outranks what the core reports: with the
         // route switched off, availability reads 0 and the callbacks are cleared, so a game
         // cannot reach a denoiser route that is not being offered.
-        if (!rr_enabled())
+        if (!rr_enabled() || rr_backend() == RrBackend::Invalid)
         {
             d4r_ngx_set_int(parameters, "SuperSamplingDenoising.Available", 0);
             d4r_ngx_set_int(parameters, "SuperSamplingDenoising.FeatureInitResult",
@@ -7455,9 +8724,12 @@ static NgxResult fill_capabilities(void* parameters)
             d4r_ngx_set_void(parameters, "DLSSDGetStatsCallback", nullptr);
         }
         const DenoiserCapability capability = denoiser_capability();
-        logf("denoiser capabilities from the core: available=%d init=0x%08x (Ray Reconstruction %s)",
-             capability.available, static_cast<unsigned int>(capability.initResult),
-             rr_denial_reason());
+        if (rr_backend() == RrBackend::Fsr)
+            logf("Ray Reconstruction capability (backend fsr, nvngx_dlssd.dll not used): %s", rr_denial_reason());
+        else
+            logf("denoiser capabilities from the core: available=%d init=0x%08x (Ray Reconstruction %s)",
+                 capability.available, static_cast<unsigned int>(capability.initResult),
+                 rr_denial_reason());
         g.ngx.destroyParameters(official);
         return NGX_SUCCESS;
     });
@@ -7556,7 +8828,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(void* adapter, const
     }
     // The local switch is checked before any core appears: with D4R_RR_ENABLE=0 this process
     // is not offering Ray Reconstruction, and no core answer may override that.
-    if (feature == NGX_FEATURE_RAY_RECONSTRUCTION && !rr_enabled())
+    if (feature == NGX_FEATURE_RAY_RECONSTRUCTION && (!rr_enabled() || rr_backend() == RrBackend::Invalid))
     {
         requirement->FeatureSupported = 1; // not supported
         logf("Ray Reconstruction is not supported: %s", rr_denial_reason());
@@ -7575,18 +8847,23 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_GetFeatureRequirements(void* adapter, const
         // feature 13's acceptance is decided later from ray_reconstruction_available().
         if (ensure_workers_started() != NGX_SUCCESS || (g.core == nullptr && !load_libraries()))
             return NGX_FAIL_PLATFORM_ERROR;
-        if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
+        if (feature == NGX_FEATURE_RAY_RECONSTRUCTION && rr_backend() == RrBackend::Dlss)
             load_denoiser_library();
     }
-    const bool supported = feature == NGX_FEATURE_SUPER_SAMPLING
-                               ? true
-                               : (g.ngxInitialized ? ray_reconstruction_available() : g.denoiser.cudaCapable);
+    // Before Init there is no device to ask AMD's runtime about: the FSR backend is offered when its DLL is in
+    // place, and CreateFeature makes the final decision on the real device.
+    const bool supported = feature == NGX_FEATURE_SUPER_SAMPLING ? true
+                           : g.ngxInitialized                    ? ray_reconstruction_available()
+                           : rr_backend() == RrBackend::Fsr      ? fsr_rr_present()
+                                                                 : g.denoiser.cudaCapable;
     if (!supported)
     {
         requirement->FeatureSupported = 1; // not supported
         if (feature == NGX_FEATURE_RAY_RECONSTRUCTION)
             logf("Ray Reconstruction is not supported: %s",
-                 g.ngxInitialized ? rr_denial_reason() : "no CUDA-capable DLSS-Denoiser for pre-Init discovery");
+                 g.ngxInitialized                 ? rr_denial_reason()
+                 : rr_backend() == RrBackend::Fsr ? "backend fsr: amd_fidelityfx_denoiser_dx12.dll is missing"
+                                                  : "no CUDA-capable DLSS-Denoiser for pre-Init discovery");
         return NGX_SUCCESS;
     }
     requirement->FeatureSupported = 0; // supported (NVSDK_NGX_FeatureSupportResult bitfield)
@@ -7696,6 +8973,7 @@ static NgxResult create_cuda_feature(Feature& feature)
         }
         feature.cudaWidth = feature.width;
         feature.cudaHeight = feature.height;
+        feature.cudaFlags = feature.flags;
         if (created == NGX_SUCCESS && env_uint("D4R_SHIM_BLOCKING_SYNC", 1) != 0 &&
             g.cu.eventCreate != nullptr && g.cu.eventRecord != nullptr &&
             g.cu.eventSynchronize != nullptr && g.cu.eventQuery != nullptr && g.cu.eventDestroy != nullptr)
@@ -7720,6 +8998,14 @@ static NgxResult create_cuda_feature(Feature& feature)
             const int startResult = g.cu.eventCreate(&feature.profileStart, 0);
             const int endResult = startResult == 0 ? g.cu.eventCreate(&feature.profileEnd, 0) : -1;
             feature.profileEventsReady = startResult == 0 && endResult == 0;
+            if(feature.profileEventsReady && env_uint("D4R_NATIVE_MV_LIVE",0)==1)
+            {
+                bool ready=true;
+                for(CudaEvent& event:feature.nativePassEvents)
+                    if(g.cu.eventCreate(&event,0)!=0) { ready=false;break; }
+                if(!ready) for(CudaEvent& event:feature.nativePassEvents)
+                { if(event) g.cu.eventDestroy(event);event=nullptr; }
+            }
             // optional: without it GPU-input-wait frames report dlss_gpu=-1 and keep gpu_eval
             if (feature.profileEventsReady && g.cu.eventCreate(&feature.profileInputsReleased, 0) != 0)
                 feature.profileInputsReleased = nullptr;
@@ -7741,10 +9027,22 @@ static NgxResult create_cuda_feature(Feature& feature)
     return result;
 }
 
+static NgxResult fsr_rr_create(Feature& feature, void* parameters);
+static NgxResult create_feature_locked(unsigned int featureId, void* parameters, NgxHandle** handle,
+                                       bool nativeVulkan);
+
 static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHandle** handle, bool nativeVulkan)
 {
     std::lock_guard<std::mutex> apiLock(g_featureApiMutex);
     std::lock_guard<std::mutex> stateLock(g.mutex);
+    return create_feature_locked(featureId, parameters, handle, nativeVulkan);
+}
+
+// The API lock and g.mutex are held. The FSR Ray Regeneration backend creates its internal Super Sampling
+// feature through here as well, without taking either lock again.
+static NgxResult create_feature_locked(unsigned int featureId, void* parameters, NgxHandle** handle,
+                                       bool nativeVulkan)
+{
     if (!g.ngxInitialized)
         return NGX_FAIL_NOT_INITIALIZED;
     if (!nativeVulkan && g.device == nullptr)
@@ -7766,7 +9064,7 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
         logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u) unsupported", featureId);
         return NGX_FAIL_FEATURE_NOT_SUPPORTED;
     }
-    if (rayReconstruction)
+    if (rayReconstruction && rr_backend() == RrBackend::Dlss)
     {
         // A game may create feature 13 without ever asking for capabilities, so the core's
         // account of the denoiser is fetched here if it has not been already.
@@ -7850,8 +9148,12 @@ static NgxResult create_feature(unsigned int featureId, void* parameters, NgxHan
     // about 20 s to compile on a cold cache, which stalled the game inside CreateFeature (Overwatch, 2026-10-11),
     // and the denoiser's 310.9 kernels 44 s (RE Requiem, 2026-10-14). A feature the engine refuses pays that at its
     // first frame instead.
-    feature->cudaCreationDeferred = !nativeVulkan && engine_requested();
-    const NgxResult result = feature->cudaCreationDeferred ? NGX_SUCCESS : create_cuda_feature(*feature);
+    const bool fsrBackend = rayReconstruction && rr_backend() == RrBackend::Fsr;
+    feature->cudaCreationDeferred = !nativeVulkan && !fsrBackend && engine_requested();
+    // Backend = fsr: no CUDA denoiser feature at all; AMD's denoiser and an internal Super Sampling feature.
+    const NgxResult result = fsrBackend                      ? fsr_rr_create(*feature, parameters)
+                             : feature->cudaCreationDeferred ? NGX_SUCCESS
+                                                             : create_cuda_feature(*feature);
     if (feature->cudaCreationDeferred)
     {
         logf("engine backend: CUDA feature creation deferred until fallback is needed");
@@ -9041,7 +10343,8 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
                                           {"DLSS.Input.SpecularAlbedo", "GBuffer.SpecularAlbedo"}};
     ID3D12Resource* guides[4] = {};
     // DLSS.Roughness.Mode 1 (packed): the roughness is the normals' w. Preset F follows the mode also when a roughness
-    // texture is bound (harness run against the CUDA path, 2026-10-13); D and E are only known without one (RE Requiem)
+    // texture is bound (harness run against the CUDA path, 2026-10-13); D and E use the bound texture (AW2 D capture:
+    // enc0 byte 366 is zero despite mode 1). Match that choice for presets D/E.
     const bool roughnessPacked = get_uint_or(parameters, "DLSS.Roughness.Mode", 0) == 1 &&
         (slot == 2 || get_resource(parameters, "GBuffer.Roughness") == nullptr);
     for (int i = 0; i < 4; ++i)
@@ -9112,13 +10415,12 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
         g_vk.interop->GetVulkanImageLayout(source.resource, source.copyState, &source.image->layout);
     }
     // the same resource can appear twice (a game may pass one texture as two guides): transition it once
-    std::vector<ID3D12Resource*> distinct;
-    for (const Source& source : sources)
-        if (std::find(distinct.begin(), distinct.end(), source.resource) == distinct.end())
-            distinct.push_back(source.resource);
-    if (distinct.size() != sources.size() - (roughnessPacked ? 1u : 0u))
-        return refuse("two inputs share one texture");
-    // each distinct resource is transitioned once (the packed roughness repeats the normals)
+    for (size_t i = 0; i < sources.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+            if (sources[i].resource == sources[j].resource &&
+                (sources[i].state != sources[j].state || sources[i].copyState != sources[j].copyState))
+                return refuse("shared inputs require conflicting resource states");
+    // Read-only guides may alias even when D/E use the bound roughness texture. Each resource is transitioned once.
     auto firstUse = [&](size_t i) {
         for (size_t j = 0; j < i; ++j)
             if (sources[j].resource == sources[i].resource) return false;
@@ -9182,6 +10484,23 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
     }
     if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
         return refuse("the command list cannot retain the engine's resources");
+    const bool profile = profile_enabled() && env_uint("D4R_PROFILE_GPU_TIMESTAMPS", 1) != 0 &&
+        profile_timestamps_ready(feature);
+    if (profile)
+    {
+        FrameTiming measured;
+        read_profile_timestamps(feature, frame, measured);
+        const auto now = ProfileClock::now();
+        const double interval = feature.engineRProfileAt.time_since_epoch().count() ?
+            profile_ms(feature.engineRProfileAt, now) : 0.0;
+        feature.engineRProfileAt = now;
+        if (profile_log_frame(frame) && measured.vkTotal >= 0)
+            logf("D4R_ENGINE_RR_PROFILE frame=%u gpu_frame=%u render=%ux%u output=%ux%u gpu_eval=%.3f "
+                 "game_interval=%.3f age=0", frame, frame - kOutputSlots, rw, rh, feature.outWidth,
+                 feature.outHeight, measured.vkTotal, interval);
+        profile_timestamp(feature, list, frame, 0);
+        profile_timestamp(feature, list, frame, 1);
+    }
     for (size_t i = 0; i < sources.size(); ++i)
         if (firstUse(i))
             transition(list, sources[i].resource, sources[i].state, sources[i].copyState);
@@ -9211,6 +10530,11 @@ static bool engine_evaluate_rr(Feature& feature, ID3D12GraphicsCommandList* list
             transition(list, sources[i].resource, sources[i].copyState, sources[i].state);
     if (!recorded)
         return refuse(failure);
+    if (profile)
+    {
+        profile_timestamp(feature, list, frame, 2);
+        profile_timestamp(feature, list, frame, 3);
+    }
     if (frame <= 3 || frame % 600 == 0)
         logf("engine frame %u recorded, Ray Reconstruction %c (jitter %.6f,%.6f, reset %d, mvScale %.3f,%.3f)", frame,
              g_rrLetter[slot], p.jitterX, p.jitterY, s.reset, p.mvScaleX, p.mvScaleY);
@@ -9503,13 +10827,18 @@ static void profile_timestamp(Feature& feature, ID3D12GraphicsCommandList* list,
     const UINT base = 4 * (frame % kOutputSlots);
     list->EndQuery(feature.timestampHeap, D3D12_QUERY_TYPE_TIMESTAMP, base + point);
     if (point == 3)
+    {
+        feature.timestampOutputFused[frame % kOutputSlots]=feature.recordOutputFused;
+        feature.timestampInputFused[frame % kOutputSlots]=feature.recordInputFused;
         list->ResolveQueryData(feature.timestampHeap, D3D12_QUERY_TYPE_TIMESTAMP, base, 4, feature.timestampReadback,
                                8ull * base);
+    }
 }
 
 // The evaluation kOutputSlots frames earlier, if its resolve has landed; clears the slot for this frame.
 static void read_profile_timestamps(Feature& feature, uint32_t frame, FrameTiming& timing)
 {
+    feature.recordOutputFused=feature.recordInputFused=false;
     volatile uint64_t* t = feature.timestampValues + 4 * (frame % kOutputSlots);
     const uint64_t t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3];
     if (t0 != 0 && t0 <= t1 && t1 <= t2 && t2 <= t3)
@@ -9519,14 +10848,28 @@ static void read_profile_timestamps(Feature& feature, uint32_t frame, FrameTimin
         timing.vkDlssWait = (t2 - t1) / perMs;
         timing.vkOutput = (t3 - t2) / perMs;
         timing.vkTotal = (t3 - t0) / perMs;
+        timing.vkOutputFused=feature.timestampOutputFused[frame % kOutputSlots];
+        timing.vkInputFused=feature.timestampInputFused[frame % kOutputSlots];
     }
     for (int index = 0; index < 4; ++index)
         t[index] = 0;
 }
 
+static NgxResult fsr_rr_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+                                 ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
+                                 ID3D12Resource* exposure, void* parameters, const FrameParams& p, uint32_t frame);
+static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters);
+
 static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters)
 {
     std::lock_guard<std::mutex> apiLock(g_featureApiMutex);
+    return evaluate_unlocked(list, handle, parameters);
+}
+
+// The API lock is held. The FSR Ray Regeneration backend evaluates its internal Super Sampling feature
+// through here, in the same command list, without taking the lock again.
+static NgxResult evaluate_unlocked(ID3D12GraphicsCommandList* list, const NgxHandle* handle, void* parameters)
+{
     FrameTiming timing;
     timing.enabled = profile_enabled();
     if (timing.enabled)
@@ -9565,6 +10908,15 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
              colorDesc.Width, colorDesc.Height, colorDesc.Format, depthDesc.Width, depthDesc.Height, depthDesc.Format,
              motionDesc.Width, motionDesc.Height, motionDesc.Format, outputDesc.Width, outputDesc.Height,
              outputDesc.Format, exposure);
+    if (env_uint("D4R_SHIM_TRACE_MOTION", 0) != 0)
+    {
+        static const GUID tag = {0xbaecd840,0x42b4,0x4b60,{0x8b,0x44,0x81,0x9a,0x7f,0xa1,0x51,0xa4}};
+        const uint32_t info[] = {frame, feature->handle.Id, static_cast<uint32_t>(outputDesc.Width), outputDesc.Height};
+        const HRESULT tagged = motion->SetPrivateData(tag, sizeof(info), info);
+        if (frame <= 10 || frame % 120 == 0)
+        logf("motion producer trace: feature=%u frame=%u resource=%p size=%llux%u format=%u status=0x%08x",
+             feature->handle.Id, frame, motion, motionDesc.Width, motionDesc.Height, motionDesc.Format, tagged);
+    }
     const bool colorSupported = supported_input(Plane::Color, colorDesc.Format);
     const bool depthSupported = supported_input(Plane::Depth, depthDesc.Format);
     const bool motionSupported = supported_input(Plane::Motion, motionDesc.Format);
@@ -9677,6 +11029,10 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
                 std::memcpy(p.auxMatrix[index], value, sizeof(p.auxMatrix[index]));
         }
     }
+
+    // Backend = fsr: AMD's denoiser, then the internal Super Sampling feature; never NVIDIA's denoiser.
+    if (feature->fsr != nullptr)
+        return fsr_rr_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame);
 
     if (engine_requested() && engine_evaluate(*feature, list, color, depth, motion, output, exposure, parameters, p, frame))
         return NGX_SUCCESS;
@@ -9903,7 +11259,8 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         const D3D12_RESOURCE_STATES states[4] = {inputState, depthState, inputState, inputState};
         for (int index = 0; index < inputCount; ++index)
             transition(list, inputs[index], states[index], D3D12_RESOURCE_STATE_COPY_SOURCE);
-        const bool fused = ensure_fused_color(*feature, slotIndex, color, vramInputs[0]);
+        const bool fused = ensure_fused_color(*feature, slotIndex, color, vramInputs[0], frame);
+        feature->recordInputFused=fused;
         const bool recorded = record_vram_inputs(*feature, list, slot, vramInputs, inputCount, fused);
         for (int index = 0; index < inputCount; ++index)
             transition(list, inputs[index], D3D12_RESOURCE_STATE_COPY_SOURCE, states[index]);
@@ -9921,6 +11278,9 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         if (exposure != nullptr)
             copy_to_staging(list, exposure, slot.exposure, inputState);
     }
+
+    record_native_motion_capture(list, slot, motion, frame);
+    record_native_gpu_check(*feature,list,slot,motion);
 
     // Frame marker, written once the copies above have completed.
     ID3D12GraphicsCommandList2* list2 = nullptr;
@@ -10022,20 +11382,16 @@ static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* hand
         {
             if (p.packedOutput)
                 vramOutput.convert = false; // the buffer already holds the texture's own texels
-            transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-            if (!record_vram_output(list, feature->outputs[target].vram, vramOutput, feature->outputConversion))
+            if (!record_feature_vram_output(*feature,target,list,output,outputState,vramOutput,frame))
                 logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
-            transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
         }
         if (timing.enabled)
             timing.presentedFrame = frame;
     }
     else if (latest >= 0 && p.vram)
     {
-        transition(list, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!record_vram_output(list, feature->outputs[latest].vram, vramOutput, feature->outputConversion))
+        if (!record_feature_vram_output(*feature,latest,list,output,outputState,vramOutput,frame))
             logf("frame %u: BeginVkCommandBufferInterop failed for the output", frame);
-        transition(list, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
     }
     else if (latest >= 0)
     {
@@ -10093,8 +11449,13 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList
     return evaluate(list, handle, parameters);
 }
 
+static void fsr_rr_release(Feature& feature);
+static void fsr_rr_destroy(Feature& feature);
+
 static void release_feature(Feature* feature)
 {
+    // The FSR backend's internal Super Sampling feature first, through this same function.
+    fsr_rr_release(*feature);
     {
         std::lock_guard<std::mutex> lock(feature->ngxWaitMutex);
         release_ngx_input_wait_locked(*feature, "the feature is being released", false);
@@ -10137,6 +11498,8 @@ static void release_feature(Feature* feature)
                 g.cu.texObjectDestroy(slot.dilatedTexture), slot.dilatedTexture = 0;
             if (slot.dilatedMotion != 0)
                 g.cu.memFree(slot.dilatedMotion), slot.dilatedMotion = 0;
+            if(slot.nativeGpuTexture) g.cu.texObjectDestroy(slot.nativeGpuTexture),slot.nativeGpuTexture=0;
+            if(slot.nativeGpuResult) g.cu.memFree(slot.nativeGpuResult),slot.nativeGpuResult=0;
         }
         for (CudaImage* image : {&feature->color, &feature->depth, &feature->motion, &feature->exposure})
         {
@@ -10153,6 +11516,7 @@ static void release_feature(Feature* feature)
             g.cu.eventDestroy(feature->profileStart);
         if (feature->profileEnd != nullptr)
             g.cu.eventDestroy(feature->profileEnd);
+        for(CudaEvent event:feature->nativePassEvents) if(event) g.cu.eventDestroy(event);
         if (feature->profileInputsReleased != nullptr)
             g.cu.eventDestroy(feature->profileInputsReleased);
         if (feature->timestampHeap != nullptr)
@@ -10168,6 +11532,10 @@ static void release_feature(Feature* feature)
                 g.cu.memFree(buffer);
         if (feature->outputLinear != 0)
             g.cu.memFree(feature->outputLinear);
+        if(feature->nativeThinMask) g.cu.memFree(feature->nativeThinMask);
+        if(feature->preparedWireAxes) g.cu.memFree(feature->preparedWireAxes);
+        if(feature->wirePatchMask) g.cu.memFree(feature->wirePatchMask);
+        for(CudaDevicePtr buffer:feature->wireBuffers) if(buffer) g.cu.memFree(buffer);
         for (InputSlot& slot : feature->inputs)
             for (HostPlane& host : slot.host)
                 release_host(host);
@@ -10186,14 +11554,17 @@ static void release_feature(Feature* feature)
     else
     {
         release_engine_network(*feature);
+        fsr_rr_destroy(*feature);
         delete feature;
     }
 }
 
 static void destroy_recorded_resources(Feature* feature)
 {
+    for(InputSlot& slot : feature->inputs)
+        if(slot.nativeValidityOwner) { slot.nativeValidityOwner->Release();slot.nativeValidityOwner=nullptr; }
     for (InputSlot& slot : feature->inputs)
-        for (Staging* staging : {&slot.color, &slot.depth, &slot.motion, &slot.exposure})
+        for (Staging* staging : {&slot.color, &slot.depth, &slot.motion, &slot.exposure, &slot.nativeMotionCapture, &slot.nativeDepthCapture, &slot.nativeSceneCapture, &slot.nativeOpaqueCapture, &slot.ownedSceneCapture, &slot.ownedMatrixCapture, &slot.ownedDepthCapture, &slot.originalOpaqueCopyCapture, &slot.glassMaskCapture, &slot.materialSceneCapture, &slot.ownedValidityCapture, &slot.glassValidityCapture, &slot.nativePrimaryDepthCapture, &slot.opaqueSceneCapture, &slot.opaqueMatrixCapture, &slot.originalPrimaryDepthCapture, &slot.originalGeometryCapture, &slot.originalHardwareDepthCapture})
             staging->release();
     for (OutputSlot& slot : feature->outputs)
         slot.staging.release();
@@ -10205,6 +11576,7 @@ static void destroy_recorded_resources(Feature* feature)
         g_vk.destroySemaphore(g_vk.device, feature->splitSemaphore, nullptr);
     if (feature->marker != nullptr)
         feature->marker->Release();
+    fsr_rr_destroy(*feature);
     logf("feature %u recorded resources retired after allocator completion", feature->handle.Id);
     delete feature;
 }
@@ -10216,7 +11588,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle)
     {
         std::lock_guard<std::mutex> lock(g_featuresMutex);
         for (Feature* candidate : g_features)
-            if (&candidate->handle == handle && !candidate->nativeVulkan)
+            if (&candidate->handle == handle && !candidate->nativeVulkan && candidate->owner == nullptr)
             {
                 // The API mutex serializes releases and release_feature removes the registry entry. An
                 // internal drain failure may already have marked this feature retiring; it still needs
@@ -10265,7 +11637,10 @@ D4R_EXPORT NgxResult NVSDK_NGX_D3D12_Shutdown()
     std::vector<Feature*> features;
     {
         std::lock_guard<std::mutex> lock(g_featuresMutex);
-        features = g_features;
+        // Internal features (the FSR backend's Super Sampling stage) go with their owner.
+        for (Feature* feature : g_features)
+            if (feature->owner == nullptr)
+                features.push_back(feature);
         for (Feature* feature : features)
             if (feature->nativeVulkan)
                 return NGX_FAIL_INVALID_PARAMETER;
@@ -10297,6 +11672,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_UpdateFeature(const void*, unsigned int)
     return NGX_SUCCESS;
 }
 
+#include "d4r_fsr_rr_backend.inl"
 #include "d4r_vulkan_frontend.inl"
 
 // Proxy filenames vary (dxgi.dll, winmm.dll, ...). Identify OptiScaler by its

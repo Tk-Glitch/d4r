@@ -76,6 +76,7 @@ void putMat(std::vector<uint8_t>& p, uint32_t offset, const Mat4& m) {
 struct RModel::Impl {
     Device device;
     uint32_t preset = 0;
+    bool gfx11 = false;
     std::unique_ptr<R2Model> v2;   // preset F ("D4RR0002"): engine/runtime_rr2.inc
     // per stage, the shader's bindings after the three buffers (engine/rr/README.md): texture argument offsets, then
     // surface argument offsets with their GLSL image format, both ascending
@@ -119,6 +120,11 @@ RModel::RModel(VkPhysicalDevice physical, VkDevice device, const std::string& di
         std::istringstream f(line);
         std::string key; f >> key;
         if (key == "preset") f >> m.preset;
+        else if (key == "arithmetic") {
+            std::string arithmetic; f >> arithmetic;
+            if (arithmetic != "gfx11") throw std::runtime_error("rr.txt: unknown arithmetic " + arithmetic);
+            m.gfx11 = true;
+        }
         else if (key == "stage") {
             std::string name, shader, weightFile, textureList, surfaceList, option; uint32_t subgroup = 32;
             f >> name >> shader >> subgroup >> weightFile >> textureList >> surfaceList >> option;
@@ -256,6 +262,7 @@ struct REngine::Impl {
     std::vector<Bindings> bindings;
     const Bindings* bound = nullptr;
     float prevJitter[2] = {0, 0};
+    rr_camera::Matrix previousView{}, previousClip{};
     uint32_t frame = 0;
     bool reset = true;
     explicit Impl(RModel::Impl& m) : model(m) {}
@@ -443,6 +450,20 @@ void REngine::setFrame(const RFrameImages& images, const RFrameSettings& setting
     putMat(p, 596, rc); putMat(p, 660, clip); putMat(p, 724, clip); putMat(p, 788, inv);
     putMat(p, 852, mul(toNdc, inv)); putMat(p, 916, mul(rc, toPixels));
     putF(p, 756, settings.jitter[0] * (2.0f / rw)); putF(p, 760, -settings.jitter[1] * (2.0f / rh));
+    if (e.model.gfx11) {
+        rr_camera::Matrix v, c;
+        for (int i = 0; i < 16; ++i) { v[i] = settings.worldToView[i]; c[i] = settings.viewToClip[i]; }
+        const auto camera = rr_camera::transforms(v, c, reset ? v : e.previousView,
+                                                  reset ? c : e.previousClip, rw, rh);
+        auto store = [&](uint32_t offset, const rr_camera::Matrix& matrix) {
+            for (int i = 0; i < 16; ++i) putF(p, offset + 4 * i, matrix[i]);
+        };
+        store(596, camera.previousClip); store(788, camera.inverseClip);
+        store(852, camera.inversePixels); store(916, camera.previousPixels);
+        putF(p, 756, c[8] + (settings.jitter[0] + settings.jitter[0]) / rw);
+        putF(p, 760, c[9] - (settings.jitter[1] * 2.0f) / rh);
+        e.previousView = v; e.previousClip = c;
+    }
     put32(p, 984, f);
     put32(p, 1024, e.rw); put32(p, 1028, e.rh);
     // the output stage

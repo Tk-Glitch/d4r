@@ -125,3 +125,19 @@
 @ stdcall d4rNgxTimelineDestroy(ptr) d4rNgxTimelineDestroy
 @ stdcall d4rNgxTimelineWait(ptr) d4rNgxTimelineWait
 @ stdcall d4rDilateMotionVectors(ptr) d4rDilateMotionVectors
+@ stdcall d4rDilateMotionVectorsPadded(ptr long) d4rDilateMotionVectorsPadded
+
+@ stdcall d4rDilateMotionVectorsThin(ptr long) d4rDilateMotionVectorsThin
+
+@ stdcall d4rComposeNativeMotion(ptr) d4rComposeNativeMotion
+@ stdcall d4rComposeNativeMotionThin(ptr) d4rComposeNativeMotionThin
+@ stdcall d4rStabilizeThinWires(ptr) d4rStabilizeThinWires
+
+@ stdcall d4rStabilizeThinWiresSparse(ptr) d4rStabilizeThinWiresSparse
+
+@ stdcall d4rComposeNativeMotionAligned(ptr) d4rComposeNativeMotionAligned
+
+@ stdcall d4rComposeNativeMotionHybrid(ptr) d4rComposeNativeMotionHybrid
+
+@ stdcall d4rComposeNativeMotionPrepared(ptr) d4rComposeNativeMotionPrepared
+@ stdcall d4rStabilizeThinWiresPrepared(ptr) d4rStabilizeThinWiresPrepared

@@ -23,15 +23,20 @@
     RAC R[2];
     for (uint n = wv; n < 6u; n += 4u) {
         B8 fb0, fb1, hb_[2];
-        coopMatLoad(fb0, XF, n * 128u, 8u, CM);
-        coopMatLoad(fb1, XF, n * 128u + 4u, 8u, CM);
+        LDS8B(fb0, XF, n * 128u, 8u);
+        LDS8B(fb1, XF, n * 128u + 4u, 8u);
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
             RAC a;
             [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_B1 / 2u + 16u * m + 8u * hl + uint(i)]);
             A8 a0, a1;
             LDA(a0, W_W1, 32u, m, 0u); LDA(a1, W_W1, 32u, m, 1u);
             K32(a, a0, fb0, a1, fb1)
+#ifdef RR_GFX11
+            { F8V hc_ = uvec2(0u); [[unroll]] for (int i = 0; i < 8; ++i) hc_[i >> 2] |= q8s(max(float(a[i]), 0.0)) << (8u * uint(i & 3));
+              G11_B(hb_[m], hc_) }
+#else
             [[unroll]] for (int i = 0; i < 8; ++i) hb_[m][i] = q8s(max(float(a[i]), 0.0));
+#endif
         }
         float16_t xv[2][8];
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
@@ -67,13 +72,25 @@
         precise float16_t se = s + float16_t(0.0001220703125);
         const float16_t r = rsq16(se);
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
+#ifdef RR_GFX11
+            F8V xq = uvec2(0u);
+#else
             B8 xq;
+#endif
             [[unroll]] for (int i = 0; i < 8; ++i) {
                 precise float16_t g = r * w16.w[W_GAIN0 / 2u + inter(16u * m + 8u * hl + uint(i))];
                 precise float16_t nn = xv[m][i] * g;
+#ifdef RR_GFX11
+                xq[i >> 2] |= q8h(nn) << (8u * uint(i & 3));
+#else
                 xq[i] = q8h(nn);
+#endif
             }
+#ifdef RR_GFX11
+            G11_ST(xq, XT, n * 128u + 4u * m, 8u)
+#else
             coopMatStore(xq, XT, n * 128u + 4u * m, 8u, CM);
+#endif
         }
     }
     barrier();   // XT complete; XF is read (the attention reuses its memory)
@@ -85,21 +102,17 @@
             A8 wk[2], xa[2];
             B8 wvb[2], xb[2];
             [[unroll]] for (uint kt = 0u; kt < 2u; ++kt) {
-                coopMatLoad(xb[kt], XT, n * 128u + 4u * kt, 8u, CM);
-                coopMatLoad(xa[kt], XT, n * 128u + 4u * kt, 8u, RM);
+                LDS8B(xb[kt], XT, n * 128u + 4u * kt, 8u);
+                LDS8A(xa[kt], XT, n * 128u + 4u * kt, 8u);
                 LDA(wk[kt], W_WK0 + HEAD * hd, 32u, c, kt);
                 LDB(wvb[kt], W_WV0 + HEAD * hd, 32u, kt, c);
             }
             RAC a = RAC(RV(float16_t(0.0)));
             K32(a, wk[0], xb[0], wk[1], xb[1])
-            A8 ka;
-            Q8(ka, a)
-            coopMatStore(ka, KVS, n * 128u + 4u * c, 8u, RM);
+            Q8STA(a, KVS, n * 128u + 4u * c, 8u)
             RAC vv = RAC(RV(float16_t(0.0)));
             K32(vv, xa[0], wvb[0], xa[1], wvb[1])
-            A8 va;
-            Q8(va, vv)
-            coopMatStore(va, KVS, 768u + c * 384u + 4u * n, 24u, RM);
+            Q8STA(vv, KVS, 768u + c * 384u + 4u * n, 24u)
         }
         barrier();
 #include "rr_attn.glsl"
@@ -111,6 +124,9 @@
     }
     // MLP (dec0_m.comp's)
     B8 Nb[2];
+#ifdef RR_GFX11
+    F8V NbC[2] = F8V[2](uvec2(0u), uvec2(0u));
+#endif
     {
         float16_t rv[2][8];
         [[unroll]] for (uint m = 0u; m < 2u; ++m) [[unroll]] for (int i = 0; i < 8; ++i) rv[m][i] = float16_t(R[m][i]);
@@ -137,10 +153,17 @@
                 const uint k = 16u * m + 8u * hl + uint(i);
                 precise float16_t g = r * w16.w[W_GAIN1 / 2u + k];
                 precise float16_t nn = rv[m][i] * g;
+#ifdef RR_GFX11
+                NbC[m][i >> 2] |= q8h(nn) << (8u * uint(i & 3));
+#else
                 Nb[m][i] = q8h(nn);
+#endif
                 precise float16_t a = rv[m][i] + w16.w[W_TABLE1 / 2u + k];
                 R[m][i] = RV(a);
             }
+#ifdef RR_GFX11
+        [[unroll]] for (uint m = 0u; m < 2u; ++m) G11_B(Nb[m], NbC[m])
+#endif
     }
     for (uint br = 0u; br < 4u; ++br) {
         const uint w1 = W_W1_0 + BRANCH * br, b1 = W_B1_0 + BRANCH * br, w2 = W_W2_0 + BRANCH * br;
@@ -151,7 +174,11 @@
             A8 a0, a1;
             LDA(a0, w1, 32u, c, 0u); LDA(a1, w1, 32u, c, 1u);
             K32(h, a0, Nb[0], a1, Nb[1])
+#ifdef RR_GFX11
+            { F8V hc_; ACTQ8C(hc_, h) G11_B(Hb[c], hc_) }
+#else
             ACTQ8(Hb[c], h)
+#endif
         }
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
             A8 a0, a1;
@@ -171,8 +198,15 @@
         const uint o = (outOff + uint(ty * ex + tx) * 32u) >> 2u;
         barrier();   // XT is read; the merge rows reuse it
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
+#ifdef RR_GFX11
+            F8V tc_;
+            G11_CODES(tc_, R[m])
+            G11_B(Tb[m], tc_)
+            const uint q0 = tc_.x, q1 = tc_.y;
+#else
             Q8(Tb[m], R[m])
             const uint q0 = pack4(Tb[m][0], Tb[m][1], Tb[m][2], Tb[m][3]), q1 = pack4(Tb[m][4], Tb[m][5], Tb[m][6], Tb[m][7]);
+#endif
             const uint at = 4u * m + 2u * hl;
             if (inside) { arena.w[o + at] = q0; arena.w[o + at + 1u] = q1; }
             const uint gm = mr * 32u + blk * 8u + 4u * m + 2u * hl;
@@ -232,11 +266,20 @@
         [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BM / 2u + 16u * m + 8u * hl + uint(i)]);
         [[unroll]] for (uint ks = 0u; ks < 4u; ++ks) {
             B8 g0, g1; A8 w0, w1;
-            coopMatLoad(g0, MG, 8u * ks, 32u, CM);
-            coopMatLoad(g1, MG, 8u * ks + 4u, 32u, CM);
+            LDS8B(g0, MG, 8u * ks, 32u);
+            LDS8B(g1, MG, 8u * ks + 4u, 32u);
             LDA(w0, W_WM, 128u, m, 2u * ks); LDA(w1, W_WM, 128u, m, 2u * ks + 1u);
             K32(a, w0, g0, w1, g1)
         }
+#ifdef RR_GFX11
+        F8V q;
+        G11_CODES(q, a)
+        if (X >= 0 && Y >= 0 && X < hx && Y < hy) {
+            const uint at = (mrgOff + (m >> 1u) * lplane + uint(Y * hx + X) * 32u) / 4u + 4u * (m & 1u) + 2u * hl;
+            arena.w[at] = q.x;
+            arena.w[at + 1u] = q.y;
+        }
+#else
         B8 q;
         Q8(q, a)
         if (X >= 0 && Y >= 0 && X < hx && Y < hy) {
@@ -244,6 +287,7 @@
             arena.w[at] = pack4(q[0], q[1], q[2], q[3]);
             arena.w[at + 1u] = pack4(q[4], q[5], q[6], q[7]);
         }
+#endif
     }
     if (wv == 3u && lane < 16u) {   // surface 128: 2x2 sums of 0.25 * surface 112, rightwards first, then downwards
         const uint mx = lane & 3u, my = lane >> 2u;

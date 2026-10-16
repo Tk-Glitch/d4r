@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "vk_dispatch.h"
+#include "rr_camera.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>

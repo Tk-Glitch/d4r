@@ -1,4 +1,4 @@
-"""Engine opt-in, preset-selection behavior and polling configuration precedence."""
+"""Engine defaults, preset-selection behavior and polling configuration precedence."""
 import configparser
 import os
 from pathlib import Path
@@ -10,17 +10,47 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShimConfigTests(unittest.TestCase):
-    def test_engine_is_opt_in_and_configured_by_ini(self):
+    def test_profile_log_interval_validation_and_environment_precedence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ini = Path(temporary) / 'd4r.ini'
+            env = {key: value for key, value in os.environ.items() if not key.startswith('D4R_')}
+            cmd = ['python3', str(ROOT / 'scripts/d4r_config.py'), '--config', str(ini)]
+            for value, expected in ((None, None), ('auto', None), ('1', '1'), ('60', '60'),
+                                    ('060', '60'), ('120', '120'), ('4294967295', '4294967295')):
+                ini.write_text('[Debug]\nProfile = true\n' +
+                               (f'ProfileLogEvery = {value}\n' if value is not None else ''))
+                result = subprocess.run(cmd, env=env, text=True, capture_output=True, check=True)
+                self.assertIn('export D4R_PROFILE=1\n', result.stdout)
+                if expected is None:
+                    self.assertNotIn('export D4R_PROFILE_LOG_EVERY=', result.stdout)
+                else:
+                    self.assertIn(f'export D4R_PROFILE_LOG_EVERY={expected}\n', result.stdout)
+            ini.write_text('[Debug]\nProfileLogEvery = 60\n')
+            result = subprocess.run(cmd, env=dict(env, D4R_PROFILE_LOG_EVERY='120'),
+                                    text=True, capture_output=True, check=True)
+            self.assertNotIn('export D4R_PROFILE_LOG_EVERY=', result.stdout)
+            for value in ('0', '-1', '0.5', 'invalid', '4294967296'):
+                ini.write_text(f'[Debug]\nProfileLogEvery = {value}\n')
+                result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2, value)
         for name in ('packaging/d4r.ini', 'config/d4r.ini.default'):
             ini = configparser.ConfigParser(inline_comment_prefixes=(';',))
             ini.read(ROOT / name)
-            self.assertFalse(ini.getboolean('Engine', 'Enabled'), name)
+            self.assertEqual(ini.getint('Debug', 'ProfileLogEvery'), 60, name)
+
+    def test_engine_defaults_and_ini_overrides(self):
+        for name, expected in (('packaging/d4r.ini', 'auto'), ('config/d4r.ini.default', 'false')):
+            ini = configparser.ConfigParser(inline_comment_prefixes=(';',))
+            ini.read(ROOT / name)
+            self.assertEqual(ini.get('Engine', 'Enabled'), expected, name)
             self.assertEqual(ini.get('Engine', 'ModelDir'), 'auto', name)
         with tempfile.TemporaryDirectory() as temporary:
             ini = Path(temporary) / 'd4r.ini'
             env = {key: value for key, value in os.environ.items() if not key.startswith('D4R_')}
             cmd = ['python3', str(ROOT / 'scripts/d4r_config.py'), '--config', str(ini)]
-            for text, enabled, model in (('', '0', None), ('[Engine]\nEnabled = true\n', '1', None),
+            for text, enabled, model in (('', '0', None), ('[Engine]\nEnabled = auto\n', '0', None),
+                                         ('[Engine]\nEnabled = false\n', '0', None),
+                                         ('[Engine]\nEnabled = true\n', '1', None),
                                          ('[Engine]\nEnabled = true\nModelDir = /models/k\n', '1', '/models/k')):
                 ini.write_text(text)
                 result = subprocess.run(cmd, env=env, text=True, capture_output=True, check=True)

@@ -14,6 +14,8 @@
 #include <time.h>
 #include "d4r_native_selection.h"
 #include "d4r_motion_dilation.h"
+#include "d4r_native_motion.h"
+#include "d4r_wire_history.h"
 #ifdef D4R_MOTION_KERNELS
 #include "d4r_motion_kernels.h"
 #endif
@@ -983,9 +985,11 @@ static void* find_zluda_symbol(const char* name)
     return cuda_library != NULL ? dlsym(cuda_library, name) : NULL;
 }
 
-/* d4r-owned, opt-in preprocessing. Runs on HIP's legacy/default stream, shared
-   with CUDA's null stream; the shim records and waits for completion before NGX. */
-CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters)
+static CUstream d4r_ngx_stream(CUstream stream);
+
+/* Preprocessing, input waits and NGX null-stream launches all use d4r_ngx_stream.
+   allocation_height == 0 retains the original ABI's active-height contract. */
+static CUresult dilate_motion_vectors(const D4rMotionDilationParams* parameters, uint32_t allocation_height, int thin_sky)
 {
     if (parameters == NULL || parameters->depth == 0 || parameters->motion == 0 || parameters->output == 0 ||
         parameters->radius < 1 || parameters->radius > 2 || parameters->render_width == 0 ||
@@ -1002,6 +1006,8 @@ CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static void* module;
     static void* function;
+    static void* lds_function;
+    static void* thin_function;
     static HIP_LAUNCH launch;
     static int initialized, result = CUDA_ERROR_NOT_SUPPORTED;
     pthread_mutex_lock(&lock);
@@ -1018,7 +1024,11 @@ CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters
         launch = hip != NULL ? (HIP_LAUNCH)dlsym(hip, "hipModuleLaunchKernel") : NULL;
         if (image != NULL && load != NULL && get != NULL && launch != NULL &&
             load(&module, image) == 0 && get(&function, module, "d4r_motion_dilate") == 0)
+        {
             result = CUDA_SUCCESS;
+            get(&lds_function, module, "d4r_motion_dilate_lds");
+            get(&thin_function, module, "d4r_motion_dilate_lds_thin");
+        }
         tracef("motion-vector dilation: %s (%s)", result == 0 ? "GPU kernel ready" : "unavailable", architecture);
     }
     const int status = result;
@@ -1026,9 +1036,342 @@ CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters
     if (status != CUDA_SUCCESS)
         return status;
     D4rMotionDilationParams copy = *parameters;
+    const int lds = lds_function != NULL && d4r_motion_dilation_lds_eligible(&copy);
+    if (allocation_height != 0 && (!lds || allocation_height < copy.motion_height ||
+        copy.motion_pitch % 4 != 0 || copy.motion_pitch / 4 > 0x7fffffffu || allocation_height > 0x7fffffffu))
+        return CUDA_ERROR_INVALID_VALUE;
+    if (thin_sky && (!lds || thin_function == NULL))
+        return CUDA_ERROR_NOT_SUPPORTED;
+    if (lds)
+    {
+        uint32_t height = allocation_height != 0 ? allocation_height : copy.motion_height;
+        void* arguments[] = {&copy, &height};
+        return launch(thin_sky ? thin_function : lds_function, (unsigned)((copy.motion_pitch / 4 + 15) / 16), (height + 15) / 16,
+                      1, 256, 1, 1, 0, d4r_ngx_stream(NULL), arguments, NULL);
+    }
     void* arguments[] = {&copy};
     const uint64_t pixels = (uint64_t)copy.motion_width * copy.motion_height;
     return launch(function, (unsigned)((pixels + 127) / 128), 1, 1, 128, 1, 1, 0, d4r_ngx_stream(NULL), arguments, NULL);
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+CUresult WINAPI d4rDilateMotionVectors(const D4rMotionDilationParams* parameters)
+{
+    return dilate_motion_vectors(parameters, 0, 0);
+}
+
+/* Additive export: retain the 72-byte parameter ABI and preserve the full padded
+   allocation in the LDS launch, without a separate full-plane copy. */
+CUresult WINAPI d4rDilateMotionVectorsPadded(const D4rMotionDilationParams* parameters, uint32_t allocation_height)
+{
+    if (allocation_height == 0)
+        return CUDA_ERROR_INVALID_VALUE;
+    return dilate_motion_vectors(parameters, allocation_height, 0);
+}
+
+CUresult WINAPI d4rDilateMotionVectorsThin(const D4rMotionDilationParams* parameters, uint32_t allocation_height)
+{
+    if (allocation_height == 0)
+        return CUDA_ERROR_INVALID_VALUE;
+    return dilate_motion_vectors(parameters, allocation_height, 1);
+}
+
+/* Additive native-MV operation. The recorded input marker must precede this
+ * preprocessing launch, and NGX follows it on the same effective stream. */
+static CUresult d4r_compose_native_motion(const D4rNativeMotionParams* parameters, unsigned int thin,float jitter_x,float jitter_y)
+{
+    if(!d4r_native_motion_parameters_valid(parameters)) return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**,const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**,void*,const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*,unsigned,unsigned,unsigned,
+        unsigned,unsigned,unsigned,unsigned,void*,void**,void**);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static void *module,*function[3];
+    static HIP_LAUNCH launch;
+    static int initialized,result=CUDA_ERROR_NOT_SUPPORTED;
+    int status;
+    pthread_mutex_lock(&lock);
+    if(!initialized)
+    {
+        void* hip;
+        const void* image;
+        HIP_LOAD load;
+        HIP_FUNCTION get;
+        char architecture[32];
+        initialized=1;pthread_once(&load_once,load_zluda);
+        hip=dlopen("libamdhip64.so.7",RTLD_NOW|RTLD_LOCAL);
+        gpu_architecture(architecture,sizeof(architecture));image=d4r_motion_image(architecture);
+        load=hip ? (HIP_LOAD)dlsym(hip,"hipModuleLoadData") : NULL;
+        get=hip ? (HIP_FUNCTION)dlsym(hip,"hipModuleGetFunction") : NULL;
+        launch=hip ? (HIP_LAUNCH)dlsym(hip,"hipModuleLaunchKernel") : NULL;
+        if(image && load && get && launch && load(&module,image)==0 &&
+            get(&function[0],module,"d4r_native_motion_compose")==0 &&
+            get(&function[1],module,"d4r_native_motion_compose_thin")==0 &&
+            get(&function[2],module,"d4r_native_motion_compose_aligned")==0) result=CUDA_SUCCESS;
+        tracef("native motion composition: %s (%s)",result==0 ? "GPU kernel ready" : "unavailable",architecture);
+    }
+    status=result;pthread_mutex_unlock(&lock);
+    if(status==CUDA_SUCCESS)
+    {
+        D4rNativeMotionThinParams copy={*parameters,jitter_x,jitter_y};
+        void* arguments[]={&copy};
+        return launch(function[thin],(copy.base.width+15)/16,(copy.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+    }
+    return status;
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+CUresult WINAPI d4rComposeNativeMotion(const D4rNativeMotionParams* parameters)
+{ return d4r_compose_native_motion(parameters,0,0,0); }
+CUresult WINAPI d4rComposeNativeMotionThin(const D4rNativeMotionThinParams* parameters)
+{
+    if(!parameters || !(parameters->jitter_x>=-1 && parameters->jitter_x<=1 && parameters->jitter_y>=-1 && parameters->jitter_y<=1)) return CUDA_ERROR_INVALID_VALUE;
+    return d4r_compose_native_motion(&parameters->base,1,parameters->jitter_x,parameters->jitter_y);
+}
+
+CUresult WINAPI d4rComposeNativeMotionAligned(const D4rNativeMotionThinParams* parameters)
+{
+    if(!parameters || !(parameters->jitter_x>=-1 && parameters->jitter_x<=1 && parameters->jitter_y>=-1 && parameters->jitter_y<=1)) return CUDA_ERROR_INVALID_VALUE;
+    return d4r_compose_native_motion(&parameters->base,2,parameters->jitter_x,parameters->jitter_y);
+}
+
+CUresult WINAPI d4rStabilizeThinWires(const D4rWireHistoryParams* parameters)
+{
+    if(!d4r_wire_history_parameters_valid(parameters)) return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**,const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**,void*,const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*,unsigned,unsigned,unsigned,
+        unsigned,unsigned,unsigned,unsigned,void*,void**,void**);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static void *module,*function;
+    static HIP_LAUNCH launch;
+    static int initialized,result=CUDA_ERROR_NOT_SUPPORTED;
+    int status;
+    pthread_mutex_lock(&lock);
+    if(!initialized)
+    {
+        void* hip;
+        const void* image;
+        HIP_LOAD load;
+        HIP_FUNCTION get;
+        char architecture[32];
+        initialized=1;pthread_once(&load_once,load_zluda);
+        hip=dlopen("libamdhip64.so.7",RTLD_NOW|RTLD_LOCAL);
+        gpu_architecture(architecture,sizeof(architecture));image=d4r_motion_image(architecture);
+        load=hip ? (HIP_LOAD)dlsym(hip,"hipModuleLoadData") : NULL;
+        get=hip ? (HIP_FUNCTION)dlsym(hip,"hipModuleGetFunction") : NULL;
+        launch=hip ? (HIP_LAUNCH)dlsym(hip,"hipModuleLaunchKernel") : NULL;
+        if(image && load && get && launch && load(&module,image)==0 &&
+            get(&function,module,"d4r_wire_history")==0) result=CUDA_SUCCESS;
+        tracef("thin wire history: %s (%s)",result==0 ? "GPU kernel ready" : "unavailable",architecture);
+    }
+    status=result;pthread_mutex_unlock(&lock);
+    if(status==CUDA_SUCCESS)
+    {
+        D4rWireHistoryParams copy=*parameters;
+        void* arguments[]={&copy};
+        return launch(function,(copy.width+15)/16,(copy.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+    }
+    return status;
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+CUresult WINAPI d4rComposeNativeMotionHybrid(const D4rNativeMotionHybridParams* parameters)
+{
+    if(!d4r_native_motion_hybrid_parameters_valid(parameters)) return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**,const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**,void*,const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*,unsigned,unsigned,unsigned,
+        unsigned,unsigned,unsigned,unsigned,void*,void**,void**);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static void *module,*function;
+    static HIP_LAUNCH launch;
+    static int initialized,result=CUDA_ERROR_NOT_SUPPORTED;
+    int status;
+    pthread_mutex_lock(&lock);
+    if(!initialized)
+    {
+        void* hip;
+        const void* image;
+        HIP_LOAD load;
+        HIP_FUNCTION get;
+        char architecture[32];
+        initialized=1;pthread_once(&load_once,load_zluda);
+        hip=dlopen("libamdhip64.so.7",RTLD_NOW|RTLD_LOCAL);
+        gpu_architecture(architecture,sizeof(architecture));image=d4r_motion_image(architecture);
+        load=hip ? (HIP_LOAD)dlsym(hip,"hipModuleLoadData") : NULL;
+        get=hip ? (HIP_FUNCTION)dlsym(hip,"hipModuleGetFunction") : NULL;
+        launch=hip ? (HIP_LAUNCH)dlsym(hip,"hipModuleLaunchKernel") : NULL;
+        if(image && load && get && launch && load(&module,image)==0 &&
+            get(&function,module,"d4r_native_motion_compose_hybrid")==0) result=CUDA_SUCCESS;
+        tracef("hybrid native motion: %s (%s)",result==0 ? "GPU kernel ready" : "unavailable",architecture);
+    }
+    status=result;pthread_mutex_unlock(&lock);
+    if(status==CUDA_SUCCESS)
+    {
+        D4rNativeMotionHybridParams copy=*parameters;
+        void* arguments[]={&copy};
+        return launch(function,(copy.native.base.width+15)/16,(copy.native.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+    }
+    return status;
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+CUresult WINAPI d4rStabilizeThinWiresSparse(const D4rWireHistorySparseParams* parameters)
+{
+    if(!d4r_wire_history_sparse_parameters_valid(parameters)) return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**,const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**,void*,const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*,unsigned,unsigned,unsigned,
+        unsigned,unsigned,unsigned,unsigned,void*,void**,void**);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static void *module,*function,*apply;
+    static HIP_LAUNCH launch;
+    static int initialized,result=CUDA_ERROR_NOT_SUPPORTED;
+    int status;
+    pthread_mutex_lock(&lock);
+    if(!initialized)
+    {
+        void* hip;
+        const void* image;
+        HIP_LOAD load;
+        HIP_FUNCTION get;
+        char architecture[32];
+        initialized=1;pthread_once(&load_once,load_zluda);
+        hip=dlopen("libamdhip64.so.7",RTLD_NOW|RTLD_LOCAL);
+        gpu_architecture(architecture,sizeof(architecture));image=d4r_motion_image(architecture);
+        load=hip ? (HIP_LOAD)dlsym(hip,"hipModuleLoadData") : NULL;
+        get=hip ? (HIP_FUNCTION)dlsym(hip,"hipModuleGetFunction") : NULL;
+        launch=hip ? (HIP_LAUNCH)dlsym(hip,"hipModuleLaunchKernel") : NULL;
+        if(image && load && get && launch && load(&module,image)==0 &&
+            get(&function,module,"d4r_wire_history_sparse")==0 &&
+            get(&apply,module,"d4r_wire_history_apply")==0) result=CUDA_SUCCESS;
+        tracef("sparse thin wire history: %s (%s)",result==0 ? "GPU kernel ready" : "unavailable",architecture);
+    }
+    status=result;pthread_mutex_unlock(&lock);
+    if(status==CUDA_SUCCESS)
+    {
+        D4rWireHistorySparseParams copy=*parameters;
+        void* arguments[]={&copy};
+        status=launch(function,(copy.base.width+15)/16,(copy.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+        if(status!=0) return status;
+        return launch(apply,(copy.base.width+15)/16,(copy.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+    }
+    return status;
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
+}
+CUresult WINAPI d4rComposeNativeMotionPrepared(const D4rNativeMotionPreparedParams* parameters)
+{
+    if(!d4r_native_motion_prepared_parameters_valid(parameters)) return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**,const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**,void*,const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*,unsigned,unsigned,unsigned,
+        unsigned,unsigned,unsigned,unsigned,void*,void**,void**);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static void *module,*function,*apply;
+    static HIP_LAUNCH launch;
+    static int initialized,result=CUDA_ERROR_NOT_SUPPORTED;
+    int status;
+    pthread_mutex_lock(&lock);
+    if(!initialized)
+    {
+        void* hip;
+        const void* image;
+        HIP_LOAD load;
+        HIP_FUNCTION get;
+        char architecture[32];
+        initialized=1;pthread_once(&load_once,load_zluda);
+        hip=dlopen("libamdhip64.so.7",RTLD_NOW|RTLD_LOCAL);
+        gpu_architecture(architecture,sizeof(architecture));image=d4r_motion_image(architecture);
+        load=hip ? (HIP_LOAD)dlsym(hip,"hipModuleLoadData") : NULL;
+        get=hip ? (HIP_FUNCTION)dlsym(hip,"hipModuleGetFunction") : NULL;
+        launch=hip ? (HIP_LAUNCH)dlsym(hip,"hipModuleLaunchKernel") : NULL;
+        if(image && load && get && launch && load(&module,image)==0 &&
+            get(&function,module,"d4r_native_motion_prepare")==0 &&
+            get(&apply,module,"d4r_native_motion_prepared")==0) result=CUDA_SUCCESS;
+        tracef("prepared native motion: %s (%s)",result==0 ? "GPU kernel ready" : "unavailable",architecture);
+    }
+    status=result;pthread_mutex_unlock(&lock);
+    if(status==CUDA_SUCCESS)
+    {
+        D4rNativeMotionPreparedParams copy=*parameters;
+        void* arguments[]={&copy};
+        status=launch(function,(copy.native.base.width+31)/32,(copy.native.base.height+31)/32,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+        if(status!=0) return status;
+        return launch(apply,(copy.native.base.width+15)/16,(copy.native.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+    }
+    return status;
+#else
+    return CUDA_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+CUresult WINAPI d4rStabilizeThinWiresPrepared(const D4rWireHistoryPreparedParams* parameters)
+{
+    if(!d4r_wire_history_prepared_parameters_valid(parameters)) return CUDA_ERROR_INVALID_VALUE;
+#ifdef D4R_MOTION_KERNELS
+    typedef int(__attribute__((sysv_abi)) * HIP_LOAD)(void**,const void*);
+    typedef int(__attribute__((sysv_abi)) * HIP_FUNCTION)(void**,void*,const char*);
+    typedef int(__attribute__((sysv_abi)) * HIP_LAUNCH)(void*,unsigned,unsigned,unsigned,
+        unsigned,unsigned,unsigned,unsigned,void*,void**,void**);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static void *module,*function,*apply;
+    static HIP_LAUNCH launch;
+    static int initialized,result=CUDA_ERROR_NOT_SUPPORTED;
+    int status;
+    pthread_mutex_lock(&lock);
+    if(!initialized)
+    {
+        void* hip;
+        const void* image;
+        HIP_LOAD load;
+        HIP_FUNCTION get;
+        char architecture[32];
+        initialized=1;pthread_once(&load_once,load_zluda);
+        hip=dlopen("libamdhip64.so.7",RTLD_NOW|RTLD_LOCAL);
+        gpu_architecture(architecture,sizeof(architecture));image=d4r_motion_image(architecture);
+        load=hip ? (HIP_LOAD)dlsym(hip,"hipModuleLoadData") : NULL;
+        get=hip ? (HIP_FUNCTION)dlsym(hip,"hipModuleGetFunction") : NULL;
+        launch=hip ? (HIP_LAUNCH)dlsym(hip,"hipModuleLaunchKernel") : NULL;
+        if(image && load && get && launch && load(&module,image)==0 &&
+            get(&function,module,"d4r_wire_history_preclassified")==0 &&
+            get(&apply,module,"d4r_wire_history_apply")==0) result=CUDA_SUCCESS;
+        tracef("prepared thin wire history: %s (%s)",result==0 ? "GPU kernel ready" : "unavailable",architecture);
+    }
+    status=result;pthread_mutex_unlock(&lock);
+    if(status==CUDA_SUCCESS)
+    {
+        D4rWireHistoryPreparedParams copy=*parameters;
+        void* arguments[]={&copy};
+        status=launch(function,(copy.sparse.base.width+15)/16,(copy.sparse.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+        if(status!=0) return status;
+        return launch(apply,(copy.sparse.base.width+15)/16,(copy.sparse.base.height+15)/16,1,256,1,1,0,
+            d4r_ngx_stream(NULL),arguments,NULL);
+    }
+    return status;
 #else
     return CUDA_ERROR_NOT_SUPPORTED;
 #endif

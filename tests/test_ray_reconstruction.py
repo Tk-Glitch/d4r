@@ -7,7 +7,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "scripts" / "d4r_config.py"
-RR_VARIABLES = ("D4R_RR_ENABLE", "D4R_RR_PRESET")
+RR_VARIABLES = ("D4R_RR_ENABLE", "D4R_RR_PRESET", "D4R_RR_BACKEND", "D4R_FSR_RR_DLL", "D4R_FSR_RR_STABILITY_BIAS",
+                "D4R_FSR_RR_DETAIL")
 
 
 def run_config(text, **overrides):
@@ -66,6 +67,65 @@ class RayReconstructionConfigTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("D4R_RR_ENABLE", decided)
         self.assertNotIn("D4R_RR_PRESET", decided)
+
+
+class RayReconstructionBackendTests(unittest.TestCase):
+    """[RayReconstruction] Backend picks the denoiser; it never changes the DLSS presets."""
+
+    def test_default_leaves_dlss_in_place(self):
+        code, decided = run_config("[RayReconstruction]\nEnable = true\n")
+        self.assertEqual(code, 0)
+        self.assertNotIn("D4R_RR_BACKEND", decided)  # the shim's default is dlss
+
+    def test_backends_are_exported_and_independent_of_presets(self):
+        for backend in ("dlss", "fsr", "FSR"):
+            with self.subTest(backend=backend):
+                code, decided = run_config(f"[RayReconstruction]\nBackend = {backend}\nModel = E\n[DLSS]\nModel = K\n")
+                self.assertEqual(code, 0)
+                self.assertEqual(decided["D4R_RR_BACKEND"], backend.lower())
+                self.assertEqual(decided["D4R_RR_PRESET"], "5")
+                self.assertEqual(decided["D4R_DLSS_PRESET"], "11")
+
+    def test_unknown_backend_is_rejected(self):
+        for value in ("amd", "fsr4", "native"):
+            with self.subTest(value=value):
+                code, decided = run_config(f"[RayReconstruction]\nBackend = {value}\n")
+                self.assertNotEqual(code, 0)
+                self.assertNotIn("D4R_RR_BACKEND", decided)
+
+    def test_denoiser_path_and_environment_precedence(self):
+        code, decided = run_config("[RayReconstruction]\nBackend = fsr\nFsrDenoiser = /opt/amd/denoiser.dll\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(decided["D4R_FSR_RR_DLL"], "/opt/amd/denoiser.dll")
+        code, decided = run_config("[RayReconstruction]\nBackend = fsr\n", D4R_RR_BACKEND="dlss")
+        self.assertEqual(code, 0)
+        self.assertNotIn("D4R_RR_BACKEND", decided)
+
+    def test_templates_keep_dlss_as_the_default(self):
+        import configparser
+        for name in ("config/d4r.ini.default", "packaging/d4r.ini"):
+            ini = configparser.ConfigParser(inline_comment_prefixes=(";",))
+            ini.read(ROOT / name)
+            self.assertEqual(ini.get("RayReconstruction", "Backend"), "dlss", name)
+            self.assertEqual(ini.get("RayReconstruction", "FsrDenoiser"), "auto", name)
+            self.assertEqual(ini.get("RayReconstruction", "FsrStabilityBias"), "auto", name)
+            self.assertEqual(ini.get("RayReconstruction", "FsrDetail"), "0", name)
+
+    def test_fsr_tuning_keys(self):
+        code, decided = run_config("[RayReconstruction]\nBackend = fsr\nFsrStabilityBias = auto\nFsrDetail = 0.25\n")
+        self.assertEqual(code, 0)
+        self.assertNotIn("D4R_FSR_RR_STABILITY_BIAS", decided)  # auto: AMD's own default
+        self.assertEqual(decided["D4R_FSR_RR_DETAIL"], "0.25")
+        code, decided = run_config("[RayReconstruction]\nFsrStabilityBias = 0\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(decided["D4R_FSR_RR_STABILITY_BIAS"], "0")
+        for text in ("FsrStabilityBias = -1", "FsrStabilityBias = low", "FsrDetail = 1.5", "FsrDetail = x"):
+            with self.subTest(text=text):
+                code, _ = run_config(f"[RayReconstruction]\n{text}\n")
+                self.assertNotEqual(code, 0)
+        code, decided = run_config("[RayReconstruction]\nFsrStabilityBias = 0\n", D4R_FSR_RR_STABILITY_BIAS="1")
+        self.assertEqual(code, 0)
+        self.assertNotIn("D4R_FSR_RR_STABILITY_BIAS", decided)
 
 
 if __name__ == "__main__":

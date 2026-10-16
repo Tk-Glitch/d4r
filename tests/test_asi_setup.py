@@ -185,11 +185,13 @@ int wmain(int argc, wchar_t** argv) {
                 (runtime / 'ngx').mkdir(parents=True)
                 for name in ('nvngx.dll', 'd4r.ini'):
                     (runtime / name).touch()
-                dlss, ngx = b'verified DLSS fixture', b'verified NGX fixture'
+                dlss, dlssd, ngx = b'verified DLSS fixture', b'verified DLSS RR fixture', b'verified NGX fixture'
                 (runtime / 'nvngx_dlss.dll').write_bytes(dlss)
+                (runtime / 'nvngx_dlssd.dll').write_bytes(dlssd)
                 (runtime / 'ngx/_nvngx.dll').write_bytes(ngx)
                 script = (ROOT / 'install.sh').read_text()
                 replacements = {'DLSS_SHA256': hashlib.sha256(dlss).hexdigest(),
+                                'DLSSD_SHA256': hashlib.sha256(dlssd).hexdigest(),
                                 'NGX_SHA256': hashlib.sha256(ngx).hexdigest()}
                 script = '\n'.join(key + '=' + replacements[key] if key in replacements else line
                                    for line in script.splitlines() for key in [line.split('=', 1)[0]]) + '\n'

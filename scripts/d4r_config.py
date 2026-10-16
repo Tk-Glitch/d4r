@@ -100,6 +100,34 @@ def main(argv):
             env["D4R_RR_PRESET"] = rr_model
         else:
             fail(f"[RayReconstruction] Model {rr_model!r}: use auto, default, D, E or F")
+    # Backend: which denoiser serves a game's Ray Reconstruction request. dlss (the default) is
+    # NVIDIA's model (Model above); fsr is AMD's FSR Ray Regeneration, followed by Super Sampling.
+    rr_backend = get("RayReconstruction", "Backend")
+    if rr_backend is not None:
+        if rr_backend.lower() not in ("dlss", "fsr"):
+            fail(f"[RayReconstruction] Backend {rr_backend!r}: use dlss or fsr")
+        env["D4R_RR_BACKEND"] = rr_backend.lower()
+    # FSR denoiser tuning: FsrStabilityBias (auto = AMD's default, or a number >= 0) and FsrDetail (the share,
+    # 0-1, of the colour that goes around the denoiser; 0 = off).
+    fsr_stability = get("RayReconstruction", "FsrStabilityBias")
+    if fsr_stability is not None and fsr_stability.lower() != "auto":
+        try:
+            if float(fsr_stability) < 0:
+                raise ValueError
+        except ValueError:
+            fail(f"[RayReconstruction] FsrStabilityBias {fsr_stability!r}: use auto or a number >= 0")
+        env["D4R_FSR_RR_STABILITY_BIAS"] = fsr_stability
+    fsr_detail = get("RayReconstruction", "FsrDetail")
+    if fsr_detail is not None:
+        try:
+            if not 0 <= float(fsr_detail) <= 1:
+                raise ValueError
+        except ValueError:
+            fail(f"[RayReconstruction] FsrDetail {fsr_detail!r}: use a number from 0 to 1")
+        env["D4R_FSR_RR_DETAIL"] = fsr_detail
+    fsr_denoiser = path_value("RayReconstruction", "FsrDenoiser")
+    if fsr_denoiser:
+        env["D4R_FSR_RR_DLL"] = fsr_denoiser
 
     age = get("Latency", "FrameAge")
     if age is not None:
@@ -162,6 +190,7 @@ def main(argv):
         if value is not None:
             env[var] = "1" if value else "0"
     value = get("Interop", "MarkerPollUs")
+    env["D4R_MOTION_THIN_SKY"] = "1" if flag("Interop", "MotionDilationThinSky") else "0"
     dilation = get("Interop", "MotionVectorDilation")
     if dilation is not None and dilation not in ("0", "1", "2"):
         fail("[Interop] MotionVectorDilation must be 0, 1 or 2")
@@ -213,6 +242,11 @@ def main(argv):
 
     if flag("Debug", "Profile"):
         env["D4R_PROFILE"] = "1"
+    every = get("Debug", "ProfileLogEvery")
+    if every is not None:
+        if not every.isascii() or not every.isdecimal() or not 1 <= int(every) <= 4294967295:
+            fail(f"[Debug] ProfileLogEvery must be 1-4294967295, not {every!r}")
+        env["D4R_PROFILE_LOG_EVERY"] = str(int(every))
     if path_value("Debug", "LogDir"):
         env["D4R_GAME_LOG_DIR"] = path_value("Debug", "LogDir")
 

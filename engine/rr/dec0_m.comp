@@ -17,7 +17,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
+#ifndef RR_GFX11
 #extension GL_EXT_float_e4m3 : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : require
@@ -27,7 +29,9 @@ layout(local_size_x = 128) in;
 #include "rr_exact.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer ParamBlock { uint p[]; } param;
+#ifndef RR_GFX11
 layout(set = 0, binding = 1, std430) readonly buffer W8 { floate4m3_t w[]; } w8;
+#endif
 layout(set = 0, binding = 1, std430) readonly buffer W16 { float16_t w[]; } w16;
 layout(set = 0, binding = 1, std430) readonly buffer W16U { uint16_t w[]; } w16u;
 layout(set = 0, binding = 1, std430) readonly buffer W8U { uint8_t w[]; } w8u;
@@ -40,10 +44,15 @@ layout(set = 0, binding = 7, rgba8_snorm) uniform writeonly image2D S144;
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define HAC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#ifndef RR_GFX11
 #define A8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define B8 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#endif
 #define RM gl_CooperativeMatrixLayoutRowMajor
 #define CM gl_CooperativeMatrixLayoutColumnMajor
+#ifdef RR_GFX11
+#include "rr_gfx11_k32.glsl"
+#else
 #define LDA(dst, base, k, mt, kt) coopMatLoad((dst), w8.w, (base) + 256u * ((mt) * ((k) / 16u) + (kt)), 16u, RM)
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define RND(m) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (m)[i_] = rnd16((m)[i_]);
@@ -64,6 +73,7 @@ layout(set = 0, binding = 7, rgba8_snorm) uniform writeonly image2D S144;
 #define RV(x) float(x)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); RND(acc) }
 #define K32H(acc, a0, b0, a1, b1) { ACC p_ = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), ACC(acc))); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (acc)[i_] = float16_t(p_[i_]); }
+#endif
 #endif
 const uint HEAD = W_WK1 - W_WK0, BRANCH = W_W1_1 - W_W1_0;
 
@@ -124,16 +134,14 @@ void main()
             [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) LDA(we[mm][kt], W_WE, 64u, 2u * wv + mm, kt);
         [[unroll]] for (uint n = 0u; n < 3u; ++n) {
             B8 lb[4];
-            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(lb[kt], LOW, n * 256u + 4u * kt, 16u, CM);
+            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) LDS8B(lb[kt], LOW, n * 256u + 4u * kt, 16u);
             [[unroll]] for (uint mm = 0u; mm < 2u; ++mm) {
                 const uint m = 2u * wv + mm;
                 RAC a;
                 [[unroll]] for (int i = 0; i < 8; ++i) a[i] = RV(w16.w[W_BE / 2u + 16u * m + 8u * hl + uint(i)]);
                 K32(a, we[mm][0], lb[0], we[mm][1], lb[1])
                 K32(a, we[mm][2], lb[2], we[mm][3], lb[3])
-                B8 q;
-                Q8(q, a)
-                coopMatStore(q, POOL, EX_AT + n * 512u + 4u * m, 32u, CM);
+                Q8STB(a, POOL, EX_AT + n * 512u + 4u * m, 32u)
             }
         }
     }
@@ -149,8 +157,12 @@ void main()
         [[unroll]] for (uint wd = 0u; wd < 8u; ++wd) {
             const uint e = POOL[EX_AT + r * 32u + 8u * s + wd], sk = arena.w[sb + wd];
             [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+#ifdef RR_GFX11
+                precise float16_t x = g11_e4h((e >> (8u * b)) & 0xffu) + g11_e4h((sk >> (8u * b)) & 0xffu);
+#else
                 precise float16_t x = float16_t(uintBitsToFloate4m3EXT(uint8_t((e >> (8u * b)) & 0xffu)))
                                     + float16_t(uintBitsToFloate4m3EXT(uint8_t((sk >> (8u * b)) & 0xffu)));
+#endif
                 v[4u * wd + b] = x;
             }
         }
@@ -169,7 +181,7 @@ void main()
         precise float16_t se = sm + float16_t(0.0001220703125);
         const float16_t rr = rsq16(se);
         [[unroll]] for (uint wd = 0u; wd < 8u; ++wd) {
-            floate4m3_t c[4];
+            F8 c[4];
             [[unroll]] for (uint b = 0u; b < 4u; ++b) {
                 const uint j = 4u * wd + b;
                 precise float16_t g = rr * w16.w[W_GAIN0 / 2u + inter(j)];
@@ -186,7 +198,11 @@ void main()
     RAC R[2];
     [[unroll]] for (uint m = 0u; m < 2u; ++m) {
         HAC x;
+#ifdef RR_GFX11
+        [[unroll]] for (int i = 0; i < 8; ++i) x[i] = XR[wv * 512u + 16u * m + col * 32u + 8u * hl + uint(i)];
+#else
         coopMatLoad(x, XR, wv * 512u + 16u * m, 32u, CM);
+#endif
         [[unroll]] for (int i = 0; i < 8; ++i) {
             precise float16_t c = float16_t(x[i]) + w16.w[W_TABLE0 / 2u + 16u * m + 8u * hl + uint(i)];
             R[m][i] = RV(c);
@@ -201,21 +217,17 @@ void main()
             A8 wk[2], xa[2];
             B8 wvb[2], xb[2];
             [[unroll]] for (uint kt = 0u; kt < 2u; ++kt) {
-                coopMatLoad(xb[kt], XT, n * 128u + 4u * kt, 8u, CM);
-                coopMatLoad(xa[kt], XT, n * 128u + 4u * kt, 8u, RM);
+                LDS8B(xb[kt], XT, n * 128u + 4u * kt, 8u);
+                LDS8A(xa[kt], XT, n * 128u + 4u * kt, 8u);
                 LDA(wk[kt], W_WK0 + HEAD * hd, 32u, c, kt);
                 LDB(wvb[kt], W_WV0 + HEAD * hd, 32u, kt, c);
             }
             RAC a = RAC(RV(float16_t(0.0)));
             K32(a, wk[0], xb[0], wk[1], xb[1])
-            A8 ka;
-            Q8(ka, a)
-            coopMatStore(ka, POOL, n * 128u + 4u * c, 8u, RM);
+            Q8STA(a, POOL, n * 128u + 4u * c, 8u)
             RAC v = RAC(RV(float16_t(0.0)));
             K32(v, xa[0], wvb[0], xa[1], wvb[1])
-            A8 va;
-            Q8(va, v)
-            coopMatStore(va, POOL, 768u + c * 384u + 4u * n, 24u, RM);
+            Q8STA(v, POOL, 768u + c * 384u + 4u * n, 24u)
         }
         barrier();
 #include "rr_attn.glsl"
@@ -228,6 +240,9 @@ void main()
 
     // ---------------------------------------------------------------- MLP
     B8 Nb[2];
+#ifdef RR_GFX11
+    F8V NbC[2] = F8V[2](uvec2(0u), uvec2(0u));
+#endif
     {
         float16_t rv[2][8];
         [[unroll]] for (uint m = 0u; m < 2u; ++m) [[unroll]] for (int i = 0; i < 8; ++i) rv[m][i] = float16_t(R[m][i]);
@@ -255,10 +270,17 @@ void main()
                 const uint k = 16u * m + 8u * hl + uint(i);
                 precise float16_t g = r * w16.w[W_GAIN1 / 2u + k];
                 precise float16_t n = rv[m][i] * g;
+#ifdef RR_GFX11
+                NbC[m][i >> 2] |= q8h(n) << (8u * uint(i & 3));
+#else
                 Nb[m][i] = q8h(n);
+#endif
                 precise float16_t a = rv[m][i] + w16.w[W_TABLE1 / 2u + k];
                 R[m][i] = RV(a);
             }
+#ifdef RR_GFX11
+        [[unroll]] for (uint m = 0u; m < 2u; ++m) G11_B(Nb[m], NbC[m])
+#endif
     }
     for (uint br = 0u; br < 4u; ++br) {
         const uint w1 = W_W1_0 + BRANCH * br, b1 = W_B1_0 + BRANCH * br, w2 = W_W2_0 + BRANCH * br;
@@ -269,7 +291,11 @@ void main()
             A8 a0, a1;
             LDA(a0, w1, 32u, c, 0u); LDA(a1, w1, 32u, c, 1u);
             K32(h, a0, Nb[0], a1, Nb[1])
+#ifdef RR_GFX11
+            { F8V hc_; ACTQ8C(hc_, h) G11_B(Hb[c], hc_) }
+#else
             ACTQ8(Hb[c], h)
+#endif
         }
         [[unroll]] for (uint m = 0u; m < 2u; ++m) {
             A8 a0, a1;

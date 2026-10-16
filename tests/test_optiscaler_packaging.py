@@ -91,7 +91,7 @@ class OptiScalerConfigTests(unittest.TestCase):
             inputs.mkdir()
             (repo / 'scripts').mkdir(parents=True)
             for name in ('package_release.sh', 'configure_optiscaler.py', 'check_glibc_compat.sh',
-                         'check_redistributable.py', 'private_d3d12_core.py'):
+                         'check_redistributable.py', 'private_d3d12_core.py', 'stage_engine_kit.sh'):
                 shutil.copy2(ROOT / 'scripts' / name, repo / 'scripts' / name)
             shutil.copytree(ROOT / 'packaging', repo / 'packaging')
             for name in ('LICENSE', 'NOTICE'):
@@ -112,6 +112,18 @@ class OptiScalerConfigTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
                 return path
+
+            # Exercise the actual installer-kit stager with representative source files.
+            # No model builder, shader compiler or GPU fixture is executed here.
+            for name in ('engine/compile_k.py', 'engine/test_k.py', 'engine/test_m.py',
+                         'engine/rr/test_layer.py', 'vulkan/ptx2glsl.py'):
+                destination = repo / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, destination)
+            fixture(repo / 'engine/weights.bin', b'must not enter the model kit')
+            fixture(repo / 'engine/test_unrelated.py', b'must not enter the model kit')
+            fixture(repo / 'build/d3d12_dlss_harness.exe')
+            validator = fixture(inputs / 'glslang/bin/glslangValidator', b'packaging-only compiler fixture')
 
             # A real minimal ELF lets the package's existing GLIBC checker run.
             elf = inputs / 'library.so'
@@ -153,7 +165,8 @@ class OptiScalerConfigTests(unittest.TestCase):
                        D4R_ZLUDA_DIR=str(inputs / 'zluda'), D4R_VKD3D_DIR=str(inputs / 'vkd3d'),
                        D4R_ROCM_RUNTIME=str(inputs / 'rocm'), D4R_OPTISCALER_LICENSE=str(license_path),
                        D4R_ZLUDA_SRC=str(inputs / 'source'), D4R_VKD3D_SRC=str(inputs / 'source'),
-                       D4R_BUNDLE_DLSS=str(dlss), D4R_BUNDLE_NGX=str(core), D4R_BUNDLE_TEX=str(inputs / 'tex'))
+                       D4R_BUNDLE_DLSS=str(dlss), D4R_BUNDLE_NGX=str(core), D4R_BUNDLE_TEX=str(inputs / 'tex'),
+                       D4R_GLSLANG=str(inputs / 'glslang'), D4R_GLSLANG_LICENSE=str(license_path))
             version = (repo / 'packaging/VERSION').read_text().strip()
             configs = []
             # A compiled engine model: only d4r's shaders and marker may reach a zip.
@@ -186,12 +199,32 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assertEqual(archive.read('d4r.asi'), archive.read('d4r/nvngx.dll'))
                             self.assertIn('d4r/d4r-setup.exe', archive.namelist())
                             self.assertEqual('d4r/install.sh' in archive.namelist(), bundled == 'installer')
-                            self.assertFalse(any(n.endswith('.py') for n in archive.namelist()))
+                            if bundled != 'installer':
+                                self.assertFalse(any(n.endswith('.py') for n in archive.namelist()))
                             self.assertIn(b'ASI add-on', archive.read('d4r/README.txt'))
                             self.assertEqual({n.split('/')[0] for n in archive.namelist()}, {'d4r.asi', 'd4r'})
                             self.assertIn('d4r/d3d12.dll', archive.namelist())
                             self.assertIn('d4r/d4r12core.dll', archive.namelist())
                             self.assertNotIn('d4r/d3d12core.dll', archive.namelist())
+                        kit = 'd4r/tools/models/'
+                        self.assertEqual('d4r/tools/build-engine-models.sh' in archive.namelist(), bundled == 'installer')
+                        if bundled == 'installer':
+                            self.assertEqual(archive.read('d4r/tools/build-engine-models.sh'),
+                                             (ROOT / 'packaging/build_engine_models.sh').read_bytes())
+                            for executable in ('d4r/tools/build-engine-models.sh', kit + 'bin/glslangValidator'):
+                                self.assertTrue((archive.getinfo(executable).external_attr >> 16) & 0o111)
+                            for source in ('engine/compile_k.py', 'engine/test_k.py', 'engine/test_m.py',
+                                           'engine/rr/test_layer.py', 'vulkan/ptx2glsl.py'):
+                                self.assertEqual(archive.read(kit + source), (ROOT / source).read_bytes())
+                            self.assertEqual(archive.read(kit + 'bin/glslangValidator'), validator.read_bytes())
+                            self.assertEqual(archive.read('d4r/licenses/glslang-LICENSE.txt'), license_path.read_bytes())
+                            self.assertIn(kit + 'bin/d3d12_dlss_harness.exe', archive.namelist())
+                            self.assertFalse(any(n.endswith('.py') and not n.startswith(kit)
+                                                 for n in archive.namelist()))
+                            self.assertNotIn(kit + 'engine/weights.bin', archive.namelist())
+                            self.assertNotIn(kit + 'engine/test_unrelated.py', archive.namelist())
+                        else:
+                            self.assertFalse(any(n.startswith(kit) for n in archive.namelist()))
                         self.assertIn('d4r/nvngx.dll', archive.namelist())
                         self.assertNotIn('nvngx.dll', archive.namelist())
                         self.assertNotIn('d4r/_nvngx.dll', archive.namelist())

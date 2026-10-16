@@ -128,6 +128,11 @@ cp -r "$ROCM_RUNTIME/lib" "$STAGE/d4r/rocm/lib"
   "$STAGE/d4r/nvcuda.dll" "$STAGE/d4r/zluda/libcuda.so" "$STAGE/d4r/rocm/lib/"*
 cp "$ROOT/packaging/d4r.ini" "$STAGE/d4r/d4r.ini"
 cp "$ROOT/packaging/d4r-check.sh" "$STAGE/d4r/d4r-check.sh"
+# AMD FSR Ray Regeneration 1.2 for [RayReconstruction] Backend = fsr: AMD's unmodified denoiser DLL (MIT)
+if [[ -n "${D4R_BUNDLE_FSR_RR_DLL:-}" ]]; then
+  cp "$D4R_BUNDLE_FSR_RR_DLL" "$STAGE/d4r/amd_fidelityfx_denoiser_dx12.dll"
+  cp "$ROOT/third_party/fidelityfx/LICENSE.txt" "$STAGE/d4r/licenses/FidelityFX-LICENSE.txt"
+fi
 if [[ "$VARIANT" != clean ]]; then
   : "${D4R_BUNDLE_DLSS:?set D4R_BUNDLE_DLSS}" "${D4R_BUNDLE_TEX:?set D4R_BUNDLE_TEX}"
   if [[ "$VARIANT" == full ]]; then

@@ -56,8 +56,12 @@ NOOPT = {'enc1'}
 SURFACE_FORMATS = {'dec0': {144: 'rgba8_snorm'}}
 
 
+# D4R_RR_GFX11=1: shaders for RDNA3, which has no FP8 matrices or VK_EXT_shader_float8 (engine/rr/rr_gfx11.glsl)
+GFX11 = ['-DRR_GFX11'] if os.environ.get('D4R_RR_GFX11') == '1' else []
+
+
 def glsl(source, output, *defines):
-    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *defines, str(source), '-o', str(output)],
+    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', *GFX11, *defines, str(source), '-o', str(output)],
                    check=True, stdout=subprocess.DEVNULL)
 
 

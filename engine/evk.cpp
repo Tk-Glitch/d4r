@@ -54,8 +54,18 @@ int main(int argc, char** argv)
     uint32_t nq = 8; VkQueueFamilyProperties qf[8]; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
     uint32_t qi = 0; for (uint32_t i = 0; i < nq; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qi = i; break; }
     float prio = 1; VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
-    const char* exts[] = {"VK_KHR_cooperative_matrix", "VK_EXT_shader_float8"};
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.enabledExtensionCount = 2; dci.ppEnabledExtensionNames = exts;
+    uint32_t ne = 0; CK(vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, nullptr));
+    std::vector<VkExtensionProperties> ep(ne); CK(vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, ep.data()));
+    const bool hasFloat8 = std::any_of(ep.begin(), ep.end(), [](const auto& e) {
+        return strcmp(e.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0;
+    });
+    if (!hasFloat8) f8.shaderFloat8 = f8.shaderFloat8CooperativeMatrix = VK_FALSE;
+    std::vector<const char*> exts;
+    if (cm.cooperativeMatrix) exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    if (f8.shaderFloat8) exts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    if (!cm.cooperativeMatrix) v13.pNext = nullptr; else if (!f8.shaderFloat8) cm.pNext = nullptr;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = static_cast<uint32_t>(exts.size()); dci.ppEnabledExtensionNames = exts.data();
     VkDevice dev; CK(vkCreateDevice(pd, &dci, nullptr, &dev));
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
     std::vector<VkDescriptorSetLayoutBinding> lb;

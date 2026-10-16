@@ -62,6 +62,7 @@ PreferAccuracy = true
 NativeSwinEncoders = false
 
 MotionVectorDilation = 2
+MotionDilationThinSky = false ; opt-in thin-only sky fill; keep false for current behavior
 ```
 
 ## Known issues

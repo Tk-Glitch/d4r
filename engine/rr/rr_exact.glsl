@@ -1,5 +1,6 @@
 // Exact NVIDIA arithmetic helpers for the native Ray Reconstruction stages (engine/rr/*_m.comp, enc1_native.comp).
-// Requires GL_EXT_shader_explicit_arithmetic_types, GL_EXT_float_e4m3.
+// Requires GL_EXT_shader_explicit_arithmetic_types, GL_EXT_float_e4m3 (RR_GFX11: GL_KHR_shader_subgroup_shuffle instead;
+// FP8 values are then codes, rr_gfx11.glsl).
 //
 // RADV folds a register-only float(float16_t(x)) back to x, so every binary16 rounding whose result is used again goes
 // through a conversion with an opaque zero (RR_ZERO16, set in main from something the compiler cannot evaluate, e.g.
@@ -30,6 +31,20 @@ uint inter(uint j) { return (j & ~31u) | (((j & 31u) >> 2u) << 1u) | (j & 1u) | 
 uint uninter(uint c) { return (c & ~31u) | (((c & 15u) >> 1u) << 2u) | (c & 1u) | (((c >> 4u) & 1u) << 1u); }
 int mirror(int v, int n) { v = abs(v); return min(v, 2 * n - 2 - v); }
 
+#ifdef RR_GFX11
+#include "rr_gfx11.glsl"
+#define F8 uint
+uint q8h(float16_t x) { return g11_code(x); }
+uint q8s(float x) { return g11_codef(x); }
+uint code(uint c) { return c; }
+float16_t e4h(uint c) { return g11_e4h(c); }
+// q8(act(h)) from the packed table (enc1_pack.act_table; the weight buffer's W8U view at W_ACT)
+#define ACTQ(h) uint(w8u.w[W_ACT + bh(h)])
+// an accumulator's activation codes (accumulator layout)
+#define ACTQ8C(dst, h) { (dst) = uvec2(0u); [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_ >> 2] |= ACTQ(float16_t((h)[i_])) << (8u * uint(i_ & 3)); }
+#else
+#define F8 floate4m3_t
+float16_t e4h(floate4m3_t v) { return float16_t(v); }
 // cvt.rn.satfinite.e4m3 (NaN -> 0x7f)
 floate4m3_t q8(float16_t h)
 {
@@ -41,6 +56,7 @@ floate4m3_t q8s(float x) { floate4m3_t r; saturatedConvertEXT(r, x); return r; }
 floate4m3_t q8h(float16_t x) { floate4m3_t r; saturatedConvertEXT(r, x); return r; }
 
 uint code(floate4m3_t v) { return uint(floate4m3BitsToUintEXT(v)); }
+#endif
 float16_t hb(uint b) { return uint16BitsToFloat16(uint16_t(b)); }
 uint bh(float16_t h) { return uint(float16BitsToUint16(h)); }
 
@@ -106,6 +122,7 @@ float16_t fma16q(float16_t a, float16_t b, float16_t c, inout bool mid)
     return hb(bh(float16_t(s)) | uint(RR_ZERO16));
 #endif
 }
+#ifndef RR_GFX11
 // The saturating FP8 conversion of a whole accumulator, two elements per conversion instruction
 #define Q8PAIRS(dst, src) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { fe4m3vec2 t_; saturatedConvertEXT(t_, vec2((src)[i_], (src)[i_ + 1])); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 // q8(act(h)) from the packed table (enc1_pack.act_table; the weight buffer's W8U view at W_ACT)
@@ -116,6 +133,7 @@ float16_t fma16q(float16_t a, float16_t b, float16_t c, inout bool mid)
 #define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 #else
 #define ACTQ8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; ++i_) (dst)[i_] = ACTQ(float16_t((h)[i_]));
+#endif
 #endif
 float16_t act(float16_t x)
 {
@@ -152,3 +170,16 @@ float16_t cubic_e(float16_t x)
     const float16_t u = fma16(m, t, float16_t(1.375));
     return hb((bh(u) << 5u) & 0x7FE0u);
 }
+// FP8 operands from a shared byte image (word offset and stride): an A row-major, a B column-major; and an accumulator
+// quantized and stored as the transposed A row-major / as a B column-major (the same bytes)
+#ifdef RR_GFX11
+#define LDS8A(m, ARR, off, stride) LD8A(m, ARR, off, stride)
+#define LDS8B(m, ARR, off, stride) LD8B(m, ARR, off, stride)
+#define Q8STA(src, ARR, off, stride) { F8V c_; G11_CODES(c_, src) G11_ST(c_, ARR, off, stride) }
+#define Q8STB(src, ARR, off, stride) Q8STA(src, ARR, off, stride)
+#else
+#define LDS8A(m, ARR, off, stride) coopMatLoad(m, ARR, off, stride, gl_CooperativeMatrixLayoutRowMajor)
+#define LDS8B(m, ARR, off, stride) coopMatLoad(m, ARR, off, stride, gl_CooperativeMatrixLayoutColumnMajor)
+#define Q8STA(src, ARR, off, stride) { A8 q; Q8(q, src) coopMatStore(q, ARR, off, stride, gl_CooperativeMatrixLayoutRowMajor); }
+#define Q8STB(src, ARR, off, stride) { B8 q; Q8(q, src) coopMatStore(q, ARR, off, stride, gl_CooperativeMatrixLayoutColumnMajor); }
+#endif

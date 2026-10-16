@@ -112,7 +112,7 @@ OptiScaler 0.9.4 checks a relative `NvngxPath` against the process working direc
 
 ## Logs
 
-The launcher writes each run's logs to `~/.cache/d4r-dlss-captures/game-<exe>-<time>/`. `d4r_nvngx.log` holds the shim's log. With `[Debug] Profile = true` it also records one `D4R_PROFILE` line per frame, with the stage timings.
+The launcher writes each run's logs to `~/.cache/d4r-dlss-captures/game-<exe>-<time>/`. `d4r_nvngx.log` holds the shim's log. With `[Debug] Profile = true` it measures stage timings every frame and records sampled `D4R_PROFILE` lines. `ProfileLogEvery = 60` (the default) logs the first five frames and then every 60th frame; set it to `1` to log every frame, or another positive integer for a different interval. Restart the game after changing it. `D4R_PROFILE_LOG_EVERY` overrides the INI setting. FSR RR stage summaries average that many completed GPU samples; native Vulkan profiling uses the same log interval. Sampling reduces log writes while retaining profiling measurements and per-frame throughput intervals. `D4R_PROFILE_LOG=0` suppresses timing rows and FSR RR summaries.
 
 Output completion uses event queries with 200 us NtDelayExecution sleeps by default. `D4R_SHIM_BLOCKING_SYNC = 0`
 under `[Env]` restores context synchronization for an A/B check. The profile records

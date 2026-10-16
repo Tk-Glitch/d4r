@@ -514,7 +514,7 @@ static void native_vk_run(Feature* feature, NativeVkFrame* frame)
             const auto downloaded = ProfileClock::now();
             if (!destination.cuda) std::memcpy(destination.mapped, feature->outputHost[0].bytes, feature->outputHost[0].size());
             feature->completedFrames++;
-            if (frame->number <= 3 || frame->number % 120 == 0 || profile_enabled())
+            if (profile_enabled() ? profile_log_frame(frame->number) : (frame->number <= 3 || frame->number % 120 == 0))
                 logf("D4R_VULKAN_PROFILE frame=%u stage=%.3f upload=%.3f evaluate=%.3f download=%.3f encode=%.3f ms",
                      frame->number, profile_ms(stageStart, staged), profile_ms(staged, uploaded),
                      profile_ms(uploaded, evaluatedAt), profile_ms(evaluatedAt, downloaded),
@@ -539,7 +539,7 @@ static void native_vk_run(Feature* feature, NativeVkFrame* frame)
     if (g_nativeVk.setEvent(g_nativeVk.device, frame->outputReady) != VK_SUCCESS)
         frame->result = NGX_FAIL_PLATFORM_ERROR;
     frame->done = true;
-    if (frame->number <= 3 || frame->number % 120 == 0 || profile_enabled())
+    if (profile_enabled() ? profile_log_frame(frame->number) : (frame->number <= 3 || frame->number % 120 == 0))
         logf("D4R_VULKAN_WAIT frame=%u input_ready=%.3f signal=%.3f total=%.3f ms",
              frame->number, profile_ms(waitStarted, inputsReadyAt),
              profile_ms(signalStarted, ProfileClock::now()), profile_ms(waitStarted, ProfileClock::now()));
@@ -857,7 +857,7 @@ D4R_EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd, const
     // write and all earlier commands which reference the staging objects.
     g_nativeVk.cmdSetEvent(cmd, frame->consumed, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     owner.frames.push_back(frame);
-    if (frame->number <= 3 || frame->number % 120 == 0 || profile_enabled())
+    if (profile_enabled() ? profile_log_frame(frame->number) : (frame->number <= 3 || frame->number % 120 == 0))
         logf("D4R_VULKAN_API frame=%u reclaim=%.3f allocate=%.3f record=%.3f total=%.3f ms",
              frame->number, profile_ms(apiStarted, reapedAt), profile_ms(reapedAt, allocatedAt),
              profile_ms(allocatedAt, ProfileClock::now()), profile_ms(apiStarted, ProfileClock::now()));

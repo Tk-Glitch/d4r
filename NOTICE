@@ -17,6 +17,15 @@ patches/vkd3d-proton/*.patch
     under the GNU Lesser General Public License, version 2.1. These patches are offered under the
     same license.
 
+third_party/fidelityfx/
+    AMD FidelityFX SDK 2.3.0 API headers (ffx_api.h, ffx_api_types.h, ffx_denoiser.h), copied
+    unmodified; the SDK license lists them under the MIT license (third_party/fidelityfx/LICENSE.txt).
+    AMD's runtime DLLs are not included and remain under AMD's binary terms.
+
+kernels/support/fsr_rr_prepare.comp
+    Its diffuse/specular split follows the DLSS-RR to FSR-RR adapter in Zach Hembree's OptiScaler
+    branch ffx-denoise-experimental and burak113's continuation (GPL-3.0).
+
 Release zips (scripts/package_release.sh) also bundle binaries of ZLUDA (Apache-2.0 or MIT, with
 LLVM under Apache-2.0 with LLVM exceptions), the patched vkd3d-proton (LGPL-2.1) and OptiScaler
 (https://github.com/optiscaler/OptiScaler, GPL-3.0, unmodified). Each zip carries their license
