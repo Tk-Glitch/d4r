@@ -179,6 +179,14 @@ EngineIni =
 Cvars =
 
 [OptiScaler]
+; Switching in game from OptiScaler's menu (Insert):
+; - DLSS model: DLSS Settings > tick Render Presets Override, pick the preset (E, K, L or M), Apply Changes.
+;   Unticking it goes back to [DLSS] Model, as do presets left at DEFAULT. false always uses [DLSS] Model.
+FollowPresets = true
+; - FSR: Upscalers > Upscaler (DX12) > FSR 3.X/4. FSR 4.1 needs an RDNA3/RDNA4 GPU and GE-Proton (which provides
+;   AMD's FSR 4 library); other GPUs get FSR 3.1. true lets OptiScaler and AMD's FSR see the real GPU (the game
+;   still sees an NVIDIA one).
+Fsr4 = true
 ; OptiScaler's own FPS overlay (top left)
 FpsOverlay = true
 ; 0 = simple ... 3 = detailed with frame-time graph

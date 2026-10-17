@@ -154,6 +154,101 @@ int main(int argc, char** argv) {
         self.assertEqual(self.select(rr=True, D4R_RR_PRESET='0'), [0] * 6)
 
 
+class OptiScalerPresetFollowerTests(unittest.TestCase):
+    """OptiScaler's Render Presets Override wins over [DLSS] Model once it changes the game's presets."""
+
+    def run_policy(self, body):
+        source = r'''
+#include "d4r_render_presets.h"
+#include <cassert>
+#include <cstring>
+static bool same(const unsigned int (&a)[6], const unsigned int (&b)[6]) { return std::memcmp(a, b, sizeof(a)) == 0; }
+int main() {
+''' + body + '\n}\n'
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / 'follower'
+            subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
+                            '-I', str(ROOT / 'tools'), '-x', 'c++', '-', '-o', str(runner)],
+                           input=source, text=True, capture_output=True, check=True)
+            subprocess.run([str(runner)], check=True, timeout=5)
+
+    def test_game_presets_keep_the_d4r_model_until_optiscaler_changes_them(self):
+        self.run_policy(r'''
+    D4rPresetFollower follower;
+    const unsigned int game[6] = {0, 0, 0, 0, 0, 0};
+    assert(!follower.follow(game, false));          // first creation: the game's presets
+    assert(!follower.follow(game, false));          // a resolution or quality change recreates with the same
+    const unsigned int m[6] = {13, 13, 13, 13, 13, 13};
+    assert(follower.follow(m, false));              // OptiScaler: override M, Apply Changes
+    const unsigned int e[6] = {5, 5, 5, 5, 5, 5};
+    assert(follower.follow(e, false));              // then E
+    assert(!follower.follow(game, false));          // override unticked: OptiScaler restores the game's presets
+''')
+
+    def test_explicit_game_presets_are_the_baseline_too(self):
+        self.run_policy(r'''
+    D4rPresetFollower follower;
+    const unsigned int game[6] = {11, 11, 11, 13, 12, 11};
+    assert(!follower.follow(game, false));
+    const unsigned int perMode[6] = {11, 11, 11, 13, 13, 11};  // OptiScaler's per-mode presets
+    assert(follower.follow(perMode, false));
+''')
+
+    def test_ini_override_is_followed_from_the_first_creation(self):
+        self.run_policy(r'''
+    D4rPresetFollower follower;
+    const unsigned int k[6] = {11, 11, 11, 11, 11, 11};
+    assert(follower.follow(k, true));
+    assert(follower.follow(k, true));
+''')
+
+    def test_default_and_latest_slots_take_the_d4r_model(self):
+        self.run_policy(r'''
+    unsigned int presets[6] = {0, 13, kD4rPresetLatest, 5, 12, 0};
+    d4r_apply_followed_presets(presets, d4r_parse_render_preset_override("11"));
+    const unsigned int expected[6] = {11, 13, 11, 5, 12, 11};
+    assert(same(presets, expected));
+    unsigned int untouched[6] = {0, 13, 0, 5, 12, 0};
+    const unsigned int copy[6] = {0, 13, 0, 5, 12, 0};
+    d4r_apply_followed_presets(untouched, d4r_parse_render_preset_override(""));
+    assert(same(untouched, copy));
+''')
+
+    def test_flagged_and_retired_presets_read_as_default(self):
+        self.run_policy(r'''
+    // Alan Wake 2 (Streamline): E and F with the high bit set, then OptiScaler recreates with zeros
+    unsigned int game[6] = {0x80000006u, 0x80000005u, 0x80000005u, 0x80000005u, 0x80000006u, 0x80000006u};
+    d4r_sanitize_presets(game, false);
+    const unsigned int zeros[6] = {0, 0, 0, 0, 0, 0};
+    assert(same(game, zeros));
+    D4rPresetFollower follower;
+    assert(!follower.follow(game, false));
+    unsigned int reset[6] = {0, 0, 0, 0, 0, 0x80000006u};
+    d4r_sanitize_presets(reset, false);
+    assert(!follower.follow(reset, false));         // not a choice made in OptiScaler
+    unsigned int mixed[6] = {1, 4, 7, 11, 13, kD4rPresetLatest};
+    d4r_sanitize_presets(mixed, false);
+    const unsigned int expected[6] = {0, 0, 0, 11, 13, kD4rPresetLatest};
+    assert(same(mixed, expected));
+    unsigned int rr[6] = {4, 5, 6, 11, 0x80000004u, 0};
+    d4r_sanitize_presets(rr, true);
+    const unsigned int rrExpected[6] = {4, 5, 6, 0, 0, 0};
+    assert(same(rr, rrExpected));
+''')
+
+    def test_quality_mode_selects_ngx_preset_slot(self):
+        self.run_policy(r'''
+    // slots: DLAA, Quality, Balanced, Performance, UltraPerformance, UltraQuality
+    assert(d4r_preset_slot(0) == 3);   // MaxPerf
+    assert(d4r_preset_slot(1) == 2);   // Balanced
+    assert(d4r_preset_slot(2) == 1);   // MaxQuality
+    assert(d4r_preset_slot(3) == 4);   // UltraPerformance
+    assert(d4r_preset_slot(4) == 5);   // UltraQuality
+    assert(d4r_preset_slot(5) == 0);   // DLAA
+    assert(d4r_preset_slot(-1) == 1 && d4r_preset_slot(9) == 1);
+''')
+
+
 
 if __name__ == '__main__':
     unittest.main()

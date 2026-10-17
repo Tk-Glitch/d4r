@@ -56,6 +56,11 @@ __device__ __forceinline__ uint32_t lane_id()
     return __builtin_amdgcn_mbcnt_lo(~0u, 0u);
 }
 
+// RDNA2: the f16-accumulator WMMA variants need the instruction; the f32 path (software products) serves them
+#ifdef __GFX10__
+#undef PWIN_NATIVE_F16ACC
+#undef PWIN_F16ACC_NATIVE
+#endif
 typedef wm_op op_t; // WMMA operand: u8v (gfx11) or u4v (gfx12)
 
 // one k16 step with the f16 accumulator of NVIDIA's f16 wmma (rounded after the step)

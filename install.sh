@@ -24,7 +24,7 @@ usage() {
     '1. Downloads official NVIDIA DLSS 310.7.0 (Super Resolution), DLSS Ray Reconstruction 310.9.1 and NGX from' \
     '   driver 596.36 (~1 GiB, once: verified copies are kept in ~/.cache/d4r/nvidia).' \
     '2. Builds the native engine'"'"'s models from those DLLs into d4r/engine (once per DLL set and builder version:' \
-    '   ~/.cache/d4r/engine-models). The engine is the faster path; d4r.ini [Engine] Enabled = auto uses it.' \
+    '   ~/.cache/d4r/engine-models). Faster on RDNA4; d4r.ini [Engine] Enabled = auto uses it.' \
     'Requires Bash, curl, sha256sum, 7zz/7z/7za, python3 with numpy, and GE-Proton 11 in Steam (or' \
     'D4R_PROTON=/path/to/GE-Proton11-3). No sudo needed. NVIDIA license terms apply. D4R_CACHE_DIR moves the cache.'
 }
@@ -188,12 +188,13 @@ if [[ "$DO_ENGINE" == ask ]] && ! interactive; then DO_ENGINE=1; fi
 if [[ "$DO_ENGINE" == ask ]]; then
   echo
   echo "Set up d4r's own DLSS engine (recommended)?"
-  echo '  + Faster: DLSS 4 / 4.5 and Ray Reconstruction run on d4r'"'"'s Vulkan engine instead of NVIDIA'"'"'s kernels'
+  echo '  + Faster on RDNA4: DLSS 4 / 4.5 and Ray Reconstruction run on d4r'"'"'s Vulkan engine instead of NVIDIA'"'"'s kernels'
   echo '    through CUDA emulation (for example Ray Reconstruction at 720p -> 4K in about 3.6 ms per frame).'
   echo '  + Lower latency: the game shows the upscaled result of the frame it just rendered, not an older one.'
   echo '  + No minute-long freeze while DLSS'"'"'s CUDA kernels compile the first time a model is used.'
   echo '  - Longer setup, once: building its models takes a minute or two (it renders a test frame per model'
   echo '    through GE-Proton) and needs ~300 MB of temporary space. Later installs reuse the models.'
+  echo '  - Slower for K and M on RDNA3; there d4r keeps those two models on its normal path.'
   echo '  Without it, d4r uses its normal path; anything the engine does not cover uses that path anyway.'
   if ask 'Set up the engine now?' y; then DO_ENGINE=1; else DO_ENGINE=0; fi
 fi

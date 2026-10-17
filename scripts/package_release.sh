@@ -16,7 +16,7 @@
 #   D4R_ROCM_RUNTIME ROCm runtime bundled as d4r/rocm (scripts/fetch_rocm_runtime.sh)
 #                                                                           default ~/.cache/d4r-rocm-runtime
 #   D4R_MAX_GLIBC     highest GLIBC ABI the Linux libraries may require     default 2.41
-#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201
+#   D4R_GPU_ARCHS    GPU targets to build kernels for          default gfx1030-gfx1036 (K only), gfx1100-gfx1103, gfx1200, gfx1201
 #                    (RDNA4 targets also get a <target>-fp8 folder: the kernels for d4r.ini NativeFp8 = on)
 #   D4R_OPTISCALER_LICENSE  OptiScaler's LICENSE (GPL-3.0) text; default: system SPDX or common-licenses copy
 #   D4R_VKD3D_SRC    vkd3d-proton source checkout, for its license files     default ~/.cache/d4r-vkd3d-proton
@@ -65,7 +65,7 @@ ZLUDA="${D4R_ZLUDA_DIR:-$HOME/.cache/d4r-zluda-current}"
 VKD3D="${D4R_VKD3D_DIR:-$HOME/.cache/d4r-vkd3d-d4r}"
 ROCM="${D4R_ROCM_DIR:-/opt/rocm}"
 ROCM_RUNTIME="${D4R_ROCM_RUNTIME:-$HOME/.cache/d4r-rocm-runtime}"
-ARCHS="${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
+ARCHS="${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}"
 if [[ "$INSTALL_MODE" == proxy ]]; then
   : "${D4R_OPTISCALER:?set D4R_OPTISCALER to the OptiScaler release archive or folder}"
 fi
@@ -104,6 +104,14 @@ fi
 cp "$OPTI/OptiScaler.dll" "$STAGE/dxgi.dll"
 python3 "$ROOT/scripts/configure_optiscaler.py" \
   "$OPTI/OptiScaler.ini" "$ROOT/packaging/optiscaler.settings" "$STAGE/OptiScaler.ini"
+# AMD's FidelityFX loader and upscaler (MIT) from the OptiScaler release, beside OptiScaler: its "FSR 3.X/4"
+# upscaler. FSR 4 on RDNA3/RDNA4 comes from Proton's amdxcffx64.dll; the shim gives OptiScaler and these
+# modules the real GPU identity (tools/d4r_fsr4_identity.h).
+for ffx in amd_fidelityfx_dx12.dll amd_fidelityfx_upscaler_dx12.dll; do
+  [[ -f "$OPTI/$ffx" ]] || { echo "the OptiScaler release has no $ffx" >&2; exit 2; }
+  cp "$OPTI/$ffx" "$STAGE/$ffx"
+done
+cp "$OPTI/Licenses/FidelityFX_v2_LICENSE.md" "$STAGE/d4r/licenses/FidelityFX-LICENSE.txt"
 else
   cp "$ROOT/build/d4r-setup.exe" "$STAGE/d4r/d4r-setup.exe"
   # Same NGX exports and implementation, delivered through the ASI loader.
@@ -212,6 +220,16 @@ build_target() {
   arch="${folder%-fp8}"
   fp8=0
   [[ "$folder" == *-fp8 ]] && fp8=1
+  # RDNA2 (gfx103x): only DLSS 4's layers (preset K) have native kernels there, built with software matrix
+  # products (kernels/common/wmma_layout.h); M, L, the texture tails and Ray Reconstruction stay translated by ZLUDA
+  if [[ "$arch" == gfx103* ]]; then
+    D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
+    D4R_PREFER_ACCURACY=1 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/accuracy/$folder" >/dev/null
+    rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt "$STAGE/d4r/kernels/accuracy/$folder"/*.resolution.txt
+    python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/$folder" "${DLLS[@]}" "${RR_DLLS[@]}"
+    python3 "$ROOT/kernels/tools/kernel_manifest.py" "$STAGE/d4r/kernels/accuracy/$folder" "${DLLS[@]}" "${RR_DLLS[@]}"
+    return 0
+  fi
   D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" k "$STAGE/d4r/kernels/$folder" >/dev/null
   D4R_PREFER_ACCURACY=0 D4R_ROCM_DIR="$ROCM" D4R_GPU_ARCH="$arch" D4R_NATIVE_FP8="$fp8" "$ROOT/kernels/build.sh" m "$STAGE/d4r/kernels/$folder" >/dev/null
   rm -f "$STAGE/d4r/kernels/$folder"/*.resolution.txt  # empty LTO notes from clang's -save-temps

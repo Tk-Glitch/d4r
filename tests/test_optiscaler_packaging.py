@@ -138,6 +138,8 @@ class OptiScalerConfigTests(unittest.TestCase):
             for name in ('d3d12.dll', 'd3d12core.dll'):
                 fixture(inputs / 'vkd3d' / name, b'MZ fixture d3d12core.dll\0 then d3d12core.dll\0' if name == 'd3d12.dll' else b'fixture')
             fixture(inputs / 'opti/OptiScaler.dll')
+            for name in ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll', 'Licenses/FidelityFX_v2_LICENSE.md'):
+                fixture(inputs / 'opti' / name)
             fixture(inputs / 'opti/OptiScaler.ini', upstream_ini().replace('\n', '\r\n').encode())
             dlss = fixture(inputs / 'nvngx_dlss.dll')
             core = fixture(inputs / '_nvngx.dll')
@@ -193,6 +195,10 @@ class OptiScalerConfigTests(unittest.TestCase):
                             self.assert_routing(data)
                             configs.append(data)
                             self.assertEqual(data, (repo / 'dist' / name / 'OptiScaler.ini').read_bytes())
+                            # OptiScaler's FSR 3.X/4 upscaler: AMD's loader and upscaler beside it
+                            for ffx in ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
+                                        'd4r/licenses/FidelityFX-LICENSE.txt'):
+                                self.assertIn(ffx, archive.namelist())
                         else:
                             self.assertNotIn('OptiScaler.ini', archive.namelist())
                             self.assertNotIn('dxgi.dll', archive.namelist())

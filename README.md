@@ -3,35 +3,19 @@
 
 want to run xess (xmx) on radeon? check out [x4r](https://github.com/countervolts/x4r)!
 
-d4r runs NVIDIA's official DLSS Super Resolution (`nvngx_dlss.dll`) and experimental Ray Reconstruction (`nvngx_dlssd.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest Super Resolution kernels replaced by hand-written RDNA3 and RDNA4 code.
+d4r runs NVIDIA's official DLSS Super Resolution (`nvngx_dlss.dll`) and experimental Ray Reconstruction (`nvngx_dlssd.dll`) in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS as usual; the DLSS network runs on the AMD GPU through [ZLUDA](https://github.com/vosen/ZLUDA) (CUDA on ROCm/HIP), with the heaviest kernels replaced by hand-written RDNA2, RDNA3 and RDNA4 code.
 
-**Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus experimental L). DLSS 5 is PURPOSELY not supported.
+**Supported DLSS models:** DLSS 3 CNN (E), DLSS 4 transformer (K, default), and DLSS 4.5 transformer (M, plus L for Ultra Performance). Ray Reconstruction presets D, E and F are experimental ([building](docs/building.md)). DLSS 5 is PURPOSELY not supported.
 
-Preset L is NVIDIA's DLSS 4.5 model for Ultra Performance, especially at 4K. Set `[DLSS] Model = L` in `d4r.ini` and select Ultra Performance in game or OptiScaler; selecting L alone does not change the input resolution. L shares M's native Swin layers and has its own texture-kernel build. Its unfolded input/output arithmetic remains translated, so performance and image quality need game testing; the M benchmarks below do not apply to L.
-
-Ray Reconstruction presets D and E use the signed CUDA-capable 3.10.7 denoiser and the translated NVIDIA network, independently of the Super Resolution model. Temporal reconstruction and separate alpha output have been verified on Radeon RX 9070 XT (gfx1201) with native FP8 WMMA enabled. Newer DLSS 4.5 RR preset F is not implemented or validated. The scalar FP8 path produced nonfinite temporal RR output and is not validated; other GPU targets and image-quality parity with RTX hardware remain unverified. See [building](docs/building.md) for the required runtime, denoiser placement, and FP8 settings.
-
-**Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. Super Resolution game testing primarily uses Radeon RX 7700 XT; Ray Reconstruction validation additionally uses RX 9070 XT. It depends on unreleased patches to ZLUDA and vkd3d-proton.
-
-See [supported games](SUPPORTED_GAMES.md) for the tested games and DLSS models.
-
-The development shim also has [experimental native Vulkan support](docs/vulkan.md).
-
-A [standalone native inference engine](engine/README.md) runs presets K and M from weights extracted from your own
-`nvngx_dlss.dll`, with d4r's own Vulkan input, network and reconstruction shaders (optionally the native HIP network
-layers) and GPU-resident temporal history. The game shim uses the CUDA/ZLUDA path described below by default;
-`[Engine] Enabled = true` (`D4R_ENGINE=1`) records supported K and M evaluations with the native engine into the
-game's own command list instead and hands anything else to the CUDA path (see the engine's README). Presets E and L
-remain CUDA-only.
+**Proof of concept:** d4r shows that DLSS can run on an AMD GPU, but it is not really that practical for everyday use yet. It depends on unreleased patches to ZLUDA and vkd3d-proton. See [supported games](SUPPORTED_GAMES.md) for the tested games and models.
 
 > **Not affiliated with NVIDIA or AMD.**
-
 
 To contact me my discord is `._ayo`. or join the [d4r discord server](https://discord.gg/mgTWpSq8f5)
 
 ## Results
 
-[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss).
+[DLSS Ultra Performance demo video](https://cdn.ayois.gay/dlss) · [more videos](docs/videos.md)
 
 Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, every DLSS result is presented in the frame it belongs to (no added latency).
 
@@ -42,162 +26,66 @@ Radeon RX 7700 XT (RDNA3, gfx1101), SILENT HILL Townfall at 2560×1440, every DL
 | Performance (1280×720) | **89.7** | 84.1 | 69.0 | 94.0 |
 | Ultra Performance (853×480) | 89.1 | **95.5** | 92.2 | 107.3 |
 
-\* FSR 4 was measured in an earlier session (2026-09-27); the DLSS columns on 2026-09-29, when the same machine ran about 2–4% slower overall. Run back to back on the same day, this release is faster than 0.1.1 at Quality with every model (E 71.2 → 71.9, K 67.9 → 68.1, M 48.4 → 49.3 fps), and more in games whose DLSS settings differ from Townfall's, whose kernel variants now run natively too.
+\* FSR 4 was measured on 2026-09-27, the DLSS columns on 2026-09-29, when the same machine ran about 2–4% slower overall. Native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49.1 fps on the same walk. How the numbers were measured: [docs/performance.md](docs/performance.md).
 
-For reference, native 2560×1440 without upscaling (the game's TSR at 100%) runs at 49.1 fps on the same walk.
+## Switching models and FSR in game
 
-On the same GPU DLSS starts at a disadvantage: its networks were designed for NVIDIA's tensor cores, and parts of them still run as translated NVIDIA code. How the numbers were measured, and what each optimisation contributed, is in [docs/performance.md](docs/performance.md).
+Open OptiScaler's menu (Insert):
 
-## FSR 4.1.1 vs. DLSS 4.5 comparison
+- **DLSS model:** under DLSS Settings, tick *Render Presets Override*, pick the preset (E, K, L or M) and press *Apply Changes*. Unticking it returns to `[DLSS] Model` in `d4r/d4r.ini`.
+- **FSR:** set *Upscaler (DX12)* to *FSR 3.X/4*. RDNA3 and RDNA4 get FSR 4.1 (needs GE-Proton, which supplies AMD's FSR 4 library); other GPUs get FSR 3.1.
 
-- [Side-by-side comparison: FSR 4.1.1 (left) and DLSS 4.5 preset M (right)](https://cdn.ayois.gay/sk-ant-api03-4Dr0yN5YAzsuAOcyp7KEfeRyB0pbh2iAv2vfywa9QITHIbQScnVQnef9jsxJzDcvWMD13r8C1qGAoQQevjLqzGPT0bAQ9AA)
-- [FSR 4.1.1 standalone video](https://cdn.ayois.gay/sk-ant-api03-YZpWqINTI2HBt6KWJTeyY2b9JJbxUTZdBVRR06KZD7b1x27QLjvQrZZX8Um5sZqkquuOlzJTHUh84FOOLsetNy-PAIiWxAA)
-- [DLSS 4.5 preset M standalone video](https://cdn.ayois.gay/sk-ant-api03-0GLTr6qEYGfUKWYoZeseLdTzPslh1AvlVLdlBEUvV893bi19b7qha5wKnuQXN2tl6l4ffaRKj5warfAFDDjOlYJNYWVQ3AA)
-
-DLSS 4.5 was using the following settings,
-
-```
-PreferAccuracy = true
-
-NativeSwinEncoders = false
-
-MotionVectorDilation = 2
-MotionDilationThinSky = false ; opt-in thin-only sky fill; keep false for current behavior
-```
+Both are on by default; `[OptiScaler] FollowPresets` and `Fsr4` in `d4r.ini` turn them off.
 
 ## Known issues
 
-- In some games using some models native upscaling can show visible artifacting.
-
-For users who prioritize fidelity over speed, set `[Kernels] PreferAccuracy = true` in `d4r/d4r.ini` and restart the game. It defaults to `false`. This selects accuracy variants of every native kernel and restores conservative translation settings. It aims to match NVIDIA's arithmetic; 1:1 image quality against RTX DLSS is not yet proven. See [native kernel numerics](docs/native-kernels.md#numerics).
+- In some games using some models native upscaling can show visible artifacting. For fidelity over speed, set `[Kernels] PreferAccuracy = true` in `d4r/d4r.ini` ([native kernel numerics](docs/native-kernels.md#numerics)).
 
 ## GPU support
 
-d4r builds for RDNA3 and RDNA4. A newly built release compiles native DLSS 4 and 4.5 network kernels for the targets below and selects the matching set at runtime. Only the RX 7700 XT has been tested by this project on a real GPU; an external video reports DLSS 4.5 running through d4r 0.1.2 on an RX 7900 XTX. RDNA4 runtime and performance remain unverified on hardware.
-
 !WE ARE LOOKING FOR VIDEOS OF IT WORKING, IF YOU HAVE A MENTIONED HERE AND DOESNT HAVE A VIDEO PLEASE TAKE ONE!
 
-| GPU | Chip | FP8 math | Runtime testing |
+| GPU | Chip | Native kernels | Runtime testing |
 |---|---|---|---|
-| RX 7700 XT, RX 7800 XT, RX 7700, Radeon PRO W7700 | gfx1101 | widened to f16 | RX 7700 XT only |
-| RX 7900 GRE / XT / XTX, Radeon PRO W7800 / W7900 | gfx1100 | widened to f16 | RX 7900 XTX: [external video](https://www.youtube.com/watch?v=_GLjJ2Dn5pU) (DLSS 4.5); other cards untested |
-| RX 7600 / 7600 XT, RX 7650 GRE | gfx1102 | widened to f16 | untested |
-| RDNA3 integrated GPUs | gfx1103 | widened to f16 | untested |
-| RX 9070 XT / 9070 / 9070 GRE, Radeon AI PRO R9700 | gfx1201 | native FP8 (`NativeFp8`, default on) | RX 9070 XT: [external video](https://www.youtube.com/watch?v=lZ0BLYqAtCs), other cards untested |
-| RX 9060 XT / 9060 | gfx1200 | native FP8 (`NativeFp8`, default on) | compile only |
-| RDNA2 and older | | | unsupported |
+| RX 7700 XT, RX 7800 XT, RX 7700, Radeon PRO W7700 | gfx1101 | K, M, L (WMMA) | RX 7700 XT |
+| RX 7900 GRE / XT / XTX, Radeon PRO W7800 / W7900 | gfx1100 | K, M, L (WMMA) | RX 7900 XTX: [external video](https://www.youtube.com/watch?v=_GLjJ2Dn5pU) |
+| RX 7600 / 7600 XT, RX 7650 GRE, RDNA3 integrated GPUs | gfx1102, gfx1103 | K, M, L (WMMA) | untested |
+| RX 9070 XT / 9070 / 9070 GRE, Radeon AI PRO R9700 | gfx1201 | K, M, L (WMMA, native FP8) | RX 9070 XT: [external video](https://www.youtube.com/watch?v=lZ0BLYqAtCs) |
+| RX 9060 XT / 9060 | gfx1200 | K, M, L (WMMA, native FP8) | compile only |
+| RX 6000 series, Steam Deck, RDNA2 integrated GPUs | gfx1030–gfx1036 | K (software matrix products) | validated on RDNA3 only |
+| RDNA1 and older | | | unsupported |
 
-Native network kernels are built for all listed gfx11/gfx12 targets. Texture kernels are compiled for each target by `d4r_emit` when supplied to the package script; RDNA4 also has a `-fp8` variant. The bridge selects the KFD GPU with the most SIMDs, avoiding an integrated GPU when a discrete GPU is present; `D4R_GPU_ARCH` overrides that choice. Missing native kernels fall back to ZLUDA and can be much slower. Earlier translated K layers produced invalid values; preserving FP16 denormal handling fixes that failure in recorded captures, but RTX image-quality parity remains unverified. Preset E does not use the native network kernels.
+RDNA2 has no WMMA instructions: its K kernels do the same matrix products with `v_dot2` and DPP broadcasts, bit-identical to the WMMA build. Running that RDNA2 path on an RX 7700 XT for testing, K took 3.6 ms per 1080p frame, against 46.8 ms fully translated (what RDNA2 had before); RDNA3 itself keeps WMMA (1.48 ms). E and K are the models to use there; M and L run fully translated. Kernels missing for a GPU fall back to ZLUDA and can be much slower. Details: [docs/native-kernels.md](docs/native-kernels.md).
 
 ## How it works
 
 ```
-game (D3D12) ──► OptiScaler (DLSS inputs) ──► d4r_nvngx.dll  (NGX D3D12 API, tools/d4r_nvngx_shim.cpp)
-                                                   │  inputs/output stay in VRAM (vkd3d-proton Vulkan interop,
-                                                   │  command list split around DLSS for same-frame results)
-                                                   ▼
-                          official NGX core + nvngx_dlss.dll  (their CUDA path)
-                                                   ▼
-                          nvcuda.dll  (Wine CUDA bridge, tools/wine_nvcuda_bridge.c)
-                                                   ▼
-                          ZLUDA  (patches/zluda: PTX → AMDGPU, WMMA, native kernel overrides)
-                                                   ▼
-                          native RDNA3 and RDNA4 kernels  (kernels/: DLSS 4 and 4.5 network layers)
+game (D3D12) ──► OptiScaler ──► d4r nvngx.dll (NGX D3D12 API) ──► NVIDIA's NGX core + nvngx_dlss.dll (CUDA path)
+                                                                          ▼
+           native RDNA kernels ◄── ZLUDA (PTX → AMDGPU) ◄── nvcuda.dll (Wine CUDA bridge)
 ```
 
-- **The shim** (`d4r_nvngx.dll`) implements the D3D12 NGX entry points OptiScaler calls, copies the game's colour, depth and motion vectors into buffers shared with HIP, evaluates DLSS through the CUDA version of NGX, and writes the result back into the game's output texture.
-- **The bridge** is a Wine builtin `nvcuda.dll` that forwards the CUDA driver API to ZLUDA on the Linux side, plus a few helpers the shim needs (Vulkan memory import, asynchronous array copies, GPU-side waits).
-- **ZLUDA** compiles NVIDIA's PTX for the AMD GPU. The patches add what DLSS needs (textures, surfaces, FP8 and tensor-core MMA on RDNA3/RDNA4 WMMA) and a hook that serves hand-written kernels in place of selected PTX kernels.
-- **Native kernels** reimplement the DLSS 4 and 4.5 network layers for RDNA3 and RDNA4 and replace parts of a few texture-heavy kernels. The 2–3× speedup was measured on the RX 7700 XT; RDNA4 speed is unverified.
-
-Details: [docs/architecture.md](docs/architecture.md) and [docs/native-kernels.md](docs/native-kernels.md).
+The shim keeps the game's inputs and output in VRAM through vkd3d-proton's Vulkan interop; ZLUDA compiles NVIDIA's PTX and serves hand-written kernels in place of the heaviest ones. An optional [native inference engine](engine/README.md) (`[Engine]`) runs K, L and M with d4r's own Vulkan shaders. Details: [docs/architecture.md](docs/architecture.md).
 
 ## Install the release
 
-The release zip works like an OptiScaler release: its contents go into the folder that holds the game's main `.exe`.
+1. Extract `d4r-<version>.zip` into the folder that holds the game's main `.exe` (OptiScaler 0.9.4 as `dxgi.dll`, the d4r-patched vkd3d-proton, AMD's FSR files and the `d4r` folder).
+2. Run `bash install.sh` there. It downloads NVIDIA's DLSS and NGX files from NVIDIA, checks their SHA-256 hashes and puts them in `d4r/`. Needs Bash, curl, sha256sum and 7-Zip; no sudo, ROCm not required.
+3. In Steam, select GE-Proton 11 for the game and set the launch options `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
 
-1. Extract `d4r-<version>.zip` there. It contains:
-   - OptiScaler 0.9.4 as `dxgi.dll`, with an `OptiScaler.ini` set up for d4r;
-   - the d4r-patched vkd3d-proton (`d3d12.dll`, `d3d12core.dll`);
-   - a `d4r` folder with the shim, the CUDA bridge, ZLUDA, the ROCm 7.2.4 runtime, the native kernels, this game's `d4r.ini`, and an `install.sh` beside the `d4r` folder.
-2. Run `bash install.sh` in the extracted release folder. It downloads NVIDIA DLSS 310.7.0 and NGX from official NVIDIA sources, verifies SHA-256 hashes, and places them in `d4r/nvngx_dlss.dll` and `d4r/ngx/_nvngx.dll`. Requires Bash, curl, sha256sum and 7-Zip (`7zz`, `7z` or `7za`); no sudo. The NGX download is a roughly 915 MiB driver archive which is extracted without executing it. Matching files are skipped and differing files are backed up.
-3. In Steam, select GE-Proton 11 for the game and set these launch options: `PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100 %command%`.
+When updating, replace `d3d12.dll`, `d3d12core.dll` and `d4r/nvngx.dll` together. Already using OptiScaler? The `-asi` zip adds d4r as a plugin ([ASI guide](packaging/ASI_README.txt)). The full guide ships in the zip as [D4R_README.txt](packaging/D4R_README.txt).
 
-When updating, replace `d3d12.dll` and `d3d12core.dll` together with `d4r/nvngx.dll`. The shim requires their matching resource-lifetime extension.
+## Building from source
 
-ROCm does not need to be installed: the zip includes its runtime (from AMD's Ubuntu 22.04 packages, which run under Steam's container runtime on any distribution). The downloaded NVIDIA files and the bundled kernels built from NVIDIA's code are not covered by this repository's license (see [NOTICE](NOTICE)). The Proton prefix and the system are not changed. [packaging/D4R_README.txt](packaging/D4R_README.txt) is the full guide that ships in the zip; `scripts/package_release.sh` builds the zip (see [docs/building.md](docs/building.md#7-package-a-release)).
-
-### Existing OptiScaler: ASI add-on
-
-The optional `d4r-<version>-asi.zip` contains only `d4r.asi` and a companion
-`d4r/` folder. Drop both into your existing OptiScaler plugin folder, then run
-`bash install.sh` inside that `d4r/` folder once for NVIDIA's DLLs. Keep the Steam
-launch options above and ensure `[Plugins] LoadAsiPlugins=true` is already enabled.
-
-On the first game launch, the ASI starts its native setup helper. Close the game
-at the setup message; the helper installs the D3D12 wrapper and private core beside the EXE
-and configures OptiScaler after the game exits, with backups. Launch again when
-the ready message appears. Unrelated settings, other plugins and the existing
-OptiScaler loader are preserved. The rest of the runtime stays beside the ASI
-in its companion folder. No Python or configuration command is needed.
-
-Use OptiScaler 0.9.4 through its game-local proxy or GE-Proton's built-in loader;
-setup finds the active loader's INI even when it lives in the prefix. OptiScaler's
-`nvngx.dll` mode does not load ASIs. See [the ASI installation guide](packaging/ASI_README.txt)
-for custom plugin paths, updating and removal. ASI loading still needs game testing.
-
-## Requirements (building from source)
-
-- Linux with an AMD RDNA3 or RDNA4 GPU. The native kernels use gfx11 or gfx12 WMMA. `scripts/package_release.sh` builds network kernels for gfx1100–gfx1103 and gfx1200–gfx1201 by default; `D4R_GPU_ARCH` selects one target for a standalone `kernels/build.sh` invocation. Runtime support outside the RX 7700 XT remains unverified on hardware (see [GPU support](#gpu-support)).
-- ROCm with HIP and its clang (tested with ROCm 7.2).
-- GE-Proton with OptiScaler integration (tested with GE-Proton11-3).
-- Build tools: a Rust toolchain and git-lfs (ZLUDA), meson and ninja (vkd3d-proton), `winegcc`/`winebuild` (bridge), `x86_64-w64-mingw32-g++` and `clang-cl` (shim), Python 3.
-- NVIDIA's `nvngx_dlss.dll` 310.7 and a matching NGX core `_nvngx.dll`.
-
-## Build and run
-
-The full sequence is in [docs/building.md](docs/building.md). In short:
-
-1. Build ZLUDA `ee2f25a` with `patches/zluda/0002`–`0013` applied, including its `d4r_emit` example for offline texture builds.
-2. Build the patched vkd3d-proton: `scripts/build_vkd3d_proton_d4r.sh OUT_DIR`.
-3. Build the shim and bridge: `scripts/build_d4r_nvngx_shim.sh`, `scripts/build_wine_nvcuda_bridge.sh`.
-4. Stage the runtime with your NVIDIA files: `scripts/install_d4r_runtime.sh _nvngx.dll nvngx_dlss.dll`.
-5. Build the native kernels: `D4R_ROCM_DIR=… D4R_DLSS_DLL=… D4R_ZLUDA_EMIT=… kernels/build.sh`.
-6. Fill in `~/.config/d4r/d4r.ini` (created from `config/d4r.ini.default` on first launch) and start the game with `scripts/d4r_play.sh`.
-
-The launcher backs up and restores everything it touches in the Proton prefix: OptiScaler.ini, the prefix's `d3d12.dll`/`d3d12core.dll`, and the game's Engine.ini when cvars are set.
-
-## Preset videos
-
-Gameplay recordings of each DLSS model at the Quality, Performance and Ultra Performance presets.
-
-**Ready or Not**
-
-| Model | Quality | Performance |
-|---|---|---|
-| DLSS 4.5 | [video](https://cdn.ayois.gay/sk-ant-api03-OPG1vqqsmDkNduG5fXJBelDI-1APyL9_ytJrnOSekZxoh-2NL8NqNuqL3pCI24kJQsudaB896GYpu5TFv93tabAgK1H2sAA) | [video](https://cdn.ayois.gay/sk-ant-api03-d-4XS1it5mtMkm-QRz0Qnkfu9FAjz_dFJURvsh_3gPZTnC1sljpWc28F6fyjUWIC6xlZm-FckWGjaP-KuIipYmroa3dQ8AA) |
-| DLSS 4 | [video](https://cdn.ayois.gay/sk-ant-api03-uXTWm4hN5jZksiSm4fvgIOr0dw43hGJ0TpZLe2ZghIbGb7aR9CGGlTV-1paBYO7G6lzIf83tOrCdaKdJerJ4re6epRWDEAA) | [video](https://cdn.ayois.gay/sk-ant-api03-fcZCkctdFOv513z1u6rPBrRseY47Qnw43Gnv5mZf_GekHw-yUoWYcBixjp2qqqbBIf7sVmht0Y676U96n2cwmFIsRgWkHAA) |
-| DLSS 3 | [video](https://cdn.ayois.gay/sk-ant-api03-_vuywLcsMzZiJxcNgucBeeXFzWi44mes5A1777bg_4XQ2X0MH22J9M7JFpTS0_q6yaGWMXf3FvL8MDiv_dc7UANxrCmlGAA) | [video](https://cdn.ayois.gay/sk-ant-api03-WzaIy34WIesQeOOTVQNXZwpPPE8khmbUynvMw9B-Luj8GFcZ_sJvGXfg6aW00TD0Rr3nWu43ELJGx2K6qs_HL6FkLdmb1AA) |
-
-**Townfall**
-
-| Model | Quality | Ultra Performance |
-|---|---|---|
-| DLSS 4.5 | [video](https://cdn.ayois.gay/sk-ant-api03-p8uL0hOUklvA-BSeEafS8LQU-gayzbqAE3NacWAmckLoXOSf2sXGf7OeG1LmvOqeGFRh_ceCWi4pLBl9yxJlvYwQWH3Y1AA) | [video](https://cdn.ayois.gay/sk-ant-api03-Mz0BzYTrLjaYSuQXtOEHTw4ydYVbPvHmMjflm8UhFp976ftXqMExD8BCMYlo93JLEGwVL3rMWoZR0CH_deJJU7jX8_s3GAA) |
-| DLSS 4 | [video](https://cdn.ayois.gay/sk-ant-api03-WgNoUPTwH0vt55Ag7RaWprXXINU5OOOEtuDXOvIjHgfAScSiIPIJGVaERoF-EA3JO7LS8xkohUlb6AFsW8AVZ2vMB14JwAA) | [video](https://cdn.ayois.gay/sk-ant-api03-skXZVD6G4DUdAfQw0RLz_UJW8GOfBlpZx1N4ezaF_UIXm7OIY1ciQysfRu4zRsxSXA8plZJi4NSzkXkV7Oxmg9ytg9zaaAA) |
-
-## Repository layout
+Linux with an RDNA2, RDNA3 or RDNA4 GPU, ROCm 7.2 with HIP and its clang, GE-Proton 11, a Rust toolchain, meson/ninja, `winegcc`, `x86_64-w64-mingw32-g++`, `clang-cl` and Python 3. The full sequence is in [docs/building.md](docs/building.md); `scripts/package_release.sh` builds the release zip.
 
 | Path | Contents |
 |---|---|
-| `tools/` | the NGX shim, the Wine CUDA bridge, a D3D12 DLSS harness, probes and kernel replay tools |
-| `kernels/` | native RDNA3/RDNA4 kernels (`k/` DLSS 4, `m/` DLSS 4.5, `tex/` texture-kernel parts, `common/` WMMA layouts), their build script, validation tools and numpy reference models |
-| `engine/` | standalone weight-based preset K and M inference runtime (Vulkan shaders, optional native HIP network), model packaging and full-frame validation |
-| `patches/` | ZLUDA and vkd3d-proton patches |
-| `scripts/` | build, install, launch and probe scripts |
-| `config/` | the default `d4r.ini` for the developer launcher |
-| `packaging/` | the release's `d4r.ini`, OptiScaler settings, user guide and install check |
-| `docs/` | architecture, build, native kernel and performance notes |
+| `tools/` | the NGX shim, the Wine CUDA bridge, a D3D12 DLSS harness, probes |
+| `kernels/` | native kernels (`k/` DLSS 4, `m/` DLSS 4.5, `tex/` texture tails, `common/` matrix layouts) and their tools |
+| `engine/` | the native K/L/M inference engine |
+| `patches/` | ZLUDA, vkd3d-proton and OptiScaler patches |
+| `scripts/`, `config/`, `packaging/`, `docs/` | build/launch scripts, the developer `d4r.ini`, release files, documentation |
 
 ## Star History
 
@@ -211,4 +99,4 @@ Gameplay recordings of each DLSS model at the Quality, Performance and Ultra Per
 
 ## License
 
-GNU General Public License, version 3 only (GPL-3.0-only; see [LICENSE](LICENSE)). The patches in `patches/` are offered under the licenses of the projects they modify: ZLUDA (Apache-2.0 or MIT) and vkd3d-proton (LGPL-2.1). See [NOTICE](NOTICE).
+GNU General Public License, version 3 only (GPL-3.0-only; see [LICENSE](LICENSE)). The patches in `patches/` are offered under the licenses of the projects they modify: ZLUDA (Apache-2.0 or MIT) and vkd3d-proton (LGPL-2.1). See [NOTICE](NOTICE). The downloaded NVIDIA files and the kernels built from NVIDIA's code are not covered by this license.

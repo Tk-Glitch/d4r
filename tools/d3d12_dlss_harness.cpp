@@ -2445,6 +2445,22 @@ int main(int argc, char** argv)
         d4r_ngx_set_uint(parameters, "Height", height);
         d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Width", width);
         d4r_ngx_set_uint(parameters, "DLSS.Render.Subrect.Dimensions.Height", height);
+        // D4R_HARNESS_RECREATE_PRESETS=11,5,13: every Super Sampling preset slot of cycle N takes entry N-1 (cycling),
+        // as OptiScaler's Render Presets Override + Apply Changes recreates the feature with the picked model
+        if (const char* list = std::getenv("D4R_HARNESS_RECREATE_PRESETS"); list != nullptr && *list != '\0')
+        {
+            std::vector<unsigned int> presets;
+            for (const char* cursor = list; *cursor != '\0';)
+            {
+                char* end = nullptr;
+                presets.push_back(static_cast<unsigned int>(std::strtoul(cursor, &end, 0)));
+                cursor = *end != '\0' ? end + 1 : end;
+            }
+            const unsigned int preset = presets[(cycle - 1) % presets.size()];
+            for (const char* mode : {"DLAA", "Quality", "Balanced", "Performance", "UltraPerformance", "UltraQuality"})
+                d4r_ngx_set_uint(parameters, (std::string("DLSS.Hint.Render.Preset.") + mode).c_str(), preset);
+            std::printf("RECREATE cycle %d: presets %u\n", cycle, preset);
+        }
         result = createFeature(g_list, featureId, parameters, &feature);
         if (result != NGX_SUCCESS)
         {

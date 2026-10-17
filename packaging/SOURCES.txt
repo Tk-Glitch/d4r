@@ -42,6 +42,10 @@ Third-party software, unmodified or patched by d4r:
                          License: d4r/licenses/OptiScaler-LICENSE-GPL-3.0.txt
   OptiScaler.ini         OptiScaler 0.9.4's OptiScaler.ini with the values d4r needs set
                          (packaging/optiscaler.settings in the d4r repository)
+  amd_fidelityfx_dx12.dll, amd_fidelityfx_upscaler_dx12.dll
+                         AMD FidelityFX SDK 2.3 loader and FSR 4.1.1 upscaler (MIT), unmodified, as shipped in
+                         the OptiScaler 0.9.4 release. https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+                         License: d4r/licenses/FidelityFX-LICENSE.txt
 
 @clean Not included: NVIDIA's DLSS libraries (nvngx_dlss.dll, nvngx_dlssd.dll) and NGX runtime (_nvngx.dll). You supply them
 @clean and are responsible for complying with NVIDIA's license terms.

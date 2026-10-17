@@ -125,13 +125,13 @@ struct Feature {
 uint32_t words[4] = {0, 3, 4, 5}, markers[4] = {6, 3, 4, 5};
 Feature* current;
 int drains = 0, drainResult = 0;
-int sync() {
+int drain_sync() { // not sync(): glibc's <unistd.h> declares void sync()
     ++drains;
     assert(words[2] == 7); // drain may only run after the CPU released the blocked queue
     assert(current->ngxWaitActive); // ticket and input ownership survive the drain
     return drainResult;
 }
-struct { struct { int(*ctxSynchronize)() = sync; void(*timelineCancel)(void*) = nullptr; } cu; } g;
+struct { struct { int(*ctxSynchronize)() = drain_sync; void(*timelineCancel)(void*) = nullptr; } cu; } g;
 ''' + release + '\n' + complete + r'''
 int main() {
     Feature f; f.ngxInputSync.mapped = words; current = &f;

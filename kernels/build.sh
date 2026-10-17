@@ -10,6 +10,8 @@
 #   D4R_NATIVE_FP8  1 (RDNA4 only): the variant for ZLUDA's native FP8 WMMA (d4r.ini [Kernels] NativeFp8):
 #                   M's layers on FP8 WMMA with NVIDIA's e4m3 activations, texture tails matching ZLUDA's
 #                   D4R_ZLUDA_WMMA_FP8_NATIVE lowering. K is the same in both variants.
+#   D4R_WMMA_SOFT   1: RDNA2's software matrix products (kernels/common/wmma_layout.h) on an RDNA3 target, to
+#                   validate and time the RDNA2 kernels on RDNA3 hardware (gfx103x targets always use them)
 #   D4R_PREFER_ACCURACY  1: preserve FP8 quantization, per-MMA f16 rounding and denormal handling;
 #                   build a separate set (default output: kernels/out/native/accuracy).
 # Texture kernels (tex) are NVIDIA's PTX with parts replaced, so they additionally need:
@@ -35,7 +37,9 @@ FP8="${D4R_NATIVE_FP8:-0}"
 case "$ARCH" in
     gfx11[0-9][0-9]) [[ "$FP8" == 1 ]] && { echo "D4R_NATIVE_FP8 needs an RDNA4 (gfx12) target" >&2; exit 2; } ;;
     gfx12[0-9][0-9]) ;;
-    *) echo "unsupported D4R_GPU_ARCH $ARCH (RDNA3 gfx110x or RDNA4 gfx120x)" >&2; exit 2 ;;
+    # RDNA2: no WMMA; kernels/common/wmma_layout.h multiplies in software (D4R_WMMA_SOFT)
+    gfx103[0-9]) [[ "$FP8" == 1 ]] && { echo "D4R_NATIVE_FP8 needs an RDNA4 (gfx12) target" >&2; exit 2; } ;;
+    *) echo "unsupported D4R_GPU_ARCH $ARCH (RDNA2 gfx103x, RDNA3 gfx110x or RDNA4 gfx120x)" >&2; exit 2 ;;
 esac
 CLANG="$ROCM/lib/llvm/bin/clang++"
 [[ -x "$CLANG" ]] || { echo "clang++ not found in $ROCM/lib/llvm/bin (set D4R_ROCM_DIR)" >&2; exit 2; }
@@ -65,6 +69,7 @@ build_hip() {
         fi
     done
     [[ "$ACCURACY" == 1 ]] && extra+=" -DD4R_ACCURACY"
+    [[ "${D4R_WMMA_SOFT:-0}" == 1 ]] && extra+=" -DD4R_WMMA_SOFT"
     # shellcheck disable=SC2086
     (cd "$tmp" && "$CLANG" -x hip --offload-arch="$ARCH" --offload-device-only -O3 $flags $extra -I"$ROCM/include" \
         --rocm-path="$ROCM" --rocm-device-lib-path="$ROCM/amdgcn/bitcode" -I"$(dirname "$src")" \

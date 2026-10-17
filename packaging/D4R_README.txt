@@ -1,12 +1,12 @@
 Modified in this fork for CUDA Ray Reconstruction support and validation (2026).
 
-d4r @VERSION@: NVIDIA DLSS on AMD Radeon RDNA3 and RDNA4 under Linux and Proton
-=====================================================================
+d4r @VERSION@: NVIDIA DLSS on AMD Radeon RDNA2, RDNA3 and RDNA4 under Linux and Proton
+=====================================================================================
 
 d4r runs NVIDIA's own DLSS Super Resolution (DLSS 4 by default), plus experimental Ray Reconstruction,
 on AMD Radeon GPUs in DirectX 12 games under Proton. OptiScaler (included) catches the game's DLSS calls
 and hands them to d4r. d4r runs NVIDIA's DLSS through ZLUDA; the heaviest Super Resolution kernels are
-replaced by kernels written for RDNA3 and RDNA4.
+replaced by kernels written for RDNA2, RDNA3 and RDNA4.
 
 This is an early release. Super Resolution game testing primarily uses Radeon RX 7700 XT.
 Ray Reconstruction presets D/E, temporal history, and separate alpha were validated on RX 9070 XT
@@ -16,11 +16,15 @@ SUPPORTED_GAMES.md in the source repository lists per-game setup notes. Expect p
 
 What you need
 -------------
-- An AMD RDNA3 or RDNA4 GPU. This build includes native DLSS 4 and 4.5 network kernels for
+- An AMD RDNA2, RDNA3 or RDNA4 GPU. This build includes native DLSS 4 and 4.5 network kernels for
   gfx1100–gfx1103 and gfx1200–gfx1201 unless the builder selected fewer targets. Only the RX 7700 XT
   (gfx1101) has been tested on a real GPU. gfx1201 has emulator testing; gfx1200 has compile testing
   only. Neither establishes RDNA4 runtime support, performance or driver stability. Texture-kernel
   optimisations are included only for targets supplied by the builder.
+  RDNA2 (RX 6000 series, Steam Deck, RDNA2 integrated GPUs; gfx1030–gfx1036) has no WMMA instructions:
+  this build gives it native DLSS 4 (K) layers that do the matrix products in software, bit-identical
+  to the WMMA kernels when run on RDNA3. Use K or E there; M and L run fully translated (slow). RDNA2
+  itself has not been tested on a real GPU.
 - Linux with the amdgpu kernel driver (/dev/kfd). ROCm itself is not needed: the zip includes the
   ROCm 7.2.4 runtime in d4r/rocm. RocmDir in d4r/d4r.ini selects another ROCm installation instead.
 - GE-Proton 11 (tested: GE-Proton11-3), selected for the game in Steam.
@@ -46,7 +50,8 @@ that archive's d4r/README.txt: setup runs automatically when the ASI loads.
 
 1. Extract everything in this zip into the folder that holds the game's main .exe. For Unreal
    Engine games that is <game>/<Project>/Binaries/Win64/, next to <Project>-Win64-Shipping.exe.
-   You get dxgi.dll, OptiScaler.ini, d3d12.dll, d3d12core.dll, this file and a d4r folder.
+   You get dxgi.dll, OptiScaler.ini, d3d12.dll, d3d12core.dll, AMD's amd_fidelityfx_dx12.dll and
+   amd_fidelityfx_upscaler_dx12.dll (OptiScaler's FSR option), this file and a d4r folder.
    When updating, replace both d3d12 DLLs with the shim: it requires their resource-lifetime extension.
    If the folder already has a dxgi.dll or OptiScaler.ini (another OptiScaler install), move those
    out of the way first. Also remove PROTON_USE_OPTISCALER from the game's launch options if you
@@ -122,6 +127,12 @@ Settings
 @full   there, d4r uses the normal path.
 @clean   Build the models with the tools in d4r's source repository (engine/README.md); until they are
 @clean   there, d4r uses the normal path.
+- Switching in game, from OptiScaler's menu (Insert):
+  - DLSS model: DLSS Settings > tick Render Presets Override, pick the preset (E, K, L or M) and press
+    Apply Changes. Unticking it goes back to Model above. ([OptiScaler] FollowPresets = false ignores it.)
+  - FSR: set Upscaler (DX12) to FSR 3.X/4. RDNA3 and RDNA4 get FSR 4.1 from GE-Proton's AMD FSR 4
+    library; other GPUs get FSR 3.1. d4r lets OptiScaler and AMD's FSR see the real GPU while the game
+    still sees an NVIDIA one ([OptiScaler] Fsr4 = false turns that off).
 - OptiScaler.ini: OptiScaler's settings, such as its fps overlay and the render resolution of each
   quality mode. Press Insert in game for OptiScaler's menu.
   [Libraries] NvngxPath=d4r\nvngx.dll explicitly selects d4r's shim; OptiDllPath=d4r is also

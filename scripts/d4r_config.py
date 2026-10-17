@@ -87,6 +87,11 @@ def main(argv):
         else:
             fail(f"[DLSS] Model {model!r}: use one of {', '.join(list(PRESETS) + list(MODEL_ALIASES))} or a preset number")
 
+    if flag("OptiScaler", "FollowPresets") is False:
+        env["D4R_FOLLOW_OPTISCALER"] = "0"
+    if flag("OptiScaler", "Fsr4") is False:
+        env["D4R_FSR4_IDENTITY"] = "0"
+
     rr_enabled = flag("RayReconstruction", "Enable")
     if rr_enabled is not None:
         env["D4R_RR_ENABLE"] = "1" if rr_enabled else "0"

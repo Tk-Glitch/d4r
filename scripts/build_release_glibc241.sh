@@ -76,6 +76,8 @@ export D4R_DLSS_PTX_DIR="$BUILD/ptx"
 python3 "$ROOT/kernels/tools/extract_dlss_ptx.py" "$D4R_BUNDLE_DLSS" "$D4R_DLSS_PTX_DIR" > "$BUILD/logs/extract.log"
 build_textures() {
     local arch="$1" folder fp8 accuracy out
+    # RDNA2 has no texture tails (they need WMMA); package_release.sh builds its K layers
+    [[ "$arch" == gfx103* ]] && return 0
     folders=("$arch")
     [[ "$arch" == gfx12* ]] && folders+=("$arch-fp8")
     for folder in "${folders[@]}"; do
@@ -93,7 +95,7 @@ build_textures() {
 }
 pending=()
 failed=0
-for arch in ${D4R_GPU_ARCHS:-gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
+for arch in ${D4R_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201}; do
     build_textures "$arch" &
     pending+=("$!")
     if (( ${#pending[@]} >= ${D4R_TEX_JOBS:-4} )); then

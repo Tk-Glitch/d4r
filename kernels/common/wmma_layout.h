@@ -32,6 +32,17 @@
 #if D4R_WMMA_LAYOUT == 11 && defined(__GFX12__)
 #error "the gfx11 WMMA layout does not exist on gfx12"
 #endif
+// RDNA2 (gfx10.3): no WMMA instruction; the gfx11 layout with the products done in software (wm_mma below).
+// The gfx11 true16 assembly (v_cvt_f16_f32 %0.l/.h) does not exist there either; the C conversions replace it.
+#if defined(__GFX10__) && !defined(D4R_WMMA_SOFT)
+#define D4R_WMMA_SOFT 1
+#endif
+#ifdef __GFX10__
+#undef WM_CVT_ASM
+#endif
+#if defined(__GFX10__) && D4R_WMMA_LAYOUT != 11
+#error "RDNA2 kernels use the gfx11 WMMA layout"
+#endif
 
 #define WM_FN __attribute__((device, always_inline)) static inline
 
@@ -324,10 +335,12 @@ WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(wm_h8, a), __builtin_bit_cast(wm_h8, b), c);
 }
 #else
+#ifndef __GFX10__
 WM_FN wm_f8v wm_mma11(const wm_u8v& a, const wm_u8v& b, wm_f8v c)
 {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(wm_h16, a), __builtin_bit_cast(wm_h16, b), c);
 }
+#endif
 #if D4R_WMMA_LAYOUT == 12
 // layout shim: gfx12 operand halves -> one gfx11 operand in K order (half 0's 8 K, then half 1's)
 WM_FN wm_u8v wm_shim_operand(const wm_u4v& v)
@@ -404,6 +417,49 @@ WM_FN wm_f8v wm_mma_zluda(const wm_op& a, const wm_op& b, wm_f8v c)
 {
     return wm_shim_acc_to12(wm_mma11(wm_shim_operand_zluda(a), wm_shim_operand_zluda(b), wm_shim_acc_to11(c)));
 }
+#elif defined(D4R_WMMA_SOFT)
+// RDNA2 (gfx103x) has no WMMA: the same gfx11 register layout, multiplied with v_dot2_f32_f16. Lane (r, h) holds
+// column r of B and needs rows 2i + h of A, which lanes 2i + h (any half) hold. Half 1's A is rotated by one row
+// first (row_ror:15 on DPP row 1 only), so that one row_share:2i broadcast gives half 0 row 2i and half 1 row
+// 2i + 1. 8 + 64 DPP moves and 64 dot2 per 16x16x16 product, f32 accumulation in K order (two products per step).
+// D4R_WMMA_SOFT on gfx11 runs this path on RDNA3 hardware for validation: there it is bit-identical to the WMMA
+// instruction (random 64-step chains with denormals, and K's whole network over a moving 24-frame sequence).
+WM_FN uint32_t wm_dpp_rot_half1(uint32_t v)
+{
+    // DPP control 0x12f = row_ror:15 (lane j of a 16-lane row reads lane (j + 1) & 15); row mask 2 = half 1 only
+    return (uint32_t)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x12f, 0x2, 0xf, false);
+}
+// One dot2 per A row with the row_share broadcast folded into the instruction (VOP2 DPP: v_dot2c_f32_f16 on gfx10,
+// v_dot2acc_f32_f16 on gfx11). LLVM's DPP combiner does not fold a v_mov_b32_dpp into these, and a separate move
+// per row doubled the instruction count and kept 64 broadcast values live (spills). gfx10 and gfx11 resolve the
+// VALU -> DPP read dependency in hardware, so no wait states are needed around the assembly.
+#ifdef __GFX10__
+#define WM_DOT2_DPP "v_dot2c_f32_f16_dpp"
+#else
+#define WM_DOT2_DPP "v_dot2acc_f32_f16_dpp"
+#endif
+#define WM_SOFT_ROW(I, LANE)                                                                                       \
+    asm(WM_DOT2_DPP " %0, %1, %2 row_share:" #LANE " row_mask:0xf bank_mask:0xf" : "+v"(c[I]) : "v"(x), "v"(column))
+WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
+{
+    // Each accumulator sums its K pairs in order 0..7, as the WMMA instruction does on gfx11 (bit-identical there).
+#pragma unroll
+    for (int d = 0; d < 8; ++d)
+    {
+        const uint32_t x = wm_dpp_rot_half1(a[d]);
+        const uint32_t column = b[d];
+        WM_SOFT_ROW(0, 0);
+        WM_SOFT_ROW(1, 2);
+        WM_SOFT_ROW(2, 4);
+        WM_SOFT_ROW(3, 6);
+        WM_SOFT_ROW(4, 8);
+        WM_SOFT_ROW(5, 10);
+        WM_SOFT_ROW(6, 12);
+        WM_SOFT_ROW(7, 14);
+    }
+    return c;
+}
+#undef WM_SOFT_ROW
 #else
 WM_FN wm_f8v wm_mma(const wm_op& a, const wm_op& b, wm_f8v c)
 {

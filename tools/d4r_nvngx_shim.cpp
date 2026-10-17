@@ -100,6 +100,7 @@
 #include <bcrypt.h>
 #include "d4r_fsr_rr.h"
 #include "d4r_fsr_rr_identity.h"
+#include "d4r_fsr4_identity.h"
 #include "d4r_fsr_rr_passes.h"
 #include "../engine/game.h"
 #include "../engine/game_m.h"
@@ -625,6 +626,12 @@ static void load_portable_config()
         model.clear();
     if (!model.empty())
         portable_set("D4R_DLSS_PRESET", model);
+    // [OptiScaler] FollowPresets: its Render Presets Override picks the model in game (d4r_render_presets.h);
+    // Fsr4: OptiScaler and AMD's FidelityFX modules see the real GPU, for its FSR 4 option (d4r_fsr4_identity.h).
+    if (ini_flag(ini, "optiscaler", "FollowPresets", 1) == 0)
+        portable_set("D4R_FOLLOW_OPTISCALER", "0");
+    if (ini_flag(ini, "optiscaler", "Fsr4", 1) == 0)
+        portable_set("D4R_FSR4_IDENTITY", "0");
 
     // Ray Reconstruction is configured on its own section and drives its own feature, so
     // nothing here reaches [DLSS] Model and nothing there reaches this.
@@ -755,6 +762,10 @@ static void load_portable_config()
         else
             on = ini_flag(ini, "engine", "Enabled", 0) != 0;
         portable_set("D4R_ENGINE", on ? "1" : "0");
+        // auto leaves K on the native kernels: K's Vulkan network is slower (2026-10-17, 7700 XT, 1706x960 -> 1440p:
+        // 3.59 ms vs 2.35 ms dlss_gpu). Enabled = true, or Network = hip with a model that has the HIP layers, keeps it.
+        if (enabled.empty() || enabled == "auto")
+            portable_set("D4R_ENGINE_K", "0");
     }
     if (const std::string engineModel = ini_value(ini, "engine", "ModelDir"); !engineModel.empty())
         portable_set(L"D4R_ENGINE_MODEL_DIR", portable_path(engineModel));
@@ -1982,6 +1993,13 @@ static NgxResult initialize(unsigned long long applicationId, const wchar_t* dat
         LUID luid;
         device->GetAdapterLuid(&luid);
         set_cuda_adapter_luid(luid);
+        // OptiScaler's FSR 4 option needs the real AMD identity for OptiScaler and AMD's modules (d4r_fsr4_identity.h)
+        if (env_string("D4R_FSR4_IDENTITY") != "0")
+        {
+            std::string detail;
+            d4r_fsr4_identity::install(device, detail);
+            logf("FSR 4 identity: %s", detail.c_str());
+        }
     }
 
     g.paths.clear();
@@ -3364,6 +3382,9 @@ struct VulkanInterop
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory = {};
     VkPhysicalDevice physical = VK_NULL_HANDLE;
+    // VK_EXT_shader_float8 (vkd3d-proton enables it when the GPU has it): M's and L's engine layers are FP8
+    // cooperative-matrix shaders, which RADV's compiler crashes on without it (RDNA3)
+    bool float8 = false;
     PFN_vkGetPhysicalDeviceFormatProperties formatProperties = nullptr;
     PFN_vkCreateBuffer createBuffer = nullptr;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
@@ -9027,6 +9048,36 @@ static NgxResult create_cuda_feature(Feature& feature)
     return result;
 }
 
+// Whether the presets of this creation were picked in OptiScaler (d4r_render_presets.h): its override is on in
+// OptiScaler.ini, or the presets changed since the game's first creation. (OptiScaler forwards the game's
+// AllocateParameters to this DLL, so the table itself does not say who filled it.) D4R_FOLLOW_OPTISCALER=0 always
+// keeps d4r's model. g.mutex is held.
+static bool optiscaler_chose_presets(bool rayReconstruction, const unsigned int (&presets)[6])
+{
+    static D4rPresetFollower followers[2];
+    static bool iniOverride[2] = {};
+    static std::once_flag iniOnce;
+    if (env_string("D4R_FOLLOW_OPTISCALER") == "0")
+        return false;
+    std::call_once(iniOnce, [] {
+        // OptiScaler reads OptiScaler.ini beside its own DLL, which d4r's install puts beside the game's EXE
+        wchar_t exe[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH)
+            return;
+        std::wstring path(exe, length);
+        path.resize(path.find_last_of(L"\\/") + 1);
+        std::string text;
+        if (!read_whole_file(path + L"OptiScaler.ini", text))
+            return;
+        const std::vector<IniEntry> ini = parse_ini(text);
+        iniOverride[0] = ini_flag(ini, "dlss", "RenderPresetOverride", 0) == 1;
+        iniOverride[1] = ini_flag(ini, "dlssd", "RenderPresetOverride", 0) == 1;
+        logf("OptiScaler.ini: RenderPresetOverride DLSS=%d DLSSD=%d", iniOverride[0], iniOverride[1]);
+    });
+    return followers[rayReconstruction].follow(presets, iniOverride[rayReconstruction]);
+}
+
 static NgxResult fsr_rr_create(Feature& feature, void* parameters);
 static NgxResult create_feature_locked(unsigned int featureId, void* parameters, NgxHandle** handle,
                                        bool nativeVulkan);
@@ -9111,27 +9162,40 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
         presets[index] = get_uint_or(parameters, presetNames[index], 0);
     const std::string forced = env_string(d4r_render_preset_variable(rayReconstruction));
     const auto presetOverride = d4r_parse_render_preset_override(forced.c_str());
+    // Flagged, retired or unknown values count as Default, both for spotting OptiScaler's change and in what is followed
     if (presetOverride.enabled)
+        d4r_sanitize_presets(presets, rayReconstruction);
+    const bool followed = presetOverride.enabled && optiscaler_chose_presets(rayReconstruction, presets);
+    if (followed)
+    {
+        logf("DLSS model: OptiScaler's preset override [DLAA=%u Quality=%u Balanced=%u Performance=%u "
+             "UltraPerformance=%u UltraQuality=%u] wins over %s=%s (which still fills Default slots)",
+             presets[0], presets[1], presets[2], presets[3], presets[4], presets[5],
+             d4r_render_preset_variable(rayReconstruction), forced.c_str());
+        d4r_apply_followed_presets(presets, presetOverride);
+    }
+    else if (presetOverride.enabled)
     {
         const unsigned int value = presetOverride.value;
         const char* model = value == 5 ? "E" : value == 11 ? "K" : value == 12 ? "L" : value == 13 ? "M" : "custom";
-        logf("DLSS model override: D4R_DLSS_PRESET=%s (model %s) overrides game/OptiScaler presets "
+        logf("DLSS model override: D4R_DLSS_PRESET=%s (model %s) overrides game presets "
              "[DLAA=%u Quality=%u Balanced=%u Performance=%u UltraPerformance=%u UltraQuality=%u]; "
              "using preset=%u for all quality modes",
              forced.c_str(), model, presets[0], presets[1], presets[2], presets[3], presets[4], presets[5], value);
+        presetOverride.apply(presets);
     }
-    presetOverride.apply(presets);
-    feature->preset = presets[1];
+    // NGX runs the preset of the feature's quality mode.
+    feature->preset = presets[d4r_preset_slot(quality)];
     // Direct output needs the native output kernel of the preset in use (verified: K = 11 through
-    // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced
-    // Super Sampling preset qualifies; a Ray Reconstruction preset never does here.
+    // hiluma_engine_output, M = 13 through rrlite_downsample_kernel, its last kernel). Only a forced or
+    // OptiScaler-chosen Super Sampling preset qualifies; a Ray Reconstruction preset never does here.
     if (!forced.empty() && !rayReconstruction)
     {
         char allowed[128] = "11,13";
         if (const std::string list = env_string("D4R_SHIM_OUTPUT_DIRECT_PRESETS"); !list.empty())
             snprintf(allowed, sizeof(allowed), "%s", list.c_str());
         for (char* token = strtok(allowed, ","); token != nullptr; token = strtok(nullptr, ","))
-            feature->outputDirectAllowed |= strtoul(token, nullptr, 0) == presets[1];
+            feature->outputDirectAllowed |= strtoul(token, nullptr, 0) == feature->preset;
     }
     feature->rayReconstruction = rayReconstruction;
     if (rayReconstruction)
@@ -9139,7 +9203,7 @@ static NgxResult create_feature_locked(unsigned int featureId, void* parameters,
             feature->auxScalarBaseline[index] = get_int_or(parameters, kAuxScalars[index].name, 0);
     logf("NVSDK_NGX_D3D12_CreateFeature(feature=%u%s): %ux%u -> %ux%u quality=%d flags=0x%x subrects=%d preset=%u",
          featureId, rayReconstruction ? ", Ray Reconstruction" : "", feature->width, feature->height,
-         feature->outWidth, feature->outHeight, quality, flags, subrects, presets[1]);
+         feature->outWidth, feature->outHeight, quality, flags, subrects, feature->preset);
 
     feature->subrects = subrects;
     std::copy(std::begin(presets), std::end(presets), feature->creationPresets.begin());
@@ -9244,6 +9308,18 @@ static void init_engine_vulkan()
         logf("engine backend: Vulkan entry points are unavailable");
         return;
     }
+    auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        instanceProc(instance, "vkEnumerateDeviceExtensionProperties"));
+    uint32_t count = 0;
+    if (enumerate != nullptr && enumerate(g_vk.physical, nullptr, &count, nullptr) == VK_SUCCESS)
+    {
+        std::vector<VkExtensionProperties> extensions(count);
+        if (enumerate(g_vk.physical, nullptr, &count, extensions.data()) == VK_SUCCESS)
+            for (uint32_t index = 0; index < count; ++index)
+                g_vk.float8 |= std::strcmp(extensions[index].extensionName, "VK_EXT_shader_float8") == 0;
+    }
+    logf("engine backend: VK_EXT_shader_float8 %s", g_vk.float8 ? "available (M and L engine layers)" : "unavailable: "
+         "M and L run on the CUDA backend");
 }
 
 static void init_engine_backend()
@@ -9982,6 +10058,10 @@ static bool engine_evaluate_m(Feature& feature, ID3D12GraphicsCommandList* list,
     };
     // NVSDK_NGX_DLSS_Feature_Flags: IsHDR 1, MVLowRes 2, MVJittered 4, DepthInverted 8, AutoExposure 0x40.
     const bool ldr = (feature.flags & 0x1) == 0; // NGX's LDR stages: a model directory of its own, no exposure
+    // The model's pipelines include the FP8 layers even when the HIP network runs them; creating those without
+    // VK_EXT_shader_float8 crashes the driver (RADV on RDNA3, vkCreateComputePipelines), so never load the model.
+    if (!g_vk.float8)
+        return refuse("the GPU has no VK_EXT_shader_float8 for the FP8 layers");
     std::call_once(g_engineM.once[presetL][ldr], [presetL, ldr] { init_engine_backend_m_variant(presetL, ldr); });
     d4r::MModel* const model = g_engineM.models[presetL][ldr].get();
     if (model == nullptr)
@@ -10561,6 +10641,8 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         return engine_evaluate_rr(feature, list, color, depth, motion, output, parameters, p, frame);
     if (feature.preset == 13 || feature.preset == 12)
         return engine_evaluate_m(feature, list, color, depth, motion, output, p, frame);
+    if (feature.preset == 11 && env_string("D4R_ENGINE_K") == "0" && env_string("D4R_ENGINE_NETWORK") != "hip")
+        return refuse("[Engine] Enabled = auto keeps K on the native kernels (faster than the Vulkan network)");
     // Without the HDR flag NGX runs its LDR input and output kernels: a model directory of its own.
     const bool ldr = (feature.flags & 0x1) == 0;
     if (ldr)
@@ -10745,6 +10827,24 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
     }
     if (FAILED(g_vk.lifetime->RetainExternalResources(list, feature.resources)))
         return refuse("the command list cannot retain the engine's resources");
+    // D4R_PROFILE: the Vulkan network's GPU time on the game's queue (timestamps around the whole recording)
+    const bool profile = profile_enabled() && env_uint("D4R_PROFILE_GPU_TIMESTAMPS", 1) != 0 &&
+        profile_timestamps_ready(feature);
+    if (profile)
+    {
+        FrameTiming measured;
+        read_profile_timestamps(feature, frame, measured);
+        const auto now = ProfileClock::now();
+        const double interval = feature.engineRProfileAt.time_since_epoch().count() ?
+            profile_ms(feature.engineRProfileAt, now) : 0.0;
+        feature.engineRProfileAt = now;
+        if (profile_log_frame(frame) && measured.vkTotal >= 0)
+            logf("D4R_ENGINE_K_PROFILE frame=%u gpu_frame=%u render=%ux%u output=%ux%u gpu_eval=%.3f "
+                 "game_interval=%.3f age=0", frame, frame - kOutputSlots, p.renderWidth, p.renderHeight,
+                 feature.outWidth, feature.outHeight, measured.vkTotal, interval);
+        profile_timestamp(feature, list, frame, 0);
+        profile_timestamp(feature, list, frame, 1);
+    }
     for (const Source& source : sources)
         transition(list, source.resource, source.state, source.copyState);
     VkCommandBuffer command = VK_NULL_HANDLE;
@@ -10772,6 +10872,11 @@ static bool engine_evaluate(Feature& feature, ID3D12GraphicsCommandList* list, I
         transition(list, source.resource, source.copyState, source.state);
     if (!recorded)
         return refuse(failure);
+    if (profile)
+    {
+        profile_timestamp(feature, list, frame, 2);
+        profile_timestamp(feature, list, frame, 3);
+    }
     feature.engineJitter[0] = p.jitterX;
     feature.engineJitter[1] = p.jitterY;
     if (frame <= 3 || frame % 600 == 0)
