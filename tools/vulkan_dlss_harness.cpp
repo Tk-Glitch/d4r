@@ -28,7 +28,7 @@ using Shutdown = Result (*)();
 
 #define VK_FUNCTIONS(X) \
 X(CreateInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) X(EnumerateDeviceExtensionProperties) \
-X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) X(CreateDevice) \
+X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) X(GetPhysicalDeviceFeatures2) X(CreateDevice) \
 X(GetDeviceProcAddr) X(GetDeviceQueue) X(CreateCommandPool) X(AllocateCommandBuffers) \
 X(BeginCommandBuffer) X(EndCommandBuffer) X(ResetCommandPool) X(QueueSubmit) X(QueueWaitIdle) X(CreateFence) X(WaitForFences) X(ResetFences) X(DestroyFence) \
 X(CreateImage) X(GetImageMemoryRequirements) X(AllocateMemory) X(BindImageMemory) X(CreateImageView) \
@@ -102,7 +102,10 @@ int main(int argc, char** argv)
 #define LOAD(name) vk##name = reinterpret_cast<PFN_vk##name>(ip(VK_NULL_HANDLE, "vk" #name));
     LOAD(CreateInstance)
 #undef LOAD
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
+    // D4R_HARNESS_ENGINE_DEVICE=1: a Vulkan 1.3 device with every supported 1.1-1.3 feature plus cooperative matrix
+    // and shader float8, as d4r's engine (and a layer in a game) needs.
+    const bool engineDevice = std::getenv("D4R_HARNESS_ENGINE_DEVICE") != nullptr;
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = engineDevice ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ci.pApplicationInfo = &app;
     VkInstance instance;
     check(vkCreateInstance(&ci,nullptr,&instance),"instance");
@@ -141,6 +144,28 @@ int main(int argc, char** argv)
         if (!supported) { std::fputs("external memory extension unavailable\n",stderr); return 1; }
         di.enabledExtensionCount=1; di.ppEnabledExtensionNames=&externalExtension;
         std::puts("enabling external-memory VRAM interop");
+    }
+    VkPhysicalDeviceShaderFloat8FeaturesEXT f8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, &f8};
+    VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &cm};
+    VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
+    VkPhysicalDeviceVulkan11Features v11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
+    std::vector<const char*> engineExtensions;
+    if (engineDevice) {
+        vkGetPhysicalDeviceFeatures2(physical,&f2);
+        check(vkEnumerateDeviceExtensionProperties(physical,nullptr,&count,nullptr),"extensions");
+        std::vector<VkExtensionProperties> extensions(count);
+        check(vkEnumerateDeviceExtensionProperties(physical,nullptr,&count,extensions.data()),"extensions");
+        bool float8 = false;
+        for (const auto& e : extensions) float8 |= std::strcmp(e.extensionName,"VK_EXT_shader_float8")==0;
+        if (!float8) { f8.shaderFloat8 = f8.shaderFloat8CooperativeMatrix = VK_FALSE; cm.pNext = nullptr; }
+        if (cm.cooperativeMatrix) engineExtensions.push_back("VK_KHR_cooperative_matrix"); else v13.pNext = nullptr;
+        if (float8) engineExtensions.push_back("VK_EXT_shader_float8");
+        for (uint32_t i = 0; i < di.enabledExtensionCount; ++i) engineExtensions.push_back(di.ppEnabledExtensionNames[i]);
+        di.pNext = &f2; di.enabledExtensionCount = static_cast<uint32_t>(engineExtensions.size());
+        di.ppEnabledExtensionNames = engineExtensions.data();
+        std::printf("engine device: cooperative matrix %u, float8 %u\n", cm.cooperativeMatrix, f8.shaderFloat8);
     }
     check(vkCreateDevice(physical,&di,nullptr,&device),"device");
     auto dp = vkGetDeviceProcAddr;
@@ -247,7 +272,8 @@ int main(int argc, char** argv)
         unsigned nonzero=0, nonfinite=0;
         for (unsigned j=0;j<OW*OH*4;++j) { nonzero += (values[j]&0x7fff)!=0; nonfinite += (values[j]&0x7c00)==0x7c00; }
         std::printf("frame %u: nonzero=%u nonfinite=%u center=%04x,%04x,%04x,%04x\n",n,nonzero,nonfinite,values[((OH/2)*OW+OW/2)*4],values[((OH/2)*OW+OW/2)*4+1],values[((OH/2)*OW+OW/2)*4+2],values[((OH/2)*OW+OW/2)*4+3]);
-        if (!nonzero || nonfinite) return 1;
+        // D4R_HARNESS_ALLOW_BLACK=1: a black frame is reported but not fatal (NGX's K starts black on the reset frame here).
+        if (nonfinite || (!nonzero && !std::getenv("D4R_HARNESS_ALLOW_BLACK"))) return 1;
         if (n+1==frames) { FILE* out=std::fopen(argv[2],"wb"); if (!out) return 1; const auto written=std::fwrite(data,1,OW*OH*8,out); std::fclose(out); if (written!=OW*OH*8) return 1; }
         vkUnmapMemory(device,readMemory);
     }

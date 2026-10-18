@@ -16,7 +16,8 @@ bool gameColorFormat(VkFormat format) {
     }
 }
 bool gameMotionFormat(VkFormat format) {
-    return format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT ||
+    // R16G16_SNORM (Enshrouded): sampled as floats in [-1, 1]; MV.Scale carries them to pixels as for float vectors.
+    return format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R16G16_SNORM ||
            format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT;
 }
 bool gameDepthFormat(VkFormat format, VkImageAspectFlags aspect) {

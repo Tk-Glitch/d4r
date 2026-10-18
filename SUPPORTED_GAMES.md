@@ -45,3 +45,14 @@ Game-specific setup:
 - **Dying Light: The Beast:** use DLSS inputs; with FSR or XeSS inputs the screen stays black. The game passes its motion vectors as `R16G16B16A16_TYPELESS`, which needs a d4r build from 2026-09-28 or later (older builds reject every frame and show a black screen).
 
 Choose a model with `Model = E`, `Model = K`, or `Model = M` under `[DLSS]` in the game's `d4r/d4r.ini`. Model compatibility does not imply equal performance; see the [Townfall measurements](docs/performance.md) for measured frame rates.
+
+Vulkan games (native Vulkan frontend, engine path; see docs/vulkan.md):
+
+- **Enshrouded** (Vulkan only): preset M verified in game on RX 9070 (gfx1201), GE-Proton11-7, through the game's own DLSS
+  inputs. Install OptiScaler as `dbghelp.dll` (the exe imports it before it creates its Vulkan device; `dxgi.dll` loads
+  too late) with `WINEDLLOVERRIDES="dbghelp=n,b"`, and set in `OptiScaler.ini`: `[Upscalers] VulkanUpscaler=dlss`,
+  `[Spoofing] Vulkan=true`, `VulkanExtensionSpoofing=false`, `Dxgi=false` (a Vulkan game needs no DXGI spoofing; the
+  verified setup ran without it), and `[InitFlags] AutoExposure=true` (the game sends no exposure; needed for K). The game's motion vectors are `R16G16_SNORM`, which the staging path rejects. Launch options as for
+  D3D12 games (`PROTON_FORCE_NVAPI=1 DXVK_NVAPI_GPU_ARCH=AD100`). The lsfg-vk layer made the game's swap chain creation
+  fail under GE-Proton11-7 even without d4r; disable it (`DISABLE_LSFGVK=1`) if the game exits with
+  `Graphics_InitializationFailed`.
