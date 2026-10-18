@@ -59,6 +59,9 @@ def mem_shape(o):
     return size, count
 
 
+# --exact-convert (the module is passed through engine/rr/spv_exact_convert.py, which keeps every conversion): a
+# cvt.rn.f16.f32 only needs the opaque zero on its f32 bits, against the fused multiply-convert (see cvt)
+CVT_GUARD = '--exact-convert' not in sys.argv
 RR_RUNTIME = r'''
 float16_t H(uint u) { return uint16BitsToFloat16(uint16_t(u)); }
 uint HU(float16_t h) { return uint(float16BitsToUint16(h)); }
@@ -716,7 +719,7 @@ class RRT(base.T):
         for i, d in enumerate(dst):
             # a binary16 result is the texel rounded to binary16: through H(HU(...) | SUST_Z) so that the driver cannot
             # fold the rounding away when the value is widened again (RR_RUNTIME's note on sust_b)
-            self.A(d, f'H(HU(float16_t(t_[{i}])) | SUST_Z)' if f16 else f't_[{i}]', 'f16' if f16 else 'float')
+            self.A(d, (f'H(HU(float16_t(t_[{i}])) | SUST_Z)' if CVT_GUARD else f'float16_t(t_[{i}])') if f16 else f't_[{i}]', 'f16' if f16 else 'float')
         self.E('}')
 
     def sust(self, op, a):
@@ -777,6 +780,11 @@ class RRT(base.T):
             # conversion into v_fma_mix, one rounding of the exact value, where the kernel rounds to f32 first: an f32
             # result that is exactly a binary16 midpoint then rounds the other way (the output stages' rare one-step
             # differences, e.g. log2(x) * c1 * c2; found 2026-10-13): the OR on the f32 bits keeps the f32 value.
+            # With --exact-convert the conversion itself is decorated NoContraction (spv_exact_convert.py), which keeps the
+            # first: only the f32 OR is needed (checked in the ISA: the same v_cvt_f16_f32 / v_cvt_f32_f16 counts, no
+            # v_fma_mix*_f16; without the f32 OR, ACO fuses some products into v_fma_mixlo_f16 despite `precise`)
+            if not CVT_GUARD:
+                return self.A(a[0], f'float16_t(uintBitsToFloat(floatBitsToUint({self.val(a[1], "f32")}) | SUST_Z))', 'f16')
             return self.A(a[0], f'H(HU(float16_t(uintBitsToFloat(floatBitsToUint({self.val(a[1], "f32")}) | SUST_Z))) | SUST_Z)', 'f16')
         return super().cvt(op, o, a)
 
@@ -859,6 +867,8 @@ class RRT(base.T):
             return self.A(a[0], f'tanh_ocml({self.val(a[1], "f32")})', 'float')
         if op == 'ex2.approx.f16':
             # v_exp_f32 of the widened value, rounded to binary16; the ORs keep that rounding (see cvt)
+            if not CVT_GUARD:
+                return self.A(a[0], f'float16_t(uintBitsToFloat(floatBitsToUint(exp2(float({self.val(a[1], "f16")}))) | SUST_Z))', 'f16')
             return self.A(a[0], f'H(HU(float16_t(uintBitsToFloat(floatBitsToUint(exp2(float({self.val(a[1], "f16")}))) | SUST_Z))) | SUST_Z)', 'f16')
         if op == 'neg.f16':
             return self.A(a[0], f'-{self.val(a[1], "f16")}', 'f16')
@@ -945,6 +955,8 @@ def main():
                          'execution) for workgroup --probe-block, into a debug buffer bound after the surfaces')
     ap.add_argument('--probe-block', default='0,0')
     ap.add_argument('--oob-report', action='store_true', help='debugging: count out-of-range buffer accesses')
+    ap.add_argument('--exact-convert', action='store_true',
+                    help='the module goes through spv_exact_convert.py: lighter guards on binary16 conversions (CVT_GUARD)')
     ns = ap.parse_args()
     block = tuple(int(x) for x in ns.block.split(',')) if ns.block else default_block(ns.kernel)
     formats = {int(k): v for k, v in (x.split('=') for x in ns.surface)}

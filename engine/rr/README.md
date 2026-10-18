@@ -547,7 +547,15 @@ registers to the waves its shared memory leaves room for (enc1 needed 97 vector 
 - **dec0_1 hands r and the MLP sum to its tail in XT and KVS' place** (KIND 5, one window per workgroup): written as
   binary16 pairs of natural channels after a barrier, read in those pairs by the tail; 14 -> 8 KiB, 192 -> 120 vector
   registers, 8 -> 12 waves per SIMD: 660 -> 623 us.
-Frame 4.09 -> 4.00 ms (network 3.39 -> 3.30). Tried without gain: the decoders' first kernels' expansion in KVS (16 /
+- **Lighter conversion guards in the hybrid stages** (enc0, dec0_1; `ptx2rr.py --exact-convert`): their modules go
+  through `spv_exact_convert.py`, whose NoContraction on every conversion already stops the fold of
+  `float(float16_t(x))`, so a `cvt.rn.f16.f32` keeps only the opaque zero on its f32 bits (against the fused
+  multiply-convert, which `precise` alone does not stop: without it ACO emits `v_fma_mixlo_f16` there). In the ISA the
+  same number of `v_cvt_f16_f32` / `v_cvt_f32_f16` as before and no `v_fma_mix*_f16`; 224 / 153 fewer instructions:
+  enc0 747 -> 729 us, dec0_1 598 -> 592. The output passes keep both ORs (they are not passed through
+  `spv_exact_convert.py`, and their ISA already uses `v_fma_mix*_f16` for plain conversions, so it cannot be checked
+  the same way).
+Frame 4.09 -> 3.97 ms (network 3.39 -> 3.28). Tried without gain: the decoders' first kernels' expansion in KVS (16 /
 12 / 8 KiB, but the deep levels have too few windows for the waves to matter and the extra barrier cost 4 - 5 us
 each), all twelve tiles of a 1440p frame in one group (sixteen tile slots: the same), the output passes on 32-wide
 waves (0.67 -> 0.82 ms) and unrolled head / branch loops in the 160-channel stages (+10 - 20 us each). Per stage

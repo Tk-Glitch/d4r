@@ -168,6 +168,9 @@ def main():
         cmd += [f'--buffer={off}' for off in BUFFERS.get(stage, [])]
         cmd += [f'--snorm16={off}' for off in SNORM16.get(stage, [])]
         cmd += [f'--surface={off}={fmt}' for off, fmt in SURFACES.get(stage, {}).items()]
+        # the hybrid stages' modules go through spv_exact_convert.py, so their conversions need only the lighter guard
+        exact = bool(a.native) and stage in HYBRID
+        cmd += ['--exact-convert'] if exact else []
         subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
         info = json.loads(generated.with_suffix('.json').read_text())
         weights = '-'
