@@ -113,10 +113,33 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
 #define BRANCHB BRANCH
 
+#if KIND == 1
+// enc1's merge input is in registers (gb) before XT or KVS is first written, so the three share 8 KiB instead of 16
+// (above about 4 KiB per wave this GPU runs the workgroup slower, see KIND 2 below): XT words 0 - 16C-1, KVS after it
+#if 16 * C + 2 * 512 > 64 * 32
+#error rr2_m.comp: XT and KVS no longer fit in GT
+#endif
+shared uint GT[64 * 32];         // the merge input: [token slot][4 sub-positions x 32 FP8 channels]; then XT and KVS
+#define XT GT
+#define KVS GT
+#define KVA(o) (16u * C + (o))
+#elif KIND == 5 && RR2_GROUP == 1
+// dec0's second kernel writes r and the MLP sum for its tail only after the block is done with XT and KVS, so the
+// three share 8 KiB instead of 14: XT words 0 - 16C-1, KVS after it; then r (RSW) at word 0 and the MLP sum (MSW) at
+// 1024, both as binary16 pairs of natural channels 2k, 2k + 1 per token (the tail reads them in those pairs)
+#if 16 * C + 2 * 512 > 2 * 1024
+#error rr2_m.comp: XT and KVS no longer fit under RSW and MSW
+#endif
+shared uint SM[2 * 1024];
+#define XT SM
+#define KVS SM
+#define KVA(o) (16u * C + (o))
+#define RSW(w) SM[w]
+#define MSW(w) SM[1024u + (w)]
+#else
 shared uint XT[16 * C];          // the window's tokens: [token slot][C FP8 channels in slot order]; later the merge rows
 shared uint KVS[2 * 512];        // the current head's QK ([token slot][32]), then V^T ([32][token slot])
-#if KIND == 1
-shared uint GT[64 * 32];         // the merge input: [token slot][4 sub-positions x 32 FP8 channels]
+#define KVA(o) (o)
 #endif
 #if KIND == 2
 // Shared memory is what limits how many waves this GPU keeps running: above about 4 KiB per wave (16 KiB for this
@@ -146,7 +169,15 @@ const uint EBRANCH = W_EWD1 - W_EWD0;
 #define EBRANCHB EBRANCH
 #endif
 #if KIND == 5
+#if RR2_GROUP == 1
+// r and the MLP sum of token row, natural channel col, for the translated tail (gen_rr2_enc0.py)
+float16_t rr2_rsh(uint row, uint col) { return unpackFloat2x16(RSW(row * 16u + (col >> 1u)))[col & 1u]; }
+float16_t rr2_msh(uint row, uint col) { return unpackFloat2x16(MSW(row * 16u + (col >> 1u)))[col & 1u]; }
+#else
 shared float16_t RSH[RR2_GROUP * 64 * 32], MSH[RR2_GROUP * 64 * 32];   // per window, r and the MLP sum per token (raster order) and natural channel
+float16_t rr2_rsh(uint row, uint col) { return RSH[gl_SubgroupID * 2048u + row * 32u + col]; }
+float16_t rr2_msh(uint row, uint col) { return MSH[gl_SubgroupID * 2048u + row * 32u + col]; }
+#endif
 #endif
 #if GUIDE || KIND == 3
 shared float16_t OUTG[64 * 4];   // the guide output per window token (raster order)
@@ -242,6 +273,7 @@ void main()
     {
         B8 gb[8];
         [[unroll]] for (uint kt = 0u; kt < 8u; ++kt) coopMatLoad(gb[kt], GT, wv * 512u + 4u * kt, 32u, CMJ);
+        barrier();   // every wave has its part of GT in registers: XT takes its place
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             RAC a;
             [[unroll]] for (int i = 0; i < 8; ++i) a[i] = BV(B1, 16u * m + 8u * hl + uint(i));
@@ -342,20 +374,20 @@ void main()
             A8 ka, va;
             Q8(ka, a)
             Q8(va, v)
-            coopMatStore(ka, KVS, n * 128u + 4u * c, 8u, RM);
-            coopMatStore(va, KVS, 512u + c * 256u + 4u * n, 16u, RM);
+            coopMatStore(ka, KVS, KVA(n * 128u + 4u * c), 8u, RM);
+            coopMatStore(va, KVS, KVA(512u + c * 256u + 4u * n), 16u, RM);
         }
         barrier();
         // scores^T (keys x this wave's queries) = QK . QK^T + bias, the cubic softmax down each column
         B8 Qb[2];
-        [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(Qb[c], KVS, wv * 128u + 4u * c, 8u, CMJ);
+        [[unroll]] for (uint c = 0u; c < 2u; ++c) coopMatLoad(Qb[c], KVS, KVA(wv * 128u + 4u * c), 8u, CMJ);
         B8 Pb[4];
         {
             float16_t e[4][8];
             [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) {
                 A8 k0, k1;
-                coopMatLoad(k0, KVS, kt * 128u, 8u, RM);
-                coopMatLoad(k1, KVS, kt * 128u + 4u, 8u, RM);
+                coopMatLoad(k0, KVS, KVA(kt * 128u), 8u, RM);
+                coopMatLoad(k1, KVS, KVA(kt * 128u + 4u), 8u, RM);
                 HAC c;
                 coopMatLoad(c, w16.w, (W_BIAS0 + HEAD * hd) / 2u + kt * 1024u + 16u * wv, 64u, RM);
                 K32H(c, k0, Qb[0], k1, Qb[1])
@@ -392,8 +424,8 @@ void main()
             RAC o = RAC(RV(float16_t(0.0)));
             [[unroll]] for (uint ks = 0u; ks < 2u; ++ks) {
                 A8 v0, v1;
-                coopMatLoad(v0, KVS, 512u + c * 256u + 8u * ks, 16u, RM);
-                coopMatLoad(v1, KVS, 512u + c * 256u + 8u * ks + 4u, 16u, RM);
+                coopMatLoad(v0, KVS, KVA(512u + c * 256u + 8u * ks), 16u, RM);
+                coopMatLoad(v1, KVS, KVA(512u + c * 256u + 8u * ks + 4u), 16u, RM);
                 K32(o, v0, Pb[2u * ks], v1, Pb[2u * ks + 1u])
             }
             Q8(Ob[c], o)
@@ -449,12 +481,23 @@ void main()
 
 #if KIND == 5
     // dec0's second kernel: the translated tail forms y = r + MLP * s2 itself and computes the outputs from it
+#if RR2_GROUP == 1
+    barrier();   // every wave is done with XT and KVS
+    // (channel slots j and j + 1, j even, hold the natural channels inter(j) and inter(j) + 1)
+    [[unroll]] for (uint m = 0u; m < MT; ++m)
+        [[unroll]] for (int i = 0; i < 8; i += 2) {
+            const uint w = (t * 32u + inter(16u * m + 8u * hl + uint(i))) >> 1u;
+            RSW(w) = packFloat2x16(f16vec2(float16_t(rv[m][i]), float16_t(rv[m][i + 1])));
+            MSW(w) = packFloat2x16(f16vec2(float16_t(ML[m][i]), float16_t(ML[m][i + 1])));
+        }
+#else
     [[unroll]] for (uint m = 0u; m < MT; ++m)
         [[unroll]] for (int i = 0; i < 8; ++i) {
             const uint at = RR2_WIN * 2048u + t * 32u + inter(16u * m + 8u * hl + uint(i));
             RSH[at] = float16_t(rv[m][i]);
             MSH[at] = float16_t(ML[m][i]);
         }
+#endif
 #else
     // ---------------------------------------------------------------- y = r + MLP * s2: the stage's tokens
     B8 Tb[MT];

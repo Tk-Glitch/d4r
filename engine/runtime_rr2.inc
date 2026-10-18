@@ -638,6 +638,11 @@ struct R2Engine {
         const auto& b = *bound;
         const uint32_t f = frame, cur = f & 1u;
         auto stamp = [&](uint32_t n) { if (stamps) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stamps, first + n); };
+        // timing only: D4R_ENGINE_RR_STAGE_STAMPS=1 also stamps after every network stage and output group, from query
+        // first + 4 on (the caller's pool needs 32 queries)
+        static const bool stageStamps = std::getenv("D4R_ENGINE_RR_STAGE_STAMPS") != nullptr;
+        uint32_t extra = 4;
+        auto stageStamp = [&] { if (stageStamps) stamp(extra++); };
         auto step = [&] {
             memoryBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -685,6 +690,7 @@ struct R2Engine {
             }
             dispatch(cb, model.stages[stage].pipeline, b.network[stage][cur], (gx + model.stages[stage].group - 1) / model.stages[stage].group, (lh(l) + sy + 7) / 8);
             step();
+            stageStamp();
         }
         stamp(2);
         // timing only: D4R_ENGINE_RR_SKIP=post,down,pooled leaves those passes out (the picture is wrong then)
@@ -706,6 +712,7 @@ struct R2Engine {
                 if (serial) step();
             }
             if (g < groups) step();
+            stageStamp();
         }
         // (the pooling pass reads what the post passes wrote: the last group's down passes do not touch it)
         if (!noPooled) dispatch(cb, model.stages[R2Pooled].pipeline, b.pooled, (qw + 15) / 16, (qh + 15) / 16);

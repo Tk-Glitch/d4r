@@ -74,8 +74,11 @@ BUFFERS['downp'] = [72, 168, 176]
 HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1']}
 # windows per workgroup of the hybrid stages (gen_rr2_enc0.py --group; D4R_RR2_GROUP to experiment)
 GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
-# encoder 0's gather as a pass of its own (D4R_RR2_SPLIT=0: one shader, the gather on one wave of the block's four)
-SPLIT = os.environ.get('D4R_RR2_SPLIT', '1') != '0'
+# encoder 0's gather as a pass of its own, which pays with the four-wave block (one shader would run the gather on one
+# wave of the four). With the one-wave block (level 3) the gather runs in the block's own shader and hands its
+# features over in shared memory instead (rr2_w.comp RR2_XF_SHARED): no record in the arena, one dispatch less.
+# D4R_RR2_SPLIT=1 / 0 forces the gather pass / the single shader.
+SPLIT = os.environ.get('D4R_RR2_SPLIT', '0' if RELAXED >= 3 and 'enc0' in ONE_WAVE else '1') != '0'
 # The pooled histories as RGBA32F holding q / 1023, as ZLUDA backs them (16 bytes a pixel). D4R_RR2_POOLED=rgb10_a2
 # makes them real UNORM 10:10:10:2 images (0.1 ms faster at 4K), but the hardware's bilinear filter then rounds
 # differently: identical at 3x and 2x scaling, 44 - 51 dB on temporal frames at 1.5x (capFQ, 2026-10-13)
@@ -191,7 +194,7 @@ def main():
                 subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / 'enc0g.spv')],
                                check=True, stdout=subprocess.DEVNULL)
                 record = int((work / 'enc0_g.record').read_text())
-            if RELAXED >= 3 and stage in ONE_WAVE and split:
+            if RELAXED >= 3 and stage in ONE_WAVE and (split or GROUP == 1):
                 how = how + ['--one-wave']
             subprocess.run([sys.executable, str(HERE / 'rr' / 'gen_rr2_enc0.py'), str(find_module(a.ptx_dir, kernel)),
                             str(generated), str(work / f'{stage}_m.comp'), *HYBRID[stage], *how],

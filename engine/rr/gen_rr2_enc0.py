@@ -15,6 +15,10 @@ out:
 With --group N (2 to 4) a workgroup holds N windows along x: waves 0 ... N - 1 run the translated code of one window
 each and the block then runs once per window; the stage's dispatch is 1 / N as wide ("xN" in rr.txt). Measured on
 an RX 9070 XT (2026-10-13) that is slower than one window per workgroup (network +0.4 ms at 1280x720 with N = 4).
+With --one-wave (D4R_RR_RELAXED=3) the block is engine/rr/rr2_w.comp in NVIDIA's own 32-thread group: the gather, the
+block and the tail all run on the one wave, and XF shares its 4 KiB with the block's XT and KVS (rr2_w.comp
+RR2_XF_SHARED), so nothing goes through memory. (The gather was made a pass of its own because on the four-wave block
+it ran on one wave while three waited; on one wave there is nothing to wait for.)
 With --dec0_1 the same for dec0's second kernel (rr2_m.comp KIND 5): nothing before the block (it reads its tokens
 from the arena); after it the last product's D fragments (the MLP sum) and the registers holding r are loaded from
 MSH / RSH, and the translated tail forms y = r + MLP * s2 and computes the kernel's outputs from it.
@@ -177,6 +181,8 @@ def main():
     m = next(i for i, l in enumerate(g) if l.startswith('void main()'))
     # --one-wave (D4R_RR_RELAXED=3): the block as rr2_w.comp, in NVIDIA's own 32-thread group, the tail on the same wave
     one_wave = '--one-wave' in sys.argv
+    if one_wave and (dec or G != 1):
+        raise SystemExit('--one-wave is for encoder 0 with one window per workgroup')
     head = '\n'.join(g[:m])
     if not one_wave:
         head = head.replace('layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;',
@@ -289,10 +295,11 @@ def main():
             '    // the gather\'s index arithmetic the tail reads\n' + '\n'.join(recomputed) + '\n' +
             '\n'.join(load + keep) + '\n' + '\n'.join(tail) + '\n    }\n}\n')
         return
-    wx = lambda t: t.replace('gl_WorkGroupID.x', f'({G}u * gl_WorkGroupID.x + gl_SubgroupID)')
-    text = (head + f'\n#extension GL_GOOGLE_include_directive : require\n#define RR2_EMBED 1\n#define RR2_GROUP {G}\n' + block + '\n' +
-            ('uint HDV(uint row, uint col) { return uint(float16BitsToUint16(MSH[gl_SubgroupID * 2048u + row * 32u + col])); }\n'
-             'uint RSV(uint row, uint col) { return uint(float16BitsToUint16(RSH[gl_SubgroupID * 2048u + row * 32u + col])); }\n\n' if dec else
+    wx = (lambda t: t) if one_wave else (lambda t: t.replace('gl_WorkGroupID.x', f'({G}u * gl_WorkGroupID.x + gl_SubgroupID)'))
+    text = (head + f'\n#extension GL_GOOGLE_include_directive : require\n#define RR2_EMBED 1\n#define RR2_GROUP {G}\n' +
+            ('#define RR2_XF_SHARED 1\n' if one_wave else '') + block + '\n' +
+            ('uint HDV(uint row, uint col) { return uint(float16BitsToUint16(rr2_msh(row, col))); }\n'
+             'uint RSV(uint row, uint col) { return uint(float16BitsToUint16(rr2_rsh(row, col))); }\n\n' if dec else
              'uint HDV(uint row, uint col) { return col < 4u ? uint(float16BitsToUint16(HD[gl_SubgroupID * 256u + row * 4u + col])) : 0u; }\n\n') +
             'void main()\n{\n' + '\n'.join(body[:nd]) +
             '\n    // this wave\'s window, when the level has it\n'

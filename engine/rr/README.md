@@ -530,6 +530,34 @@ only; the other stages still use `rr2_m.comp`.
 well 4.98 / 5.59. Decoder 0's second kernel is not converted: it hands r and the MLP sum (8 KiB of binary16) to its
 translated tail through shared memory, which a single wave cannot hold without losing the 4 KiB rate.
 
+Shared memory, later (2026-10-18, RX 9070 XT, RADV, 1280x720 -> 2560x1440, `d4r-rr` with `D4R_RR_TIME_REPEAT=40`
+and `D4R_ENGINE_RR_STAGE_STAMPS=1`, five interleaved runs; every image of six temporal frames byte-identical to the
+previous model, also at 1114x626 -> 1080p, 853x480 -> 1440p and with `D4R_RR_TEST_ROBUST2=1`). ACO sizes a shader's
+registers to the waves its shared memory leaves room for (enc1 needed 97 vector registers before scheduling and got
+240, dec0_1 79 and 192), so a stage that declares less shared memory also gets fewer registers and more waves:
+- **Encoder 0 in one shader again at level 3.** With the one-wave block nothing waits while the gather runs, so
+  `gen_rr2_enc0.py --one-wave` without `--split` runs the gather, the block and the tail in one 32-thread group and
+  hands the features over in shared memory: XF shares its 4 KiB with the block's XT and KVS (`rr2_w.comp`
+  `RR2_XF_SHARED`; every feature tile is in registers before the block first writes either). No gather pass, no
+  record in the arena (76 bytes a render pixel, of which 36 MB lay past the arena at 720p). The gather now runs at the
+  block's 6 waves per SIMD instead of 16 as a pass of its own, which takes back most of the saved traffic:
+  enc0g + enc0 798 -> 772 us. `D4R_RR2_SPLIT=1` builds the gather pass.
+- **enc1's merge input shares its 8 KiB with XT and KVS** (`rr2_m.comp` KIND 1): 17 -> 9 KiB of shared memory, 240 ->
+  144 vector registers, 6 -> 10 waves per SIMD: 286 -> 266 us.
+- **dec0_1 hands r and the MLP sum to its tail in XT and KVS' place** (KIND 5, one window per workgroup): written as
+  binary16 pairs of natural channels after a barrier, read in those pairs by the tail; 14 -> 8 KiB, 192 -> 120 vector
+  registers, 8 -> 12 waves per SIMD: 660 -> 623 us.
+Frame 4.09 -> 4.00 ms (network 3.39 -> 3.30). Tried without gain: the decoders' first kernels' expansion in KVS (16 /
+12 / 8 KiB, but the deep levels have too few windows for the waves to matter and the extra barrier cost 4 - 5 us
+each), all twelve tiles of a 1440p frame in one group (sixteen tile slots: the same), the output passes on 32-wide
+waves (0.67 -> 0.82 ms) and unrolled head / branch loops in the 160-channel stages (+10 - 20 us each). Per stage
+(us): enc0 772, enc1 266, enc2 137, dec1_0 246, dec1_1 208, dec0_0 405, dec0_1 623, levels 3 - 5 (eight stages) 395,
+output 670 (post 490, down 180). Levels 4 and 5 have 15 - 77 windows for 64 compute units.
+Eight waves per window for those levels (each token tile's channel tiles split over two waves, the hidden layer's
+two tiles one each, the halves meeting in shared memory; byte-identical) does not pay: enc4 / dec4_0 / dec4_1 46 / 45 /
+36 -> 49 / 45 / 40 us, enc5 35 -> 31, level 3 64 - 66 -> 78 - 86. A workgroup stays on one compute unit, so the idle
+units stay idle and the extra waves only add the shared work and barriers.
+
 ### Presets D and E against a real NVIDIA card, and level 3 for them (2026-10-14)
 
 NVIDIA's own kernels for presets D and E were replayed on an RTX PRO 4500 Blackwell (drivers 595.91 and 580.178: the
