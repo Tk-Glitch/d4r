@@ -295,7 +295,25 @@ def main():
             '    // the gather\'s index arithmetic the tail reads\n' + '\n'.join(recomputed) + '\n' +
             '\n'.join(load + keep) + '\n' + '\n'.join(tail) + '\n    }\n}\n')
         return
-    wx = (lambda t: t) if one_wave else (lambda t: t.replace('gl_WorkGroupID.x', f'({G}u * gl_WorkGroupID.x + gl_SubgroupID)'))
+    # --tail-waves N (dec0_1, one window per workgroup): the translated tail on N of the block's waves instead of one.
+    # Each wave runs its own copy of the tail with only the N-th part of its stores (in order: the first pixel's,
+    # then the second's); the compiler drops what a copy's stores do not need. Every stored value comes from the
+    # same instructions on the same values as on one wave, so the outputs are the same.
+    TW = int(sys.argv[sys.argv.index('--tail-waves') + 1]) if '--tail-waves' in sys.argv else 1
+    if TW > 1 and not (dec and G == 1):
+        raise SystemExit('--tail-waves is for dec0_1 with one window per workgroup')
+    wx = (lambda t: t) if one_wave or TW > 1 else (lambda t: t.replace('gl_WorkGroupID.x', f'({G}u * gl_WorkGroupID.x + gl_SubgroupID)'))
+    STORE = re.compile(r'^\s*(?!if\b|for\b|while\b|switch\b|return\b)[A-Za-z_]\w*\(')
+    stores = [i for i, l in enumerate(tail) if STORE.match(l)]
+    if TW > 1 and len(stores) % TW:
+        raise SystemExit(f'--tail-waves {TW}: {len(stores)} stores do not split evenly')
+    def tail_part(w):
+        mine = set(stores[w * len(stores) // TW:(w + 1) * len(stores) // TW])
+        return [l for i, l in enumerate(tail) if i not in stores or i in mine]
+    tails = ''.join(f'    if (rr2_valid && gl_SubgroupID == {w}u) {{\n' + '\n'.join(load + keep) + '\n' + '\n'.join(tail_part(w)) + '\n    }\n'
+                    for w in range(TW)) if TW > 1 else None
+    valid = (f'gl_SubgroupID < {TW}u && gl_WorkGroupID.x < rr2_gx' if TW > 1 else
+             f'gl_SubgroupID < {G}u && {G}u * gl_WorkGroupID.x + gl_SubgroupID < rr2_gx')
     text = (head + f'\n#extension GL_GOOGLE_include_directive : require\n#define RR2_EMBED 1\n#define RR2_GROUP {G}\n' +
             ('#define RR2_XF_SHARED 1\n' if one_wave else '') + block + '\n' +
             ('uint HDV(uint row, uint col) { return uint(float16BitsToUint16(rr2_msh(row, col))); }\n'
@@ -304,15 +322,16 @@ def main():
             'void main()\n{\n' + '\n'.join(body[:nd]) +
             '\n    // this wave\'s window, when the level has it\n'
             '    const uint rr2_gx = (param.w[0] + (param.w[20] & 0xffffu) + 7u) / 8u;\n'
-            f'    const bool rr2_valid = gl_SubgroupID < {G}u && {G}u * gl_WorkGroupID.x + gl_SubgroupID < rr2_gx;\n'
+            f'    const bool rr2_valid = {valid};\n'
             '    if (rr2_valid) {   // NVIDIA\'s warp: the translation before the first product\n' + wx('\n'.join(pre)) + '\n    }\n' +
             ('' if dec else '\n'.join(store)) +
             # (the block runs unconditionally, also for a window past the level's last one: it writes nothing there, and
             # inside a branch the driver compiles it much slower)
             ('\n    barrier();\n    rr2_block();\n    barrier();\n' if G == 1 else
              f'\n    barrier();\n    for (uint w_ = 0u; w_ < {G}u; ++w_) {{\n        rr2_win = w_;\n'
-             '        rr2_block();\n        barrier();\n    }\n') + '    if (rr2_valid) {\n' +
-            '\n'.join(load + keep) + '\n' + wx('\n'.join(tail)) + '\n    }\n}\n')
+             '        rr2_block();\n        barrier();\n    }\n') +
+            (tails + '}\n' if tails else
+             '    if (rr2_valid) {\n' + '\n'.join(load + keep) + '\n' + wx('\n'.join(tail)) + '\n    }\n}\n'))
     Path(out).write_text(text)
     print(f'{out}: {len(pre)} gather lines, {len(cut)} cut, {len(tail)} tail lines, {len(seen)} A fragment sets')
 

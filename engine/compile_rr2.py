@@ -71,7 +71,7 @@ KERNEL['downp'] = 'rr2_downsample_kernel_static_hdr'
 BLOCK['downp'] = '16,16,1'
 BUFFERS['downp'] = [72, 168, 176]
 # with --native: the translation of the per-pixel code around the native block (engine/rr/gen_rr2_enc0.py)
-HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1']}
+HYBRID = {'enc0': [], 'dec0_1': ['--dec0_1', '--tail-waves', os.environ.get('D4R_RR2_TAIL_WAVES', '2')]}
 # windows per workgroup of the hybrid stages (gen_rr2_enc0.py --group; D4R_RR2_GROUP to experiment)
 GROUP = int(os.environ.get('D4R_RR2_GROUP', '1'))
 # encoder 0's gather as a pass of its own, which pays with the four-wave block (one shader would run the gather on one

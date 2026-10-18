@@ -557,6 +557,13 @@ registers to the waves its shared memory leaves room for (enc1 needed 97 vector 
   so the check there is the whole instruction mix: only `v_and_or_b32` / `v_or` / `v_perm` / shifts go (post -16
   VALU, down -9, downp -73), every `v_fma_f32` / `v_mul_f32` / `v_add_f32` / conversion / `v_exp` / `v_log` count is
   unchanged (post moves 5 of its 57 mixes from the low to the high half of their registers). Output 673 -> 665 us.
+- **dec0_1's translated tail on two waves** (`gen_rr2_enc0.py --tail-waves 2`). The tail ran on wave 0 while the
+  block's other three waves had nothing left to do; it is a prologue (y = r + MLP * s2 and the shuffles that give each
+  lane its two pixels) and then the same per-pixel code twice. Each of two waves now runs its own copy of the tail with
+  only one pixel's stores (the first six, the last six), and the compiler drops what a copy's stores do not need:
+  every stored value comes from the same instructions on the same values. 120 -> 96 vector registers, 12 -> 16 waves
+  per SIMD; dec0_1 565 -> 474 us. Four waves (each pixel's stores split in two) is slower, 529 us: the per-pixel work
+  the parts share is then done twice. `D4R_RR2_TAIL_WAVES=1` builds the single-wave tail.
 - **One unsigned comparison per axis in the translation's bounds-checked fetch** (`ptx2rr.py` `fetch0`: a negative
   coordinate is above every size): 231 instructions fewer in enc0, whose gather fetches 102 times, its scalar spills
   200 -> 176; enc0 745 -> 738 us.
