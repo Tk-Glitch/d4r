@@ -555,7 +555,18 @@ registers to the waves its shared memory leaves room for (enc1 needed 97 vector 
   enc0 747 -> 729 us, dec0_1 598 -> 592. The output passes keep both ORs (they are not passed through
   `spv_exact_convert.py`, and their ISA already uses `v_fma_mix*_f16` for plain conversions, so it cannot be checked
   the same way).
-Frame 4.09 -> 3.97 ms (network 3.39 -> 3.28). Tried without gain: the decoders' first kernels' expansion in KVS (16 /
+- **Hardware saturation for the FP8 conversions of f32 values** (`rr_exact.glsl` `FINITE`). RADV lowers a saturating
+  conversion (`saturatedConvertEXT`) as a NaN-preserving clamp per element (`v_minimummaximum_f32`) and then the
+  conversion, because the hardware's FP16_OVFL saturation turns infinities into NaN instead of +-448 (ACO's comment;
+  confirmed on all 2^32 f32 inputs, RX 9070 XT: FP16_OVFL is identical to the clamp for every finite value and NaN,
+  only +-Inf differ). The values converted here never are infinite: sums of FP8 products (each at most 448^2) and
+  binary16 biases stay far below 3.4e38. Written as "an infinity becomes NaN, then saturate", the conversion is the
+  pattern `nir_opt_algebraic` turns into `f2e4m3fn_satfn` (vkd3d-proton's; Mesa >= 25.2, `has_f2e4m3fn_satfn`):
+  the hardware conversion with FP16_OVFL and no clamp. 168 - 232 clamps fewer per network stage (enc0 960 -> 128);
+  frame 3.92 -> 3.79 ms, every stage faster (dec0_1 607 -> 576 us, enc0 752 -> 727, enc1 262 -> 247). The binary16
+  conversions (the decoders' first kernels' input) keep the clamp: NIR moves the infinity test through the widening
+  and the pattern no longer matches. `RR_SAT_CLAMP=1` builds the old form.
+Frame 4.09 -> 3.84 ms. Tried without gain: the decoders' first kernels' expansion in KVS (16 /
 12 / 8 KiB, but the deep levels have too few windows for the waves to matter and the extra barrier cost 4 - 5 us
 each), all twelve tiles of a 1440p frame in one group (sixteen tile slots: the same), the output passes on 32-wide
 waves (0.67 -> 0.82 ms) and unrolled head / branch loops in the 160-channel stages (+10 - 20 us each). Per stage

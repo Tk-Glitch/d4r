@@ -90,7 +90,7 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define E4V(w, b) float(uintBitsToFloate4m3EXT(uint8_t(((w) >> (8u * (b))) & 0xffu)))
 #define RESID(d, a, s, c) const float d = fma(float(a), float(s), float(c));
 #define Q8R(x) q8s(x)
-#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2(float((h)[i_]), float((h)[i_ + 1])); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2(float((h)[i_]), float((h)[i_ + 1])); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 #else
 #define RVT float16_t
 #define E4V(w, b) e4((w), (b))
