@@ -126,6 +126,43 @@ and the NGX core signatures used by
 Host event signaling follows the
 [Vulkan event synchronization contract](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWaitEvents.html).
 
+## Engine path (no staging)
+
+With the engine on (`[Engine] Enabled`, `D4R_ENGINE=1`, which `auto` sets when `d4r\engine` holds models), the
+Vulkan frontend records d4r's own network for presets K, M and L straight into the caller's command buffer on the
+game's own `VkDevice`: the same `GameUpscaler` / `GameUpscalerM` adapters the D3D12 path uses through vkd3d-proton.
+There is no CPU staging, no CUDA evaluation and no host wait; the result belongs to the frame being recorded.
+`D4R_VULKAN_ENGINE=0` keeps the staging path. Anything the engine does not cover returns to the staging path,
+logged once as `native Vulkan engine (K|M|L): <reason>; feature N uses the staging path`.
+
+- Inputs are sampled through the caller's views in `SHADER_READ_ONLY_OPTIMAL` (`D4R_VULKAN_INPUT_GENERAL=1`
+  for `GENERAL`); depth/stencil views get a depth-only view of their own. The output must be an RGBA16F (or,
+  with an RGB10 model, A2B10G10R10) image the engine writes directly in `GENERAL`, because the resource contract
+  gives it `STORAGE` usage only.
+- Each recording ends with a `vkCmdSetEvent`; a released feature's engine objects are destroyed once every
+  recorded event has fired, or at shutdown after the application's device-idle point. Unsubmitted recordings are
+  never waited on.
+- Device features: the engine's shaders use `VK_KHR_cooperative_matrix` (and `VK_EXT_shader_float8` for M and L).
+  `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements` now reports both where the adapter has them, so games
+  that honour NGX's requirements enable the extensions. Their feature bits are still up to the game; RADV compiles
+  and runs the engine without them (bit-identical harness output on a plain 1.1 device), but that is outside the
+  Vulkan specification, and a layer that enables the features is the clean fix.
+- Not covered: Ray Reconstruction, bias-colour and transparency masks, and K's game exposure texture in a
+  non-float format. With AutoExposure off and no exposure texture, K is refused; `[InitFlags] AutoExposure=true` in
+  `OptiScaler.ini` covers games that send no exposure (M and L ignore exposure).
+
+Harness checks (RX 9070, gfx1201, GE-Proton11-7, 640x360 -> 1280x720, frame 8, against the staging path):
+K 99.6 % bit-identical, the rest within one half-float ulp; M 52.7 dB and L 54.3 dB PSNR (FP8 rounding) with equal
+means; `dynamic`, `recreate` and `discard` pass for K and M. `D4R_HARNESS_ENGINE_DEVICE=1` creates a 1.3 device with
+the engine's features; `D4R_HARNESS_ALLOW_BLACK=1` tolerates NGX's black reset frame for K on the staging path.
+
+```sh
+D4R_ENGINE=1 D4R_DLSS_PRESET=13 D4R_HARNESS_ENGINE_DEVICE=1 D4R_ENGINE_MODEL_M_DIR=PORTABLE_D4R_DIR/engine/m \
+  scripts/run_vulkan_dlss_harness_proton.sh PROTON_DIR PORTABLE_D4R_DIR build/engine-m.rgba16f 8
+```
+
+In game: Enshrouded (Vulkan only) runs preset M on this path at 1505x847 -> 2560x1440; see SUPPORTED_GAMES.md.
+
 ## Synthetic harness
 
 The harness creates an AMD Vulkan device without NGX-specific device extensions,

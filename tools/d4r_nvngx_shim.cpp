@@ -3385,6 +3385,8 @@ struct VulkanInterop
     // VK_EXT_shader_float8 (vkd3d-proton enables it when the GPU has it): M's and L's engine layers are FP8
     // cooperative-matrix shaders, which RADV's compiler crashes on without it (RDNA3)
     bool float8 = false;
+    // The engine runs on the game's own Vulkan device (native Vulkan NGX frontend): no vkd3d interop objects.
+    bool native = false;
     PFN_vkGetPhysicalDeviceFormatProperties formatProperties = nullptr;
     PFN_vkCreateBuffer createBuffer = nullptr;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
@@ -9332,7 +9334,7 @@ static void init_engine_backend()
         WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + L"\\engine\\k").c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
     }
-    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    if ((!g_vk.native && (g_vk.interop == nullptr || g_vk.lifetime == nullptr)) || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
         return;
     // A Unix path names the same file through Wine's Z: drive.
     const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
@@ -9361,7 +9363,7 @@ static void init_engine_backend_ldr()
         WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + L"\\engine\\k-ldr").c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
     }
-    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    if ((!g_vk.native && (g_vk.interop == nullptr || g_vk.lifetime == nullptr)) || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
         return;
     const std::string path = directory[0] == '/' ? "Z:" + directory : directory;
     try
@@ -9457,7 +9459,7 @@ static void init_engine_backend_m_variant(bool presetL, bool ldr)
         WideCharToMultiByte(CP_ACP, 0, (g_portable.dir + sub).c_str(), -1, folder, sizeof(folder), nullptr, nullptr);
         directory = folder;
     }
-    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    if ((!g_vk.native && (g_vk.interop == nullptr || g_vk.lifetime == nullptr)) || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
     {
         logf("engine backend (%s): Vulkan interop is unavailable", name);
         return;
@@ -10303,7 +10305,7 @@ static std::string rr_model_directory(int slot)
 static void init_engine_backend_rr(int slot)
 {
     const std::string path = rr_model_directory(slot);
-    if (g_vk.interop == nullptr || g_vk.lifetime == nullptr || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
+    if ((!g_vk.native && (g_vk.interop == nullptr || g_vk.lifetime == nullptr)) || g_vk.device == VK_NULL_HANDLE || d4r::vkTable.CreateBuffer == nullptr)
     {
         logf("engine backend (Ray Reconstruction): Vulkan interop is unavailable");
         g_engineR.state[slot] = 3;
