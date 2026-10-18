@@ -530,6 +530,65 @@ only; the other stages still use `rr2_m.comp`.
 well 4.98 / 5.59. Decoder 0's second kernel is not converted: it hands r and the MLP sum (8 KiB of binary16) to its
 translated tail through shared memory, which a single wave cannot hold without losing the 4 KiB rate.
 
+Shared memory, later (2026-10-18, RX 9070 XT, RADV, 1280x720 -> 2560x1440, `d4r-rr` with `D4R_RR_TIME_REPEAT=40`
+and `D4R_ENGINE_RR_STAGE_STAMPS=1`, five interleaved runs; every image of six temporal frames byte-identical to the
+previous model, also at 1114x626 -> 1080p, 853x480 -> 1440p and with `D4R_RR_TEST_ROBUST2=1`). ACO sizes a shader's
+registers to the waves its shared memory leaves room for (enc1 needed 97 vector registers before scheduling and got
+240, dec0_1 79 and 192), so a stage that declares less shared memory also gets fewer registers and more waves:
+- **Encoder 0 in one shader again at level 3.** With the one-wave block nothing waits while the gather runs, so
+  `gen_rr2_enc0.py --one-wave` without `--split` runs the gather, the block and the tail in one 32-thread group and
+  hands the features over in shared memory: XF shares its 4 KiB with the block's XT and KVS (`rr2_w.comp`
+  `RR2_XF_SHARED`; every feature tile is in registers before the block first writes either). No gather pass, no
+  record in the arena (76 bytes a render pixel, of which 36 MB lay past the arena at 720p). The gather now runs at the
+  block's 6 waves per SIMD instead of 16 as a pass of its own, which takes back most of the saved traffic:
+  enc0g + enc0 798 -> 772 us. `D4R_RR2_SPLIT=1` builds the gather pass.
+- **enc1's merge input shares its 8 KiB with XT and KVS** (`rr2_m.comp` KIND 1): 17 -> 9 KiB of shared memory, 240 ->
+  144 vector registers, 6 -> 10 waves per SIMD: 286 -> 266 us.
+- **dec0_1 hands r and the MLP sum to its tail in XT and KVS' place** (KIND 5, one window per workgroup): written as
+  binary16 pairs of natural channels after a barrier, read in those pairs by the tail; 14 -> 8 KiB, 192 -> 120 vector
+  registers, 8 -> 12 waves per SIMD: 660 -> 623 us.
+- **Lighter conversion guards in the hybrid stages** (enc0, dec0_1; `ptx2rr.py --exact-convert`): their modules go
+  through `spv_exact_convert.py`, whose NoContraction on every conversion already stops the fold of
+  `float(float16_t(x))`, so a `cvt.rn.f16.f32` keeps only the opaque zero on its f32 bits (against the fused
+  multiply-convert, which `precise` alone does not stop: without it ACO emits `v_fma_mixlo_f16` there). In the ISA the
+  same number of `v_cvt_f16_f32` / `v_cvt_f32_f16` as before and no `v_fma_mix*_f16`; 224 / 153 fewer instructions:
+  enc0 747 -> 729 us, dec0_1 598 -> 592. The output passes (post, down, downp, pooled) now go through
+  `spv_exact_convert.py` too and take the same guard. Their ISA already uses `v_fma_mix*_f16` for plain conversions,
+  so the check there is the whole instruction mix: only `v_and_or_b32` / `v_or` / `v_perm` / shifts go (post -16
+  VALU, down -9, downp -73), every `v_fma_f32` / `v_mul_f32` / `v_add_f32` / conversion / `v_exp` / `v_log` count is
+  unchanged (post moves 5 of its 57 mixes from the low to the high half of their registers). Output 673 -> 665 us.
+- **dec0_1's translated tail on two waves** (`gen_rr2_enc0.py --tail-waves 2`). The tail ran on wave 0 while the
+  block's other three waves had nothing left to do; it is a prologue (y = r + MLP * s2 and the shuffles that give each
+  lane its two pixels) and then the same per-pixel code twice. Each of two waves now runs its own copy of the tail with
+  only one pixel's stores (the first six, the last six), and the compiler drops what a copy's stores do not need:
+  every stored value comes from the same instructions on the same values. 120 -> 96 vector registers, 12 -> 16 waves
+  per SIMD; dec0_1 565 -> 474 us. Four waves (each pixel's stores split in two) is slower, 529 us: the per-pixel work
+  the parts share is then done twice. `D4R_RR2_TAIL_WAVES=1` builds the single-wave tail.
+- **One unsigned comparison per axis in the translation's bounds-checked fetch** (`ptx2rr.py` `fetch0`: a negative
+  coordinate is above every size): 231 instructions fewer in enc0, whose gather fetches 102 times, its scalar spills
+  200 -> 176; enc0 745 -> 738 us.
+- **Hardware saturation for the FP8 conversions of f32 values** (`rr_exact.glsl` `FINITE`). RADV lowers a saturating
+  conversion (`saturatedConvertEXT`) as a NaN-preserving clamp per element (`v_minimummaximum_f32`) and then the
+  conversion, because the hardware's FP16_OVFL saturation turns infinities into NaN instead of +-448 (ACO's comment;
+  confirmed on all 2^32 f32 inputs, RX 9070 XT: FP16_OVFL is identical to the clamp for every finite value and NaN,
+  only +-Inf differ). The values converted here never are infinite: sums of FP8 products (each at most 448^2) and
+  binary16 biases stay far below 3.4e38. Written as "an infinity becomes NaN, then saturate", the conversion is the
+  pattern `nir_opt_algebraic` turns into `f2e4m3fn_satfn` (vkd3d-proton's; Mesa >= 25.2, `has_f2e4m3fn_satfn`):
+  the hardware conversion with FP16_OVFL and no clamp. 168 - 232 clamps fewer per network stage (enc0 960 -> 128);
+  frame 3.92 -> 3.79 ms, every stage faster (dec0_1 607 -> 576 us, enc0 752 -> 727, enc1 262 -> 247). The binary16
+  conversions (the decoders' first kernels' input) keep the clamp: NIR moves the infinity test through the widening
+  and the pattern no longer matches. `RR_SAT_CLAMP=1` builds the old form.
+Frame 4.09 -> 3.84 ms. Tried without gain: the decoders' first kernels' expansion in KVS (16 /
+12 / 8 KiB, but the deep levels have too few windows for the waves to matter and the extra barrier cost 4 - 5 us
+each), all twelve tiles of a 1440p frame in one group (sixteen tile slots: the same), the output passes on 32-wide
+waves (0.67 -> 0.82 ms) and unrolled head / branch loops in the 160-channel stages (+10 - 20 us each). Per stage
+(us): enc0 772, enc1 266, enc2 137, dec1_0 246, dec1_1 208, dec0_0 405, dec0_1 623, levels 3 - 5 (eight stages) 395,
+output 670 (post 490, down 180). Levels 4 and 5 have 15 - 77 windows for 64 compute units.
+Eight waves per window for those levels (each token tile's channel tiles split over two waves, the hidden layer's
+two tiles one each, the halves meeting in shared memory; byte-identical) does not pay: enc4 / dec4_0 / dec4_1 46 / 45 /
+36 -> 49 / 45 / 40 us, enc5 35 -> 31, level 3 64 - 66 -> 78 - 86. A workgroup stays on one compute unit, so the idle
+units stay idle and the extra waves only add the shared work and barriers.
+
 ### Presets D and E against a real NVIDIA card, and level 3 for them (2026-10-14)
 
 NVIDIA's own kernels for presets D and E were replayed on an RTX PRO 4500 Blackwell (drivers 595.91 and 580.178: the

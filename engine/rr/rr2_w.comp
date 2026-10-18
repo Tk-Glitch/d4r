@@ -6,8 +6,10 @@
 // Shared memory stays at 4 KiB, above which this GPU runs fewer waves (engine/rr/README.md). The arithmetic is
 // rr2_m.comp's with -DRR_RELAXED=2 -DRR_NATIVE and the arena comes out byte-identical to that build
 // (build/rr/f/nv/invest-20261013/REPORT.md: 453 us against 581 us at 1280x720). compile_rr2.py uses it for dec0_0.
-// KIND 4 is encoder 0's block the same way (the embedding of the gather pass's record, the tokens, the guide head to
-// HD), included with RR2_EMBED and RR2_XF_ARENA by the shader engine/rr/gen_rr2_enc0.py --one-wave generates.
+// KIND 4 is encoder 0's block the same way (the embedding of the gather's features, the tokens, the guide head to
+// HD), included with RR2_EMBED by the shader engine/rr/gen_rr2_enc0.py --one-wave generates: with RR2_XF_SHARED the
+// gather runs in the same shader and leaves the features in XF (the default), with RR2_XF_ARENA they come from the
+// gather pass's record in the arena (--split block).
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -26,8 +28,8 @@ layout(local_size_x = 32) in;
 #if !(KIND == 2 || KIND == 4) || CM != 0 || GUIDE != 0 || C != 32
 #error rr2_w.comp: a 32-channel decoder's first kernel, or encoder 0's block
 #endif
-#if KIND == 4 && !(defined(RR2_EMBED) && defined(RR2_XF_ARENA))
-#error rr2_w.comp: encoder 0's block reads the gather pass's record (gen_rr2_enc0.py --split block --one-wave)
+#if KIND == 4 && !(defined(RR2_EMBED) && (defined(RR2_XF_ARENA) || defined(RR2_XF_SHARED)))
+#error rr2_w.comp: encoder 0's block reads the gather's features (gen_rr2_enc0.py --one-wave)
 #endif
 #define MT (C / 16)
 #ifdef RR2_EMBED
@@ -53,11 +55,21 @@ layout(set = 0, binding = 2, std430) buffer Arena { uint w[]; } arena;
 #define LDB(dst, base, n, kt, nt) coopMatLoad((dst), w8.w, (base) + 256u * ((kt) * ((n) / 16u) + (nt)), 16u, RM)
 #define K32(acc, a0, b0, a1, b1) { (acc) = coopMatMulAdd((a1), (b1), coopMatMulAdd((a0), (b0), (acc))); }
 #define Q8(dst, src) Q8PAIRS(dst, src)
-#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, x_ * g_); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
+#define ACT8(dst, h) [[unroll]] for (int i_ = 0; i_ < 8; i_ += 2) { const vec2 x_ = vec2((h)[i_], (h)[i_ + 1]); const vec2 y_ = clamp(x_, vec2(-2.0), vec2(2.0)); const vec2 g_ = fma(y_, fma(-abs(y_), vec2(0.0810546875), vec2(0.412109375)), vec2(0.5)); fe4m3vec2 t_; saturatedConvertEXT(t_, FINITE2(x_ * g_)); (dst)[i_] = t_.x; (dst)[i_ + 1] = t_.y; }
 const uint HEAD = W_WQK1 - W_WQK0, BRANCH = W_WD1 - W_WD0;
 
+#if KIND == 4 && defined(RR2_XF_SHARED)
+// the gather's features (XF, [token slot][64 FP8 feature slots], 4 KiB) are all in registers before the block first
+// writes XT or KVS, so the three share 4 KiB: KVS words 0 - 511, XT words 512 - 1023
+shared uint XF[64 * 16];
+#define KVS XF
+#define XT XF
+#define XTA(o) (512u + (o))
+#else
 shared uint XT[16 * C];
 shared uint KVS[512];          // the expansion (input phase), then per head V^T, then QK
+#define XTA(o) (o)
+#endif
 // Shared memory is what limits how many waves this GPU keeps running: above about 4 KiB per wave the rate falls in
 // proportion (build/rr/f/nv/cost/occ2.py). So the input phase borrows KVS, which the attention only needs later
 // (LOW at word 0, EX at word 512), and the block's unquantised input stays in registers (xr), not in memory.
@@ -68,7 +80,14 @@ shared uint KVS[512];          // the expansion (input phase), then per head V^T
 #endif
 #define EX_AT 0u
 #if KIND == 4
+#ifdef RR2_XF_ARENA
 uint rr2_xf;                     // the window's record from the gather pass: the index of its first arena word
+#define XF_SRC arena.w
+#define XF_AT rr2_xf
+#else
+#define XF_SRC XF
+#define XF_AT 0u
+#endif
 shared float16_t HD[64 * 4];     // the guide head per token (raster order), for the translated tail
 const uint EBRANCH = W_EWD1 - W_EWD0;
 #endif
@@ -103,10 +122,13 @@ void main()
         B8 fb[4][4];
         ACC X[4][MT];
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv) {
-            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[wv][kt], arena.w, rr2_xf + wv * 256u + 4u * kt, 16u, CMJ);
+            [[unroll]] for (uint kt = 0u; kt < 4u; ++kt) coopMatLoad(fb[wv][kt], XF_SRC, XF_AT + wv * 256u + 4u * kt, 16u, CMJ);
             [[unroll]] for (uint m = 0u; m < MT; ++m)
                 [[unroll]] for (int i = 0; i < 8; ++i) X[wv][m][i] = float(w16.w[W_EBU / 2u + 16u * m + 8u * hl + uint(i)]);
         }
+#ifdef RR2_XF_SHARED
+        barrier();   // XF is read: XT and KVS take its place
+#endif
         [[unroll]] for (uint br = 0u; br < 2u; ++br) {
             A8 ewd[2][4], ewu0[MT], ewu1[MT];
             [[unroll]] for (uint c = 0u; c < 2u; ++c)
@@ -128,7 +150,7 @@ void main()
         [[unroll]] for (uint wv = 0u; wv < 4u; ++wv)
             [[unroll]] for (uint m = 0u; m < MT; ++m) {
                 Q8(qx[wv][m], X[wv][m])
-                coopMatStore(qx[wv][m], XT, wv * 4u * C + 4u * m, C / 4u, CMJ);
+                coopMatStore(qx[wv][m], XT, XTA(wv * 4u * C + 4u * m), C / 4u, CMJ);
             }
     }
 #else
@@ -198,8 +220,8 @@ void main()
                 ACC v = ACC(0.0);
                 [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
                     A8 xa0, xa1;
-                    coopMatLoad(xa0, XT, n * 4u * C + 4u * kt, C / 4u, RM);
-                    coopMatLoad(xa1, XT, n * 4u * C + 4u * kt + 4u, C / 4u, RM);
+                    coopMatLoad(xa0, XT, XTA(n * 4u * C + 4u * kt), C / 4u, RM);
+                    coopMatLoad(xa1, XT, XTA(n * 4u * C + 4u * kt + 4u), C / 4u, RM);
                     K32(v, xa0, wvt[kt], xa1, wvt[kt + 1u])
                 }
                 A8 va;
@@ -219,8 +241,8 @@ void main()
                 ACC a = ACC(0.0);
                 [[unroll]] for (uint kt = 0u; kt < MT; kt += 2u) {
                     B8 xb0, xb1;
-                    coopMatLoad(xb0, XT, n * 4u * C + 4u * kt, C / 4u, CMJ);
-                    coopMatLoad(xb1, XT, n * 4u * C + 4u * kt + 4u, C / 4u, CMJ);
+                    coopMatLoad(xb0, XT, XTA(n * 4u * C + 4u * kt), C / 4u, CMJ);
+                    coopMatLoad(xb1, XT, XTA(n * 4u * C + 4u * kt + 4u), C / 4u, CMJ);
                     K32(a, wk[kt], xb0, wk[kt + 1u], xb1)
                 }
                 A8 ka;
@@ -348,7 +370,7 @@ void main()
         [[unroll]] for (uint m = 0u; m < MT; ++m) {
             floate4m3_t Tb[8];
             [[unroll]] for (int i = 0; i < 8; i += 2) {
-                fe4m3vec2 q; saturatedConvertEXT(q, vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1])));
+                fe4m3vec2 q; saturatedConvertEXT(q, FINITE2(vec2(fma(ML[wv][m][i], f2, rv[wv][m][i]), fma(ML[wv][m][i+1], f2, rv[wv][m][i+1]))));
                 Tb[i] = q.x; Tb[i+1] = q.y;
             }
 #if KIND == 4

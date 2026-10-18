@@ -185,7 +185,9 @@ int main(int argc, char** argv) try {
     HostBuffer staging(c, VkDeviceSize(ow) * oh * 8 * 4);
     // GPU time of every frame: REngine's four stamps (start, after exposure, after the network, after the output)
     VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    qp.queryType = VK_QUERY_TYPE_TIMESTAMP; qp.queryCount = 4;
+    qp.queryType = VK_QUERY_TYPE_TIMESTAMP; qp.queryCount = 32;
+    // D4R_ENGINE_RR_STAGE_STAMPS=1: the time of every network stage and output group as well (best frame of the repeats)
+    const bool stageTimes = std::getenv("D4R_ENGINE_RR_STAGE_STAMPS") != nullptr;
     VkQueryPool stamps; CK(vkCreateQueryPool(c.device, &qp, nullptr, &stamps));
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(c.physical, &props);
     const int repeat = std::getenv("D4R_RR_TIME_REPEAT") ? std::atoi(std::getenv("D4R_RR_TIME_REPEAT")) : 1;
@@ -233,21 +235,36 @@ int main(int argc, char** argv) try {
         engine.setFrame(images, s);
         if (first) c.submit([&](VkCommandBuffer cb) { model.recordUpload(cb); engine.recordInitialize(cb); first = false; });
         double best = 1e30, network = 0, output = 0, exposure = 0;
+        std::vector<double> stageBest(28, 1e30);
         for (int r = 0; r < repeat; ++r) {
             if (r) engine.setFrame(images, s);
             c.submit([&](VkCommandBuffer cb) {
-                vkCmdResetQueryPool(cb, stamps, 0, 4);
+                vkCmdResetQueryPool(cb, stamps, 0, 32);
                 engine.recordFrame(cb, stamps, 0);
             });
             uint64_t t[4];
             CK(vkGetQueryPoolResults(c.device, stamps, 0, 4, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             const double ms = props.limits.timestampPeriod * 1e-6;
+            if (stageTimes) {   // per stage: the minimum over the repeats (stamps 1, then 4 ... as written)
+                uint64_t all[32][2];
+                vkGetQueryPoolResults(c.device, stamps, 0, 32, sizeof(all), all, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                uint64_t prev = all[1][0];
+                for (uint32_t q = 4; q < 32 && all[q][1]; ++q) {
+                    stageBest[q - 4] = std::min(stageBest[q - 4], (all[q][0] - prev) * ms);
+                    prev = all[q][0];
+                }
+            }
             if ((t[3] - t[0]) * ms < best) {
                 best = (t[3] - t[0]) * ms; exposure = (t[1] - t[0]) * ms; network = (t[2] - t[1]) * ms; output = (t[3] - t[2]) * ms;
             }
         }
         std::cout << "frame " << f << ": " << best << " ms (exposure " << exposure << ", network " << network
                   << ", output " << output << ")\n";
+        if (stageTimes) {
+            std::cout << "stages (us):";
+            for (double t : stageBest) if (t < 1e29) std::cout << " " << static_cast<int>(t * 1000 + 0.5);
+            std::cout << "\n";
+        }
         for (const auto& d : engine.debugImages()) {
             const size_t bytes = size_t(d.width) * d.height * texelBytes(d.format);
             c.submit([&](VkCommandBuffer cb) {
