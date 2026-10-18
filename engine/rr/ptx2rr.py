@@ -70,7 +70,8 @@ uint HU2_(u16vec2 u) { return uint(u.x) | (uint(u.y) << 16); }
 uint H2U(f16vec2 h) { return HU2_(float16BitsToUint16(h)); }
 int s16(uint u) { return (int(u) << 16) >> 16; }
 float rcp_a(float x) { return 1.0 / x; }
-vec4 fetch0(sampler2D t, ivec2 c) { const ivec2 n = textureSize(t, 0); return (c.x < 0 || c.y < 0 || c.x >= n.x || c.y >= n.y) ? vec4(0.0) : texelFetch(t, c, 0); }
+// (one unsigned comparison per axis: a negative coordinate is above every size)
+vec4 fetch0(sampler2D t, ivec2 c) { const ivec2 n = textureSize(t, 0); return any(greaterThanEqual(uvec2(c), uvec2(n))) ? vec4(0.0) : texelFetch(t, c, 0); }
 // x + copysign(0.5, x) rounded toward zero and then truncated: round half away from zero, exactly
 float round_half_away(float x) { float t = trunc(x); return abs(x - t) >= 0.5 ? t + sign(x) : t; }
 uint PARAM32(uint o) { return param.w[o >> 2]; }

@@ -552,9 +552,14 @@ registers to the waves its shared memory leaves room for (enc1 needed 97 vector 
   `float(float16_t(x))`, so a `cvt.rn.f16.f32` keeps only the opaque zero on its f32 bits (against the fused
   multiply-convert, which `precise` alone does not stop: without it ACO emits `v_fma_mixlo_f16` there). In the ISA the
   same number of `v_cvt_f16_f32` / `v_cvt_f32_f16` as before and no `v_fma_mix*_f16`; 224 / 153 fewer instructions:
-  enc0 747 -> 729 us, dec0_1 598 -> 592. The output passes keep both ORs (they are not passed through
-  `spv_exact_convert.py`, and their ISA already uses `v_fma_mix*_f16` for plain conversions, so it cannot be checked
-  the same way).
+  enc0 747 -> 729 us, dec0_1 598 -> 592. The output passes (post, down, downp, pooled) now go through
+  `spv_exact_convert.py` too and take the same guard. Their ISA already uses `v_fma_mix*_f16` for plain conversions,
+  so the check there is the whole instruction mix: only `v_and_or_b32` / `v_or` / `v_perm` / shifts go (post -16
+  VALU, down -9, downp -73), every `v_fma_f32` / `v_mul_f32` / `v_add_f32` / conversion / `v_exp` / `v_log` count is
+  unchanged (post moves 5 of its 57 mixes from the low to the high half of their registers). Output 673 -> 665 us.
+- **One unsigned comparison per axis in the translation's bounds-checked fetch** (`ptx2rr.py` `fetch0`: a negative
+  coordinate is above every size): 231 instructions fewer in enc0, whose gather fetches 102 times, its scalar spills
+  200 -> 176; enc0 745 -> 738 us.
 - **Hardware saturation for the FP8 conversions of f32 values** (`rr_exact.glsl` `FINITE`). RADV lowers a saturating
   conversion (`saturatedConvertEXT`) as a NaN-preserving clamp per element (`v_minimummaximum_f32`) and then the
   conversion, because the hardware's FP16_OVFL saturation turns infinities into NaN instead of +-448 (ACO's comment;

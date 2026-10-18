@@ -168,8 +168,9 @@ def main():
         cmd += [f'--buffer={off}' for off in BUFFERS.get(stage, [])]
         cmd += [f'--snorm16={off}' for off in SNORM16.get(stage, [])]
         cmd += [f'--surface={off}={fmt}' for off, fmt in SURFACES.get(stage, {}).items()]
-        # the hybrid stages' modules go through spv_exact_convert.py, so their conversions need only the lighter guard
-        exact = bool(a.native) and stage in HYBRID
+        # the hybrid stages' and the output passes' modules go through spv_exact_convert.py, so their conversions need
+        # only the lighter guard (ptx2rr.py --exact-convert)
+        exact = (bool(a.native) and stage in HYBRID) or not network
         cmd += ['--exact-convert'] if exact else []
         subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
         info = json.loads(generated.with_suffix('.json').read_text())
@@ -210,6 +211,9 @@ def main():
         else:
             subprocess.run(capped + ['glslangValidator', '-V', '--target-env', 'vulkan1.3', str(generated), '-o',
                                      str(out / f'{stage}.spv')], check=True, stdout=subprocess.DEVNULL)
+            if exact:
+                subprocess.run([sys.executable, str(HERE / 'rr' / 'spv_exact_convert.py'), str(out / f'{stage}.spv')],
+                               check=True, stdout=subprocess.DEVNULL)
         if hybrid:
             pass
         elif network:
